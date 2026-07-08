@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Person Re-ID Tracker</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Sora:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div class="bg-noise" aria-hidden="true"></div>
+    <div class="bg-vignette" aria-hidden="true"></div>
+
+    <div class="layout">
+      <!-- HEADER -->
+      <header class="hero">
+        <div class="hero-main reveal">
+          <p class="eyebrow">Multi-Person Detection + Tracking + Re-ID</p>
+          <h1>Person Re-ID Tracker</h1>
+          <p class="lead">
+            Upload surveillance footage, run the complete pipeline, and review source vs processed output with clean identities and progress visibility.
+          </p>
+
+          <div class="controls-section">
+            <div class="controls" role="group" aria-label="video controls">
+              <label class="control-btn warm">
+                <input id="inputFile" type="file" accept="video/*" />
+                📁 Upload Input Video
+              </label>
+              <label class="control-btn cool">
+                <input id="outputFile" type="file" accept="video/*" />
+                📥 Load Output Video
+              </label>
+              <button id="processBtn" class="control-btn solid" type="button">▶ Process Video</button>
+            </div>
+
+            <div class="meta-strip">
+              <div class="meta-item">
+                <span class="meta-title">Input</span>
+                <span class="meta-value" id="inputName">—</span>
+              </div>
+              <div class="meta-item">
+                <span class="meta-title">Status</span>
+                <span class="meta-value" id="metaStatus">Ready</span>
+              </div>
+              <div class="meta-item">
+                <span class="meta-title">Output</span>
+                <span class="meta-value" id="outputName">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="status-box" aria-live="polite">
+            <div class="status-row">
+              <span id="status" class="status state-idle">Awaiting input upload...</span>
+              <span class="pulse-dot" id="statusDot" aria-hidden="true"></span>
+            </div>
+
+            <div class="progress-wrap">
+              <div class="progress-label">
+                <span>Pipeline Progress</span>
+                <span id="progressText">0%</span>
+              </div>
+              <progress id="progressBar" max="100" value="0" aria-label="processing progress"></progress>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- VIDEO COMPARISON -->
+      <main class="stage reveal delay-2">
+        <div class="stage-header">
+          <h2>Live Comparison</h2>
+        </div>
+
+        <div class="video-grid">
+          <section class="screen" data-role="input">
+            <div class="screen-header">
+              <h3>Source Feed</h3>
+              <span class="badge">RAW</span>
+            </div>
+            <div class="video-shell">
+              <video id="inputVideo" controls muted playsinline></video>
+              <div class="placeholder" id="inputPlaceholder">
+                <div class="placeholder-icon">🎬</div>
+                <p>Upload a clip to preview the original stream.</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" data-role="output">
+            <div class="screen-header">
+              <h3>Processed Feed</h3>
+              <span class="badge output">RE-ID</span>
+            </div>
+            <div class="video-shell">
+              <video id="outputVideo" controls muted playsinline></video>
+              <div class="placeholder" id="outputPlaceholder">
+                <div class="placeholder-icon">🤖</div>
+                <p>Processed output will appear here after pipeline completion.</p>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+
+
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+input/
+*.mp4
+outputs/
+web/outputs/
+web/uploads/
+*.log
+*.pptx
+test_output.txt
+consolidation_report.txt
+*.json
+__pycache__/
+*.pyc
+*.pkl
+models/
+*.pt
