@@ -13,3 +13,6 @@ __pycache__/
 *.pkl
 models/
 *.pt
+venv/
+reidentification/dataset/
+*.pth

@@ -451,8 +451,27 @@ class ReIDEngine:
     def _load_model(self, name):
         # Skip torchreid import (TensorFlow dependency chain causes hangs)
         # Use ResNetReIDBackbone directly (ResNet-50 + metric learning head)
-        m = ResNetReIDBackbone().to(self.device).eval()
-        logger.info("✅ ResNet-50 + Re-ID head loaded (512-dim embeddings)")
+        m = ResNetReIDBackbone().to(self.device)
+
+        # If a fine-tuned checkpoint exists (see reidentification/training/
+        # train_reid.py), load it. Falls back to the ImageNet-only backbone
+        # exactly as before if the file is missing/empty/unloadable, so
+        # nothing else in the pipeline (registration/embedder.py included)
+        # has to change either way.
+        weights_path = Path(__file__).resolve().parent / "weights" / "best_model.pth"
+        if weights_path.exists() and weights_path.stat().st_size > 0:
+            try:
+                state = torch.load(weights_path, map_location=self.device)
+                m.load_state_dict(state)
+                logger.info(f"✅ Fine-tuned Re-ID weights loaded from {weights_path} (512-dim embeddings)")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not load fine-tuned weights ({e}); "
+                                f"using ImageNet-only backbone instead")
+        else:
+            logger.info("✅ ResNet-50 + Re-ID head loaded (ImageNet weights only — "
+                        "no fine-tuned checkpoint found, 512-dim embeddings)")
+
+        m.eval()
         return m
 
     # ── feature ────────────────────────────────────────────────────────────
