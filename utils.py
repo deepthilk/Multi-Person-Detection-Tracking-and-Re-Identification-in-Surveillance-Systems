@@ -342,50 +342,23 @@ def generate_summary_report(detections_json, tracking_json, reid_json=None):
 if __name__ == "__main__":
     print("Utils module for multi-person tracking and Re-ID system")
 def draw_global_matches(frame, cam_frame_people):
-    """Like draw_reid_matches, but labels each box with the GLOBAL identity
-    (consistent across all cameras) and resolved name, if any — using the
-    output of reidentification.cross_camera_match instead of a single
-    camera's local consolidated_id."""
     frame_copy = frame.copy()
-
-    deduped = []
-    best_by_id = {}
+    seen_ids = set()
     for person in cam_frame_people:
         gid = person.get('global_id')
-        if gid is None:
-            continue  # unmatched/ghost track — nothing meaningful to label
-        bbox = person['bbox']
-        x1, y1, x2, y2 = bbox
-        area = max(0, x2 - x1) * max(0, y2 - y1)
-
-        candidate = {'global_id': gid, 'bbox': bbox, 'name': person.get('name'),
-                     'name_similarity': person.get('name_similarity'), 'area': area}
-        prev = best_by_id.get(gid)
-        if prev is None or area > prev['area']:
-            best_by_id[gid] = candidate
-
-    for candidate in sorted(best_by_id.values(), key=lambda x: x['area'], reverse=True):
-        keep = True
-        for kept in deduped:
-            if compute_iou(candidate['bbox'], kept['bbox']) > 0.50:
-                keep = False
-                break
-        if keep:
-            deduped.append(candidate)
-
-    for person in deduped:
+        if gid is None or gid in seen_ids:
+            continue  # only skip exact duplicate detections of the SAME id
+        seen_ids.add(gid)
         x1, y1, x2, y2 = person['bbox']
-        if person['name']:
-            color = (0, 200, 0)   # green = recognized/named person
+        if person.get('name'):
+            color = (0, 200, 0)
             label = f"{person['name']} ({person['name_similarity']:.2f})"
         else:
-            color = (0, 255, 255)  # cyan = unnamed but globally tracked
-            label = f"Global ID {person['global_id']}"
-
+            color = (0, 255, 255)
+            label = f"Global ID {gid}"
         cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame_copy, label, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
     return frame_copy
 
 
