@@ -341,3 +341,93 @@ def generate_summary_report(detections_json, tracking_json, reid_json=None):
 
 if __name__ == "__main__":
     print("Utils module for multi-person tracking and Re-ID system")
+def draw_global_matches(frame, cam_frame_people):
+    """Like draw_reid_matches, but labels each box with the GLOBAL identity
+    (consistent across all cameras) and resolved name, if any — using the
+    output of reidentification.cross_camera_match instead of a single
+    camera's local consolidated_id."""
+    frame_copy = frame.copy()
+
+    deduped = []
+    best_by_id = {}
+    for person in cam_frame_people:
+        gid = person.get('global_id')
+        if gid is None:
+            continue  # unmatched/ghost track — nothing meaningful to label
+        bbox = person['bbox']
+        x1, y1, x2, y2 = bbox
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+
+        candidate = {'global_id': gid, 'bbox': bbox, 'name': person.get('name'),
+                     'name_similarity': person.get('name_similarity'), 'area': area}
+        prev = best_by_id.get(gid)
+        if prev is None or area > prev['area']:
+            best_by_id[gid] = candidate
+
+    for candidate in sorted(best_by_id.values(), key=lambda x: x['area'], reverse=True):
+        keep = True
+        for kept in deduped:
+            if compute_iou(candidate['bbox'], kept['bbox']) > 0.50:
+                keep = False
+                break
+        if keep:
+            deduped.append(candidate)
+
+    for person in deduped:
+        x1, y1, x2, y2 = person['bbox']
+        if person['name']:
+            color = (0, 200, 0)   # green = recognized/named person
+            label = f"{person['name']} ({person['name_similarity']:.2f})"
+        else:
+            color = (0, 255, 255)  # cyan = unnamed but globally tracked
+            label = f"Global ID {person['global_id']}"
+
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame_copy, label, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return frame_copy
+
+
+def render_global_id_video(video_path, combined_json_path, camera_id, output_video_path):
+    """Render one camera's video with GLOBAL identity boxes (cross-camera
+    consistent IDs / names), reading reidentification/cross_camera_match.py's
+    combined output — e.g. outputs/cross_camera/global_identities.json."""
+    combined = load_json(combined_json_path)
+    cam_results = combined.get(camera_id, {})
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error(f"Failed to open video: {video_path}")
+        return False
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    out = None
+    for codec in ("mp4v", "avc1", "H264"):
+        writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*codec), fps, (width, height))
+        if writer.isOpened():
+            out = writer
+            break
+    if out is None:
+        cap.release()
+        logger.error("Failed to initialize VideoWriter with available codecs")
+        return False
+
+    frame_id = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_id += 1
+        frame_people = cam_results.get(str(frame_id), [])
+        frame = draw_global_matches(frame, frame_people)
+        out.write(frame)
+
+    cap.release()
+    out.release()
+    _reencode_for_browser(output_video_path)
+    logger.info(f"✅ Global-ID video saved -> {output_video_path}")
+    return True
