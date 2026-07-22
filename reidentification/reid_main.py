@@ -96,8 +96,8 @@ class ReIDConfig:
     REAPPEAR_GAP: int = 25   # LOWERED from 30 — quicker to re-appearance matching
 
     # Switch-guard (prevent ID swap during crossings — ULTRA STRICT for uniforms)
-    SWITCH_MARGIN:    float = 0.30   # HEAVILY INCREASED for uniforms — prevent accidental swaps
-    SWITCH_MIN_SCORE: float = 0.92   # HEAVILY INCREASED for uniforms — extremely confident before swapping
+    SWITCH_MARGIN:    float = 0.45   # HEAVILY INCREASED for uniforms — prevent accidental swaps
+    SWITCH_MIN_SCORE: float = 0.96   # HEAVILY INCREASED for uniforms — extremely confident before swapping
 
     # Continuity lock — STRENGTHENED for uniforms (hard to change ID)
     TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
