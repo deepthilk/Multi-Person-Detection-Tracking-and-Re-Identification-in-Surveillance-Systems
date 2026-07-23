@@ -450,6 +450,11 @@ class ReIDEngine:
         self.face_extractor = FaceCueExtractor()
         if self.face_extractor.enabled:
             logger.info("✅ Face-based Re-ID cue enabled (helps distinguish identical uniforms)")
+        # Diagnostics: how often is a face actually found? If this stays near
+        # 0%, the face cue can't be helping — worth knowing rather than
+        # guessing when tuning against real footage.
+        self._face_attempts = 0
+        self._face_hits     = 0
 
         if self.use_osnet:
             self.T_MATCH    = CFG.MATCH_THRESHOLD_OSNET
@@ -760,6 +765,9 @@ class ReIDEngine:
             feat = self.extract_feature(frame, bbox)
             if feat is not None:
                 face_feat = self.face_extractor.extract(frame, bbox)
+                self._face_attempts += 1
+                if face_feat is not None:
+                    self._face_hits += 1
                 self._store(pid, feat, frame_id)
                 candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': face_feat})
                 self._pending.pop(pid, None)
@@ -782,6 +790,11 @@ class ReIDEngine:
     # ── finalize ───────────────────────────────────────────────────────────
 
     def finalize_clustering(self):
+        if self.face_extractor.enabled and self._face_attempts > 0:
+            rate = 100.0 * self._face_hits / self._face_attempts
+            logger.info(f"📊 Face cue: detected on {self._face_hits}/{self._face_attempts} "
+                        f"person-detections ({rate:.1f}%) — "
+                        f"{'low rate, faces mostly not helping here' if rate < 15 else 'active and contributing to matches'}")
         if self.track_to_identity:
             self.id_mapping = dict(self.track_to_identity)
             self.consolidated_features = {

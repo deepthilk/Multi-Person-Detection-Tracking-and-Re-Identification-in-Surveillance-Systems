@@ -58,9 +58,9 @@ class FaceCueExtractor:
     # Below this face-detector confidence (via the face's location size vs
     # the crop), skip — a tiny/partial face gives a noisy, unreliable
     # embedding that would do more harm than good.
-    MIN_FACE_PIXELS = 20   # min face-box side length in the (upsampled) crop
+    MIN_FACE_PIXELS = 15   # min face-box side length in the (upsampled) crop
 
-    def __init__(self, upsample_times: int = 1):
+    def __init__(self, upsample_times: int = 2):
         self.enabled = _FACE_RECOGNITION_AVAILABLE
         self.upsample_times = upsample_times
 
