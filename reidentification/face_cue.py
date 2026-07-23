@@ -27,6 +27,7 @@ Usage (see reid_main.py's ReIDEngine for the actual wiring):
 """
 
 import logging
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,9 @@ class FaceCueExtractor:
     def __init__(self, upsample_times: int = 2):
         self.enabled = _FACE_RECOGNITION_AVAILABLE
         self.upsample_times = upsample_times
+        self._errors_logged = 0   # surface the first few extraction errors
+                                   # visibly instead of silently swallowing
+                                   # them at debug level forever
 
     def _head_crop(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
@@ -85,8 +89,15 @@ class FaceCueExtractor:
         if crop is None or crop.shape[0] < 10 or crop.shape[1] < 10:
             return None
         try:
-            # face_recognition expects RGB
-            rgb = crop[:, :, ::-1]
+            # IMPORTANT: crop[:, :, ::-1] looks like it converts BGR->RGB, but
+            # it creates a non-contiguous array (negative stride) — dlib's C++
+            # backend (underneath face_recognition) silently rejects those
+            # with no visible error, which is exactly what caused the 0%
+            # detection rate here. cv2.cvtColor always returns a proper
+            # contiguous array.
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            if not rgb.flags['C_CONTIGUOUS']:
+                rgb = np.ascontiguousarray(rgb)   # belt-and-braces safety net
             locations = face_recognition.face_locations(
                 rgb, number_of_times_to_upsample=self.upsample_times
             )
@@ -107,7 +118,11 @@ class FaceCueExtractor:
                 return None
             return np.asarray(encodings[0], dtype=np.float32)
         except Exception as e:
-            logger.debug(f"Face extraction error: {e}")
+            if self._errors_logged < 3:
+                logger.warning(f"⚠️  Face extraction error (showing first 3 only): {e}")
+                self._errors_logged += 1
+            else:
+                logger.debug(f"Face extraction error: {e}")
             return None
 
     @staticmethod
