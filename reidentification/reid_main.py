@@ -63,6 +63,8 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from reidentification.face_cue import FaceCueExtractor  # optional face-based cue
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Config
@@ -96,8 +98,8 @@ class ReIDConfig:
     REAPPEAR_GAP: int = 25   # LOWERED from 30 — quicker to re-appearance matching
 
     # Switch-guard (prevent ID swap during crossings — ULTRA STRICT for uniforms)
-    SWITCH_MARGIN:    float = 0.45   # HEAVILY INCREASED for uniforms — prevent accidental swaps
-    SWITCH_MIN_SCORE: float = 0.96   # HEAVILY INCREASED for uniforms — extremely confident before swapping
+    SWITCH_MARGIN:    float = 0.30   # HEAVILY INCREASED for uniforms — prevent accidental swaps
+    SWITCH_MIN_SCORE: float = 0.92   # HEAVILY INCREASED for uniforms — extremely confident before swapping
 
     # Continuity lock — STRENGTHENED for uniforms (hard to change ID)
     TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
@@ -133,6 +135,15 @@ class ReIDConfig:
     CUE_COLOR_ZONE: float = 0.20
     CUE_TEXTURE:    float = 0.06
     CUE_PROPORTION: float = 0.04
+
+    # Face cue — NOT part of the 698-dim descriptor (kept separate so the
+    # registration module's stable contract is unaffected). Applied as a
+    # heavy override on top of the body-appearance score whenever a
+    # confident face embedding is available on both sides of a comparison.
+    # Faces stay distinctive even in identical uniforms, unlike body
+    # appearance — this directly targets the uniform-crossing failure mode.
+    FACE_WEIGHT:          float = 0.65   # blend weight when a face is available
+    FACE_MIN_SIMILARITY:  float = 0.35   # below this, treat as a mismatch veto
 
 
 CFG = ReIDConfig()
@@ -373,7 +384,8 @@ class AppearanceGallery:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Identity:
-    def __init__(self, stable_id: int, descriptor: np.ndarray, bbox, frame_id: int):
+    def __init__(self, stable_id: int, descriptor: np.ndarray, bbox, frame_id: int,
+                 face_descriptor=None):
         self.stable_id   = stable_id
         self.descriptor  = descriptor.copy()
         self.gallery     = AppearanceGallery(descriptor)
@@ -382,11 +394,21 @@ class Identity:
         self.velocity    = (0.0, 0.0)
         self.last_frame  = frame_id
         self.count       = 1
+        # Best face embedding seen for this identity so far (None until a
+        # confident face is first observed). Kept as a single "best" vector
+        # rather than an EMA — a clear frontal face is a much stronger
+        # reference than an average blended with blurry/angled ones.
+        self.face_descriptor = face_descriptor.copy() if face_descriptor is not None else None
 
     def appearance_score(self, query) -> float:
         return 0.70 * self.gallery.match(query) + 0.30 * _cosine(query, self.descriptor)
 
-    def update(self, descriptor, bbox, frame_id: int):
+    def face_similarity(self, face_query):
+        if self.face_descriptor is None or face_query is None:
+            return None
+        return FaceCueExtractor.similarity(self.face_descriptor, face_query)
+
+    def update(self, descriptor, bbox, frame_id: int, face_descriptor=None):
         self.descriptor = _normalize(
             (1-CFG.EMA_ALPHA)*self.descriptor + CFG.EMA_ALPHA*descriptor)
         self.gallery.update(descriptor)
@@ -401,6 +423,11 @@ class Identity:
         self.last_center = c
         self.last_frame  = frame_id
         self.count      += 1
+        if face_descriptor is not None:
+            # A fresh confident face detection replaces the stored one — at
+            # minimum equally trustworthy as whatever (possibly none) we
+            # had, and this keeps it current if the person's angle changes.
+            self.face_descriptor = face_descriptor.copy()
 
     def predicted_bbox(self, frame_id: int):
         gap = max(1, frame_id-self.last_frame)
@@ -420,6 +447,9 @@ class ReIDEngine:
         self.use_osnet = False
         self.model     = self._load_model(model_name)
         self.extractor = MultiCueExtractor(self.device, self.use_osnet)
+        self.face_extractor = FaceCueExtractor()
+        if self.face_extractor.enabled:
+            logger.info("✅ Face-based Re-ID cue enabled (helps distinguish identical uniforms)")
 
         if self.use_osnet:
             self.T_MATCH    = CFG.MATCH_THRESHOLD_OSNET
@@ -487,7 +517,23 @@ class ReIDEngine:
         dist = float(np.linalg.norm(_bbox_center(bbox) - _bbox_center(ref_bbox)))
         return float(np.exp(-dist / (diag * CFG.MOTION_DENOM_COEFF + 1e-6)))
 
-    def _score(self, identity: Identity, feat, bbox, frame_id: int) -> float:
+    def _blend_face(self, base_score: float, identity: Identity, face_feat) -> float:
+        """Blend a face-similarity override into a base score, when a
+        confident face embedding is available on both sides. Faces stay
+        distinctive in identical uniforms, so this is weighted heavily —
+        but it only ever activates when both identity.face_descriptor and
+        the current detection's face_feat exist; otherwise it's a no-op
+        and behaviour is identical to before this cue was added."""
+        face_sim = identity.face_similarity(face_feat)
+        if face_sim is None:
+            return base_score
+        if face_sim < CFG.FACE_MIN_SIMILARITY:
+            # Confident face mismatch — veto even a strong body-appearance
+            # score, since two different people can't share a face.
+            return min(base_score, face_sim)
+        return (1 - CFG.FACE_WEIGHT) * base_score + CFG.FACE_WEIGHT * face_sim
+
+    def _score(self, identity: Identity, feat, bbox, frame_id: int, face_feat=None) -> float:
         gap = frame_id - identity.last_frame
         app = identity.appearance_score(feat)
 
@@ -495,7 +541,7 @@ class ReIDEngine:
         # Use appearance-only scoring so a person returning after 50+ frames
         # isn't penalised for being in a different position.
         if gap > CFG.REAPPEAR_GAP:
-            return app   # pure appearance, compared against T_REAPPEAR later
+            return self._blend_face(app, identity, face_feat)   # compared against T_REAPPEAR later
 
         ref  = identity.predicted_bbox(frame_id) if gap > 1 else identity.last_bbox
         iou  = _iou(bbox, ref)
@@ -504,7 +550,8 @@ class ReIDEngine:
         if mot < 0.08 and iou < 0.02 and gap > CFG.MOTION_GATE_MIN_GAP:
             return -1.0
 
-        return CFG.W_APPEARANCE*app + CFG.W_MOTION*mot + CFG.W_IOU*iou
+        base = CFG.W_APPEARANCE*app + CFG.W_MOTION*mot + CFG.W_IOU*iou
+        return self._blend_face(base, identity, face_feat)
 
     # ── crossings ──────────────────────────────────────────────────────────
 
@@ -551,7 +598,8 @@ class ReIDEngine:
                     ident = self.identity_db[sid]
                     if frame_id - ident.last_frame > CFG.MAX_IDENTITY_GAP:
                         continue
-                    s = self._score(ident, cand['feat'], cand['bbox'], frame_id)
+                    s = self._score(ident, cand['feat'], cand['bbox'], frame_id,
+                                     face_feat=cand.get('face_feat'))
                     if self.track_to_identity.get(cand['tid']) == sid:
                         s = min(s + 0.06, 1.0)
                     if frame_id - ident.last_frame <= CFG.REACTIVATE_WINDOW:
@@ -660,13 +708,15 @@ class ReIDEngine:
             if i in assigned:
                 continue
             sid = self.next_stable_id; self.next_stable_id += 1
-            self.identity_db[sid] = Identity(sid, cand['feat'], cand['bbox'], frame_id)
+            self.identity_db[sid] = Identity(sid, cand['feat'], cand['bbox'], frame_id,
+                                              face_descriptor=cand.get('face_feat'))
             assigned[i] = sid; used.add(sid)
 
         # ── Update ────────────────────────────────────────────────────────
         for i, sid in assigned.items():
             cand = candidates[i]
-            self.identity_db[sid].update(cand['feat'], cand['bbox'], frame_id)
+            self.identity_db[sid].update(cand['feat'], cand['bbox'], frame_id,
+                                          face_descriptor=cand.get('face_feat'))
             self.track_to_identity[cand['tid']] = sid
             self.track_last_seen[cand['tid']]   = frame_id
             self._pending.pop(cand['tid'], None)
@@ -709,8 +759,9 @@ class ReIDEngine:
 
             feat = self.extract_feature(frame, bbox)
             if feat is not None:
+                face_feat = self.face_extractor.extract(frame, bbox)
                 self._store(pid, feat, frame_id)
-                candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat})
+                candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': face_feat})
                 self._pending.pop(pid, None)
             else:
                 existing = self.track_to_identity.get(pid)
