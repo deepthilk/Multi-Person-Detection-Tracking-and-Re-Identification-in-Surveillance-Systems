@@ -120,7 +120,18 @@ class ReIDConfig:
     DEDUP_IOU:       float = 0.75
 
     # Temporal
-    MAX_IDENTITY_GAP:  int = 500    # frames identity is remembered
+    # How long (in frames) an identity stays eligible for re-matching before
+    # being permanently forgotten. This used to be 500 frames (~17 seconds
+    # at 30fps) — nowhere near enough for "recognize the same person if they
+    # return 10+ minutes later" (an explicit requirement). At 30fps, 10
+    # minutes = 18,000 frames; set generously higher for headroom (variable
+    # fps, longer sessions). Tradeoff: identities are held in memory (and
+    # considered as match candidates) for the whole session instead of
+    # being pruned quickly — more candidates in the pool means slightly more
+    # opportunity for confusion between similar-looking people, but that's
+    # the necessary cost of the long-term recognition requirement, not a
+    # bug. Adjust to match your actual video's fps/length if needed.
+    MAX_IDENTITY_GAP:  int = 60000   # ~33 min at 30fps — long-term memory
     REACTIVATE_WINDOW: int = 45
 
     # Crossing
@@ -144,6 +155,11 @@ class ReIDConfig:
     # appearance — this directly targets the uniform-crossing failure mode.
     FACE_WEIGHT:          float = 0.65   # blend weight when a face is available
     FACE_MIN_SIMILARITY:  float = 0.35   # below this, treat as a mismatch veto
+
+    # Grace period before minting a brand-new identity — see PASS 4 comment
+    # in ReIDEngine._assign for why this exists (single-frame re-appearance
+    # failures were permanently splitting one person into two IDs).
+    NEW_ID_GRACE_FRAMES: int = 4
 
 
 CFG = ReIDConfig()
@@ -455,6 +471,7 @@ class ReIDEngine:
         # guessing when tuning against real footage.
         self._face_attempts = 0
         self._face_hits     = 0
+        self._new_id_grace: dict = {}   # tracker_id -> consecutive PASS4-miss count
 
         if self.use_osnet:
             self.T_MATCH    = CFG.MATCH_THRESHOLD_OSNET
@@ -709,13 +726,34 @@ class ReIDEngine:
                     assigned[i] = best_sid; used.add(best_sid)
 
         # ── PASS 4: new identities ────────────────────────────────────────
+        # FIX: a candidate that fails PASS 1-3 on a SINGLE frame used to get
+        # a brand-new permanent identity immediately — meaning a person
+        # re-entering frame had exactly one frame's chance to match their
+        # old identity, with no retry. If that one frame had a bad angle,
+        # no visible face, or a mediocre appearance score (common right at
+        # re-entry), they'd be wrongly given a new ID forever, even though
+        # PASS 1-3 keep running fresh every subsequent frame and might well
+        # have matched them a moment later.
+        #
+        # Grace period: hold off minting a new identity for a tracker id
+        # until it has failed matching for CFG.NEW_ID_GRACE_FRAMES in a row.
+        # Only applies when other identities already exist (stable_ids) —
+        # the very first person(s) ever seen still get an ID immediately,
+        # since there's nothing for them to be a re-appearance OF.
         for i, cand in enumerate(candidates):
             if i in assigned:
                 continue
+            tid = cand['tid']
+            if stable_ids:
+                miss = self._new_id_grace.get(tid, 0) + 1
+                self._new_id_grace[tid] = miss
+                if miss < CFG.NEW_ID_GRACE_FRAMES:
+                    continue   # give PASS 1-3 another shot next frame
             sid = self.next_stable_id; self.next_stable_id += 1
             self.identity_db[sid] = Identity(sid, cand['feat'], cand['bbox'], frame_id,
                                               face_descriptor=cand.get('face_feat'))
             assigned[i] = sid; used.add(sid)
+            self._new_id_grace.pop(tid, None)
 
         # ── Update ────────────────────────────────────────────────────────
         for i, sid in assigned.items():
@@ -725,6 +763,7 @@ class ReIDEngine:
             self.track_to_identity[cand['tid']] = sid
             self.track_last_seen[cand['tid']]   = frame_id
             self._pending.pop(cand['tid'], None)
+            self._new_id_grace.pop(cand['tid'], None)   # matched — reset grace
 
         return assigned
 
