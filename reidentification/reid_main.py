@@ -125,7 +125,20 @@ class ReIDConfig:
     MIN_CROP_PX:     int   = 8      # min pixels after clamping
     MIN_HEIGHT:      int   = 50
     MIN_AREA_RATIO:  float = 0.0008
-    DEDUP_IOU:       float = 0.75
+    # Duplicate-detection merge (before any tracking/Re-ID even runs): when
+    # YOLO/NMS produces two overlapping boxes for one physical person, they
+    # need to be merged into one BEFORE reaching the tracker/Re-ID — an
+    # unmerged duplicate becomes two separate tracker IDs, which Re-ID will
+    # (correctly, given its inputs) treat as two different people and give
+    # two different global IDs, inflating the person count. 0.75 was too
+    # strict: two real duplicate boxes on one person are often visibly
+    # offset from each other (different crop margins from near-identical
+    # detections), not near-perfectly overlapping — observed case had two
+    # boxes clearly on one person that never crossed 0.75 IoU. Lowered to
+    # 0.5, which still requires substantial overlap (so two genuinely
+    # different people standing close together in a crossing won't get
+    # wrongly merged here) while catching realistic duplicate detections.
+    DEDUP_IOU:       float = 0.50
 
     # Temporal
     # How long (in frames) an identity stays eligible for re-matching before
