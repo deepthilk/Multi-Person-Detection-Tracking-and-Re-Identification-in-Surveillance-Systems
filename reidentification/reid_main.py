@@ -809,6 +809,30 @@ class ReIDEngine:
                     if s > best_s:
                         best_s, best_sid = s, sid
                 if best_sid is not None and best_s >= self.T_REAPPEAR:
+                    # FIX: PASS 3 used to reassign a tracker's identity purely
+                    # based on crossing T_REAPPEAR, with NO check against
+                    # whatever identity that tracker was already carrying
+                    # from earlier this frame or a prior frame — unlike
+                    # PASS 1/2, which both require clearing the switch-guard
+                    # before overriding an existing assignment. This let a
+                    # low-confidence reappearance score silently steal a
+                    # track from its correct identity, right after PASS 2's
+                    # switch-guard had already (correctly) blocked the same
+                    # move — the exact swap traced at frame 252 (tid=9
+                    # blocked 3->1 by PASS2, then done anyway by PASS3).
+                    prev = self.track_to_identity.get(cand['tid'])
+                    if prev is not None and prev in sid_to_col and prev != best_sid:
+                        ps = float(score_matrix[i, sid_to_col[prev]])
+                        allowed = self._switch_allowed(
+                                best_s, ps, cand.get('face_feat'),
+                                self.identity_db[best_sid], self.identity_db.get(prev),
+                                CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                        self._trace(frame_id, f"PASS3 SWITCH tid={cand['tid']} "
+                                    f"{prev}->{best_sid}: new_s={best_s:.3f} prev_s={ps:.3f} "
+                                    f"has_face={cand.get('face_feat') is not None} "
+                                    f"{'ALLOWED' if allowed else 'BLOCKED'}")
+                        if not allowed:
+                            continue   # leave unassigned this frame; PASS4 grace retries later
                     logger.debug(f"  Re-appearance: tracker {cand['tid']} → "
                                  f"stable_id {best_sid}  score={best_s:.3f}")
                     self._trace(frame_id, f"PASS3 reappear: tid={cand['tid']} -> sid={best_sid} "
