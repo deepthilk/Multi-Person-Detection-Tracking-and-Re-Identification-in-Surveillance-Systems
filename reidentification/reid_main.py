@@ -474,9 +474,14 @@ class Identity:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReIDEngine:
-    def __init__(self, model_name="osnet_x1_0", device="cuda"):
+    def __init__(self, model_name="osnet_x1_0", device="cuda", debug_trace=False):
         self.device    = torch.device(device if torch.cuda.is_available() else "cpu")
         self.use_osnet = False
+        self.debug_trace = debug_trace   # see _trace() — set True to log every
+                                          # ID decision (lock/assign/switch/new)
+                                          # with the exact scores behind it,
+                                          # instead of having to infer what
+                                          # happened from watching a video
         self.model     = self._load_model(model_name)
         self.extractor = MultiCueExtractor(self.device, self.use_osnet)
         self.face_extractor = FaceCueExtractor()
@@ -595,6 +600,15 @@ class ReIDEngine:
                 margin, min_score = CFG.SWITCH_MARGIN_FACE_CONFIRMED, CFG.SWITCH_MIN_SCORE_FACE_CONFIRMED
         return s >= ps + margin and s >= min_score
 
+    def _trace(self, frame_id: int, msg: str):
+        """Opt-in decision log (enable with debug_trace=True). Prints exactly
+        which ID decision fired and why, at the moment it happens — grep the
+        output for '[TRACE fN' around a frame number you saw go wrong in the
+        video (frame ≈ seconds_into_video * fps) to see the real numbers
+        behind it, instead of guessing from what the video looks like."""
+        if self.debug_trace:
+            logger.info(f"[TRACE f{frame_id}] {msg}")
+
     def _score(self, identity: Identity, feat, bbox, frame_id: int, face_feat=None) -> float:
         gap = frame_id - identity.last_frame
         app = identity.appearance_score(feat)
@@ -701,9 +715,10 @@ class ReIDEngine:
                 if gap <= CFG.TRACK_LOCK_GAP and s >= CFG.TRACK_LOCK_MIN_SCORE:
                     if prev not in best_lock or s > best_lock[prev][1]:
                         best_lock[prev] = (i, s)
-            for sid, (row, _) in best_lock.items():
+            for sid, (row, s) in best_lock.items():
                 assigned[row] = sid; used.add(sid)
                 locked_rows.add(row); locked_cols.add(sid_to_col[sid])
+                self._trace(frame_id, f"PASS0 lock: tid={candidates[row]['tid']} -> sid={sid} score={s:.3f}")
 
         # ── PASS 1: Hungarian (short-gap candidates) ──────────────────────
         if stable_ids:
@@ -732,11 +747,17 @@ class ReIDEngine:
                         ps = float(score_matrix[r, sid_to_col[prev]])
                         mg = CFG.SWITCH_MARGIN * (1.5 if is_cross else 1.0)
                         ma = CFG.SWITCH_MIN_SCORE * (1.05 if is_cross else 1.0)
-                        if not self._switch_allowed(
+                        allowed = self._switch_allowed(
                                 s, ps, candidates[r].get('face_feat'),
-                                self.identity_db[sid], self.identity_db.get(prev), mg, ma):
+                                self.identity_db[sid], self.identity_db.get(prev), mg, ma)
+                        self._trace(frame_id, f"PASS1 SWITCH tid={candidates[r]['tid']} "
+                                    f"{prev}->{sid}: new_s={s:.3f} prev_s={ps:.3f} "
+                                    f"has_face={candidates[r].get('face_feat') is not None} "
+                                    f"{'ALLOWED' if allowed else 'BLOCKED'}")
+                        if not allowed:
                             continue
                     assigned[r] = sid; used.add(sid)
+                    self._trace(frame_id, f"PASS1 assign: tid={candidates[r]['tid']} -> sid={sid} score={s:.3f}")
 
         # ── PASS 2: greedy fallback ───────────────────────────────────────
         if stable_ids:
@@ -755,12 +776,18 @@ class ReIDEngine:
                 prev = self.track_to_identity.get(cand['tid'])
                 if prev is not None and prev in sid_to_col and prev != best_sid:
                     ps = float(score_matrix[i, sid_to_col[prev]])
-                    if not self._switch_allowed(
+                    allowed = self._switch_allowed(
                             best_s, ps, cand.get('face_feat'),
                             self.identity_db[best_sid], self.identity_db.get(prev),
-                            CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE):
+                            CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                    self._trace(frame_id, f"PASS2 SWITCH tid={cand['tid']} "
+                                f"{prev}->{best_sid}: new_s={best_s:.3f} prev_s={ps:.3f} "
+                                f"has_face={cand.get('face_feat') is not None} "
+                                f"{'ALLOWED' if allowed else 'BLOCKED'}")
+                    if not allowed:
                         continue
                 assigned[i] = best_sid; used.add(best_sid)
+                self._trace(frame_id, f"PASS2 assign: tid={cand['tid']} -> sid={best_sid} score={best_s:.3f}")
 
         # ── PASS 3: re-appearance (appearance-only, long gap) ─────────────
         # FIX (Bug 7): dedicated pass for persons returning after >REAPPEAR_GAP frames.
@@ -784,6 +811,9 @@ class ReIDEngine:
                 if best_sid is not None and best_s >= self.T_REAPPEAR:
                     logger.debug(f"  Re-appearance: tracker {cand['tid']} → "
                                  f"stable_id {best_sid}  score={best_s:.3f}")
+                    self._trace(frame_id, f"PASS3 reappear: tid={cand['tid']} -> sid={best_sid} "
+                                f"score={best_s:.3f} (T_REAPPEAR={self.T_REAPPEAR:.3f}) "
+                                f"has_face={cand.get('face_feat') is not None}")
                     assigned[i] = best_sid; used.add(best_sid)
 
         # ── PASS 4: new identities ────────────────────────────────────────
@@ -809,12 +839,15 @@ class ReIDEngine:
                 miss = self._new_id_grace.get(tid, 0) + 1
                 self._new_id_grace[tid] = miss
                 if miss < CFG.NEW_ID_GRACE_FRAMES:
+                    self._trace(frame_id, f"PASS4 grace: tid={tid} miss={miss}/{CFG.NEW_ID_GRACE_FRAMES}, waiting")
                     continue   # give PASS 1-3 another shot next frame
             sid = self.next_stable_id; self.next_stable_id += 1
             self.identity_db[sid] = Identity(sid, cand['feat'], cand['bbox'], frame_id,
                                               face_descriptor=cand.get('face_feat'))
             assigned[i] = sid; used.add(sid)
             self._new_id_grace.pop(tid, None)
+            self._trace(frame_id, f"PASS4 NEW IDENTITY: tid={tid} -> sid={sid} "
+                        f"(had_stable_ids={bool(stable_ids)}, has_face={cand.get('face_feat') is not None})")
 
         # ── Update ────────────────────────────────────────────────────────
         for i, sid in assigned.items():
@@ -957,11 +990,11 @@ class ReIDEngine:
 #  Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="cuda"):
+def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="cuda", debug_trace=False):
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
 
-    engine = ReIDEngine(device=device)
+    engine = ReIDEngine(device=device, debug_trace=debug_trace)
 
     with open(tracking_json_path) as f:
         tracking_data = json.load(f)

@@ -45,6 +45,10 @@ def main():
     parser.add_argument("--skip-names", action="store_true",
                          help="Skip name resolution even if the registration DB has entries")
     parser.add_argument("--output", type=str, default="outputs/cross_camera/global_identities.json")
+    parser.add_argument("--debug-trace", action="store_true",
+                         help="Log every ID lock/switch/reappear/new-identity decision with the "
+                              "exact scores behind it — grep the output for a frame number "
+                              "(frame ≈ seconds_into_video * fps) to see exactly why a swap happened")
     args = parser.parse_args()
 
     import torch
@@ -88,6 +92,7 @@ def main():
             tracking_json_path=tracking_json,
             output_json_path=reid_output,
             device=device,
+            debug_trace=args.debug_trace,
         )
         camera_engines[cam_id] = engine
         camera_results[cam_id] = results
