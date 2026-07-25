@@ -159,7 +159,15 @@ class ReIDConfig:
     # Grace period before minting a brand-new identity — see PASS 4 comment
     # in ReIDEngine._assign for why this exists (single-frame re-appearance
     # failures were permanently splitting one person into two IDs).
-    NEW_ID_GRACE_FRAMES: int = 4
+    # Kept short deliberately: each extra grace frame is also an extra
+    # chance for a genuinely new person to accidentally cross the (loose,
+    # uniform-tolerant) reappearance threshold and get wrongly merged into
+    # an existing identity — see REAPPEAR_NO_FACE_PENALTY below.
+    NEW_ID_GRACE_FRAMES: int = 2
+
+    # Body-only reappearance (no face confirmation available) is penalised
+    # by this much before comparing against T_REAPPEAR — see _score().
+    REAPPEAR_NO_FACE_PENALTY: float = 0.12
 
 
 CFG = ReIDConfig()
@@ -563,7 +571,23 @@ class ReIDEngine:
         # Use appearance-only scoring so a person returning after 50+ frames
         # isn't penalised for being in a different position.
         if gap > CFG.REAPPEAR_GAP:
-            return self._blend_face(app, identity, face_feat)   # compared against T_REAPPEAR later
+            face_sim = identity.face_similarity(face_feat)
+            if face_sim is not None:
+                # A face is available on both sides — this is a reliable
+                # signal even in identical uniforms, so use the normal
+                # (lenient) blend.
+                return self._blend_face(app, identity, face_feat)
+            # No face on either side: T_REAPPEAR (0.45-0.50) was tuned loose
+            # specifically to tolerate uniform ambiguity — fine for a single
+            # attempt, but combined with the multi-frame retry grace period
+            # (see PASS 4), a genuinely NEW person got repeated chances to
+            # cross that loose bar by uniform-driven coincidence, causing
+            # false merges (observed: 4 real people collapsed to 3 IDs).
+            # Require a distinctly higher raw appearance score here so
+            # body-only reappearance is deliberately harder to trigger by
+            # chance — better to occasionally split one real person into
+            # two IDs than to merge two different real people into one.
+            return app - CFG.REAPPEAR_NO_FACE_PENALTY
 
         ref  = identity.predicted_bbox(frame_id) if gap > 1 else identity.last_bbox
         iou  = _iou(bbox, ref)
