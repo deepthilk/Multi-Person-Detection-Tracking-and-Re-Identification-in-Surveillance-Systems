@@ -98,8 +98,16 @@ class ReIDConfig:
     REAPPEAR_GAP: int = 25   # LOWERED from 30 — quicker to re-appearance matching
 
     # Switch-guard (prevent ID swap during crossings — ULTRA STRICT for uniforms)
-    SWITCH_MARGIN:    float = 0.30   # HEAVILY INCREASED for uniforms — prevent accidental swaps
-    SWITCH_MIN_SCORE: float = 0.92   # HEAVILY INCREASED for uniforms — extremely confident before swapping
+    SWITCH_MARGIN:    float = 0.45   # HEAVILY INCREASED for uniforms — prevent accidental swaps
+    SWITCH_MIN_SCORE: float = 0.96   # HEAVILY INCREASED for uniforms — extremely confident before swapping
+
+    # When a face confidently confirms the SWITCH target (and/or confidently
+    # disagrees with whatever identity is currently locked in), the strict
+    # thresholds above are relaxed to these — face evidence is fundamentally
+    # more trustworthy than body appearance for identical uniforms, so it's
+    # allowed to correct a switch the body-only guard would otherwise block.
+    SWITCH_MARGIN_FACE_CONFIRMED:    float = 0.05
+    SWITCH_MIN_SCORE_FACE_CONFIRMED: float = 0.55
 
     # Continuity lock — STRENGTHENED for uniforms (hard to change ID)
     TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
@@ -563,6 +571,30 @@ class ReIDEngine:
             return min(base_score, face_sim)
         return (1 - CFG.FACE_WEIGHT) * base_score + CFG.FACE_WEIGHT * face_sim
 
+    def _switch_allowed(self, s: float, ps: float, cand_face_feat,
+                         new_identity: 'Identity', prev_identity: 'Identity',
+                         margin: float, min_score: float) -> bool:
+        """Whether re-assigning a track from prev_identity to new_identity is
+        allowed. Normally requires clearing strict margin/min_score bars
+        (see SWITCH_MARGIN/SWITCH_MIN_SCORE — deliberately hard to trigger,
+        to avoid accidental swaps between identically-uniformed people).
+        But when a face is available and clearly says "this is NOT
+        prev_identity, it IS new_identity", that's a much more trustworthy
+        signal than body appearance alone — so this relaxes the bar to
+        SWITCH_*_FACE_CONFIRMED instead. This is what lets a wrong
+        assignment made during an occluded crossing (where no face was
+        visible) get corrected a few frames later once a face becomes
+        visible again — without it, the strict guard built to prevent
+        swaps also prevents legitimate corrections."""
+        if cand_face_feat is not None:
+            new_face_sim  = new_identity.face_similarity(cand_face_feat)
+            prev_face_sim = prev_identity.face_similarity(cand_face_feat) if prev_identity else None
+            face_confirms = (new_face_sim is not None and new_face_sim >= CFG.FACE_MIN_SIMILARITY and
+                              (prev_face_sim is None or prev_face_sim < CFG.FACE_MIN_SIMILARITY))
+            if face_confirms:
+                margin, min_score = CFG.SWITCH_MARGIN_FACE_CONFIRMED, CFG.SWITCH_MIN_SCORE_FACE_CONFIRMED
+        return s >= ps + margin and s >= min_score
+
     def _score(self, identity: Identity, feat, bbox, frame_id: int, face_feat=None) -> float:
         gap = frame_id - identity.last_frame
         app = identity.appearance_score(feat)
@@ -700,7 +732,9 @@ class ReIDEngine:
                         ps = float(score_matrix[r, sid_to_col[prev]])
                         mg = CFG.SWITCH_MARGIN * (1.5 if is_cross else 1.0)
                         ma = CFG.SWITCH_MIN_SCORE * (1.05 if is_cross else 1.0)
-                        if not (s >= ps + mg and s >= ma):
+                        if not self._switch_allowed(
+                                s, ps, candidates[r].get('face_feat'),
+                                self.identity_db[sid], self.identity_db.get(prev), mg, ma):
                             continue
                     assigned[r] = sid; used.add(sid)
 
@@ -721,7 +755,10 @@ class ReIDEngine:
                 prev = self.track_to_identity.get(cand['tid'])
                 if prev is not None and prev in sid_to_col and prev != best_sid:
                     ps = float(score_matrix[i, sid_to_col[prev]])
-                    if not (best_s >= ps + CFG.SWITCH_MARGIN and best_s >= CFG.SWITCH_MIN_SCORE):
+                    if not self._switch_allowed(
+                            best_s, ps, cand.get('face_feat'),
+                            self.identity_db[best_sid], self.identity_db.get(prev),
+                            CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE):
                         continue
                 assigned[i] = best_sid; used.add(best_sid)
 
