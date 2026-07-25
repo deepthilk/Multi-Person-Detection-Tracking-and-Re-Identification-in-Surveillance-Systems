@@ -859,6 +859,13 @@ class ReIDEngine:
             self._pending.pop(cand['tid'], None)
             self._new_id_grace.pop(cand['tid'], None)   # matched — reset grace
 
+        if self.debug_trace:
+            state = {candidates[i]['tid']: sid for i, sid in assigned.items()}
+            all_tids = [c['tid'] for c in candidates]
+            unassigned = [t for t in all_tids if t not in state]
+            self._trace(frame_id, f"STATE tids_this_frame={all_tids} "
+                        f"assigned={state} unassigned={unassigned}")
+
         return assigned
 
     # ── process_frame ──────────────────────────────────────────────────────
