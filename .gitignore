@@ -16,4 +16,4 @@ models/
 venv/
 reidentification/dataset/
 *.pth
-model/model.py
+reidentification/model/model.py
