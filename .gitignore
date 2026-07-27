@@ -16,3 +16,5 @@ models/
 venv/
 reidentification/dataset/
 *.pth
+check_similarity/
+photos/
