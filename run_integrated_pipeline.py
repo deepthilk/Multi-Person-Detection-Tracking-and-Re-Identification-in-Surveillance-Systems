@@ -49,6 +49,12 @@ def main():
                          help="Log every ID lock/switch/reappear/new-identity decision with the "
                               "exact scores behind it — grep the output for a frame number "
                               "(frame ≈ seconds_into_video * fps) to see exactly why a swap happened")
+    parser.add_argument("--track-level", action="store_true",
+                         help="Use track-level global clustering (reidentification.track_cluster) "
+                              "instead of the frame-by-frame ReIDEngine + separate cross-camera "
+                              "matching step. Averages descriptors over each whole DeepSORT track "
+                              "and clusters once, globally, rather than deciding identity every "
+                              "frame in real time — see track_cluster.py's module docstring for why.")
     args = parser.parse_args()
 
     import torch
@@ -68,6 +74,55 @@ def main():
         device=device, conf_threshold=args.conf_threshold, max_frames=args.max_frames,
     )
     logger.info(f"✅ {len(records)} person records across {len(per_camera_tracking)} camera(s)")
+
+    registered_persons = None
+    if not args.skip_names:
+        try:
+            from registration.identity_db import IdentityDatabase
+            db = IdentityDatabase()
+            if len(db):
+                registered_persons = db.export_for_reid()
+                logger.info(f"Loaded {len(registered_persons)} registered person(s) for name resolution")
+            else:
+                logger.info("Registration DB is empty — global identities will be unnamed")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not load registration DB ({e}); continuing without names")
+
+    if args.track_level:
+        # ── Track-level path: one clustering pass replaces Steps 2+3 ──────
+        logger.info("=" * 70)
+        logger.info("STEP 2+3: Track-Level Re-Identification & Clustering")
+        logger.info("=" * 70)
+        from reidentification.track_cluster import run_track_level_pipeline
+
+        per_camera_tracking_paths = {}
+        for cfg in CAMERAS:
+            cam_id = cfg["camera_id"]
+            if cam_id not in per_camera_tracking or not per_camera_tracking[cam_id]:
+                logger.warning(f"⏭️  {cam_id}: no tracking data, skipping")
+                continue
+            per_camera_tracking_paths[cam_id] = f"{MULTICAM_SETTINGS['tracking_dir']}/{cam_id}_tracking.json"
+
+        if not per_camera_tracking_paths:
+            logger.error("❌ No camera produced tracking data — nothing to cluster")
+            return 1
+
+        combined = run_track_level_pipeline(
+            camera_configs=CAMERAS,
+            per_camera_tracking_paths=per_camera_tracking_paths,
+            device=device,
+            max_frames=args.max_frames,
+            registered_persons=registered_persons,
+            output_json_path=args.output,
+        )
+        n_global = len(combined.get("global_identities", {}))
+        n_named = sum(1 for v in combined["global_identities"].values() if "name" in v)
+        logger.info("=" * 70)
+        logger.info(f"✅ Pipeline complete (track-level): {n_global} global identities "
+                    f"({n_named} matched to a registered name)")
+        logger.info(f"   Dashboard-ready output: {args.output}")
+        logger.info("=" * 70)
+        return 0
 
     # ── Step 2: Re-ID, once per camera, using Deepthi's UNMODIFIED pipeline ──
     logger.info("=" * 70)
@@ -106,19 +161,6 @@ def main():
     logger.info("STEP 3: Cross-Camera Identity Matching")
     logger.info("=" * 70)
     from reidentification.cross_camera_match import run_cross_camera_matching
-
-    registered_persons = None
-    if not args.skip_names:
-        try:
-            from registration.identity_db import IdentityDatabase
-            db = IdentityDatabase()
-            if len(db):
-                registered_persons = db.export_for_reid()
-                logger.info(f"Loaded {len(registered_persons)} registered person(s) for name resolution")
-            else:
-                logger.info("Registration DB is empty — global identities will be unnamed")
-        except Exception as e:
-            logger.warning(f"⚠️  Could not load registration DB ({e}); continuing without names")
 
     combined = run_cross_camera_matching(
         camera_results=camera_results,

@@ -18,3 +18,4 @@ reidentification/dataset/
 *.pth
 check_similarity.py
 photos/
+reidentification/model/model.py
