@@ -3,11 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Person Re-ID Tracker</title>
+    <title>Multi-Person Detection, Tracking &amp; Re-Identification</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Sora:wght@300;400;500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/styles.css" />
@@ -18,100 +18,331 @@
     <div class="bg-vignette" aria-hidden="true"></div>
 
     <div class="layout">
-      <!-- HEADER -->
-      <header class="hero">
-        <div class="hero-main reveal">
-          <p class="eyebrow">Multi-Person Detection + Tracking + Re-ID</p>
-          <h1>Person Re-ID Tracker</h1>
-          <p class="lead">
-            Upload surveillance footage, run the complete pipeline, and review source vs processed output with clean identities and progress visibility.
-          </p>
-
-          <div class="controls-section">
-            <div class="controls" role="group" aria-label="video controls">
-              <label class="control-btn warm">
-                <input id="inputFile" type="file" accept="video/*" />
-                📁 Upload Input Video
-              </label>
-              <label class="control-btn cool">
-                <input id="outputFile" type="file" accept="video/*" />
-                📥 Load Output Video
-              </label>
-              <button id="processBtn" class="control-btn solid" type="button">▶ Process Video</button>
-            </div>
-
-            <div class="meta-strip">
-              <div class="meta-item">
-                <span class="meta-title">Input</span>
-                <span class="meta-value" id="inputName">—</span>
-              </div>
-              <div class="meta-item">
-                <span class="meta-title">Status</span>
-                <span class="meta-value" id="metaStatus">Ready</span>
-              </div>
-              <div class="meta-item">
-                <span class="meta-title">Output</span>
-                <span class="meta-value" id="outputName">—</span>
-              </div>
-            </div>
+      <!-- TOP BAR -->
+      <header class="topbar reveal">
+        <div class="brand">
+          <span class="brand-mark">◎</span>
+          <div>
+            <p class="eyebrow">Live Operations Console</p>
+            <h1>Multi-Person Detection, Tracking &amp; Re-Identification</h1>
           </div>
-
-          <div class="status-box" aria-live="polite">
-            <div class="status-row">
-              <span id="status" class="status state-idle">Awaiting input upload...</span>
-              <span class="pulse-dot" id="statusDot" aria-hidden="true"></span>
-            </div>
-
-            <div class="progress-wrap">
-              <div class="progress-label">
-                <span>Pipeline Progress</span>
-                <span id="progressText">0%</span>
-              </div>
-              <progress id="progressBar" max="100" value="0" aria-label="processing progress"></progress>
-            </div>
-          </div>
+        </div>
+        <div class="topbar-right">
+          <nav class="tabs" role="tablist" aria-label="Console sections">
+            <button class="tab-btn" data-tab="upload" role="tab" aria-selected="true">
+              <span class="tab-num">01</span> Upload
+            </button>
+            <button class="tab-btn" data-tab="people" role="tab" aria-selected="false">
+              <span class="tab-num">02</span> Known People
+            </button>
+            <button class="tab-btn" data-tab="process" role="tab" aria-selected="false">
+              <span class="tab-num">03</span> Processing
+            </button>
+            <button class="tab-btn" data-tab="results" role="tab" aria-selected="false">
+              <span class="tab-num">04</span> Results
+            </button>
+            <button class="tab-btn" data-tab="telemetry" role="tab" aria-selected="false">
+              <span class="tab-num">05</span> Telemetry
+            </button>
+          </nav>
+          <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch between dark and light mode" title="Switch theme">
+            <span class="theme-icon theme-icon-dark">🌙</span>
+            <span class="theme-icon theme-icon-light">☀️</span>
+          </button>
         </div>
       </header>
 
-      <!-- VIDEO COMPARISON -->
-      <main class="stage reveal delay-2">
-        <div class="stage-header">
-          <h2>Live Comparison</h2>
-        </div>
+      <!-- ══════════════════ VIEW: UPLOAD ══════════════════ -->
+      <main class="view active" id="view-upload">
+        <section class="panel reveal">
+          <div class="panel-head">
+            <h2>Camera Feeds</h2>
+            <p>Set how many cameras you're reviewing, then attach one clip per camera.</p>
+          </div>
 
-        <div class="video-grid">
-          <section class="screen" data-role="input">
-            <div class="screen-header">
-              <h3>Source Feed</h3>
-              <span class="badge">RAW</span>
+          <div class="camera-count-row">
+            <label for="cameraCount">Number of cameras</label>
+            <div class="stepper">
+              <button type="button" id="camMinus" class="stepper-btn" aria-label="Fewer cameras">−</button>
+              <input id="cameraCount" type="number" min="1" max="12" value="2" inputmode="numeric" />
+              <button type="button" id="camPlus" class="stepper-btn" aria-label="More cameras">+</button>
             </div>
-            <div class="video-shell">
-              <video id="inputVideo" controls muted playsinline></video>
-              <div class="placeholder" id="inputPlaceholder">
-                <div class="placeholder-icon">🎬</div>
-                <p>Upload a clip to preview the original stream.</p>
-              </div>
-            </div>
-          </section>
+          </div>
 
-          <section class="screen" data-role="output">
-            <div class="screen-header">
-              <h3>Processed Feed</h3>
-              <span class="badge output">RE-ID</span>
-            </div>
-            <div class="video-shell">
-              <video id="outputVideo" controls muted playsinline></video>
-              <div class="placeholder" id="outputPlaceholder">
-                <div class="placeholder-icon">🤖</div>
-                <p>Processed output will appear here after pipeline completion.</p>
-              </div>
-            </div>
-          </section>
-        </div>
+          <div id="cameraSlots" class="camera-slots"></div>
+
+          <div class="panel-footer">
+            <span id="uploadHint" class="hint">Attach a video to every slot to continue.</span>
+            <button id="startProcessingBtn" class="btn primary" type="button" disabled>▶ Start Processing</button>
+          </div>
+        </section>
       </main>
 
+      <!-- ══════════════════ VIEW: PEOPLE / REGISTRATION ══════════════════ -->
+      <main class="view" id="view-people">
+        <section class="panel reveal">
+          <div class="panel-head">
+            <h2>Register a Person</h2>
+            <p>Add a name and a few clear photos. Embeddings are generated automatically and stored in the identity database.</p>
+          </div>
 
+          <form id="registerForm" class="register-form">
+            <div class="field">
+              <label for="personName">Full name</label>
+              <input id="personName" type="text" placeholder="e.g. Alice Fernandes" autocomplete="off" required />
+            </div>
+
+            <div class="field">
+              <label for="personPhotos">Photos</label>
+              <label class="dropzone" id="dropzone" for="personPhotos">
+                <span class="dropzone-icon">📷</span>
+                <span id="dropzoneText">Click to choose photos, or drop them here</span>
+                <input id="personPhotos" type="file" accept="image/*" multiple hidden />
+              </label>
+              <div id="photoPreview" class="photo-preview"></div>
+            </div>
+
+            <div class="panel-footer">
+              <span id="registerHint" class="hint"></span>
+              <button id="registerBtn" class="btn primary" type="submit">＋ Generate Embeddings &amp; Register</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel reveal delay-2">
+          <div class="panel-head split">
+            <div>
+              <h2>Identity Database</h2>
+              <p>Every registered person, searchable by name.</p>
+            </div>
+            <div class="search-box">
+              <input id="personSearch" type="search" placeholder="Search by name…" />
+            </div>
+          </div>
+
+          <div id="personCount" class="hint" style="margin-bottom: .8rem;"></div>
+          <div id="personList" class="person-grid"></div>
+          <div id="personEmpty" class="empty-state" hidden>
+            <p>No one's registered yet.</p>
+            <span>Add a person above to build the identity database.</span>
+          </div>
+        </section>
+      </main>
+
+      <!-- ══════════════════ VIEW: PROCESS ══════════════════ -->
+      <main class="view" id="view-process">
+        <section class="panel reveal">
+          <div class="panel-head">
+            <h2>Pipeline Status</h2>
+            <p>Detection → tracking → re-identification, running per camera.</p>
+          </div>
+
+          <div id="overallProgressWrap" class="progress-wrap" style="max-width: none;">
+            <div class="progress-label">
+              <span>Overall progress</span>
+              <span id="overallProgressText">0%</span>
+            </div>
+            <progress id="overallProgressBar" max="100" value="0"></progress>
+          </div>
+
+          <div id="cameraStatusList" class="camera-status-list"></div>
+
+          <div id="processEmpty" class="empty-state">
+            <p>No run in progress.</p>
+            <span>Upload camera feeds first, then start processing from the Upload tab.</span>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-2" id="previewPanel" hidden>
+          <div class="panel-head split">
+            <div>
+              <h2>Live Detection Preview</h2>
+              <p>Uploaded footage with bounding boxes and identity placards tracked live on top.</p>
+            </div>
+            <div class="preview-controls">
+              <select id="previewCameraSelect" aria-label="Camera to preview"></select>
+              <button id="previewPauseToggle" class="btn ghost small" type="button">⏸ Pause</button>
+            </div>
+          </div>
+          <div class="overlay-stage">
+            <video id="previewVideo" muted loop playsinline></video>
+            <canvas id="overlayCanvas"></canvas>
+            <span id="overlayModeBadge" class="overlay-mode-badge">DEMO OVERLAY</span>
+          </div>
+        </section>
+      </main>
+
+      <!-- ══════════════════ VIEW: RESULTS ══════════════════ -->
+      <main class="view" id="view-results">
+        <section class="panel reveal">
+          <div class="summary-bar" id="summaryBar">
+            <div class="summary-stat">
+              <span class="summary-value" id="statDetected">0</span>
+              <span class="summary-label">People detected</span>
+            </div>
+            <div class="summary-stat ok">
+              <span class="summary-value" id="statMatched">0</span>
+              <span class="summary-label">Matched</span>
+            </div>
+            <div class="summary-stat warn">
+              <span class="summary-value" id="statUnknown">0</span>
+              <span class="summary-label">Unknown</span>
+            </div>
+            <div class="summary-stat">
+              <span class="summary-value" id="statCameras">0</span>
+              <span class="summary-label">Cameras</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-2">
+          <div class="panel-head split">
+            <div>
+              <h2>Matched Identities</h2>
+              <p>Registered people recognised across the footage.</p>
+            </div>
+            <div class="search-box">
+              <input id="resultsSearch" type="search" placeholder="Search matched people…" />
+            </div>
+          </div>
+          <div id="matchedList" class="results-list"></div>
+          <div id="matchedEmpty" class="empty-state" hidden>
+            <p>No matches yet.</p>
+            <span>Run processing, or register more people to improve recognition.</span>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-2">
+          <div class="panel-head">
+            <h2>Unknown / Unmatched</h2>
+            <p>People seen on camera who aren't in the identity database.</p>
+          </div>
+          <div id="unmatchedList" class="results-list"></div>
+          <div id="unmatchedEmpty" class="empty-state" hidden>
+            <p>Nothing unmatched.</p>
+            <span>Every detected person was matched to a known identity.</span>
+          </div>
+        </section>
+      </main>
+      <!-- ══════════════════ VIEW: TELEMETRY ══════════════════ -->
+      <main class="view" id="view-telemetry">
+        <section class="panel reveal">
+          <div class="panel-head split">
+            <div>
+              <h2>System Health</h2>
+              <p>Inference hardware and stream integrity, sampled live.</p>
+            </div>
+            <span class="badge ok" id="telemetryLiveBadge"><span class="pulse-dot working"></span> LIVE</span>
+          </div>
+
+          <div class="telemetry-grid">
+            <div class="telemetry-card">
+              <div class="telemetry-card-head">
+                <span class="telemetry-label">GPU VRAM</span>
+                <span class="telemetry-value" id="vramValue">— / —</span>
+              </div>
+              <div class="gauge-track"><div class="gauge-fill" id="vramGauge"></div></div>
+              <span class="telemetry-sub" id="vramSub">device: —</span>
+            </div>
+
+            <div class="telemetry-card">
+              <div class="telemetry-card-head">
+                <span class="telemetry-label">GPU Utilization</span>
+                <span class="telemetry-value" id="gpuUtilValue">0%</span>
+              </div>
+              <div class="gauge-track"><div class="gauge-fill cool" id="gpuUtilGauge"></div></div>
+              <span class="telemetry-sub" id="gpuUtilSub">osnet_x1_0 backbone</span>
+            </div>
+
+            <div class="telemetry-card">
+              <div class="telemetry-card-head">
+                <span class="telemetry-label">Stream Drop Rate</span>
+                <span class="telemetry-value" id="dropRateValue">0.0%</span>
+              </div>
+              <div class="gauge-track"><div class="gauge-fill warn" id="dropRateGauge"></div></div>
+              <span class="telemetry-sub" id="dropRateSub">frames dropped / received</span>
+            </div>
+
+            <div class="telemetry-card wide">
+              <div class="telemetry-card-head">
+                <span class="telemetry-label">Inference Latency</span>
+                <span class="telemetry-value" id="latencyValue">0 ms</span>
+              </div>
+              <canvas id="latencyChart" class="latency-chart" height="72"></canvas>
+              <span class="telemetry-sub">rolling p50 · detection + Re-ID pass, per frame</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-2">
+          <div class="panel-head split">
+            <div>
+              <h2>System Log</h2>
+              <p>Pipeline events, telemetry warnings, and Re-ID match alerts.</p>
+            </div>
+            <button id="logClearBtn" class="btn ghost small" type="button">Clear log</button>
+          </div>
+          <div id="logTerminal" class="log-terminal" role="log" aria-live="polite"></div>
+        </section>
+      </main>
     </div>
+
+    <!-- Confirm delete modal -->
+    <div class="modal-backdrop" id="confirmModal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <h3 id="confirmTitle">Delete this person?</h3>
+        <p id="confirmBody">This removes their photos and embeddings from the identity database. This can't be undone.</p>
+        <div class="modal-actions">
+          <button class="btn ghost" id="confirmCancel" type="button">Cancel</button>
+          <button class="btn danger" id="confirmDelete" type="button">Delete</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit person drawer -->
+    <div class="modal-backdrop" id="editModal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="editTitle">
+        <h3 id="editTitle">Edit person</h3>
+        <div class="field">
+          <label for="editName">Name</label>
+          <input id="editName" type="text" />
+        </div>
+        <div class="field">
+          <label for="editPhotos">Add more photos</label>
+          <label class="dropzone" for="editPhotos">
+            <span class="dropzone-icon">📷</span>
+            <span>Click to add more photos</span>
+            <input id="editPhotos" type="file" accept="image/*" multiple hidden />
+          </label>
+          <div id="editPhotoPreview" class="photo-preview"></div>
+        </div>
+        <span id="editHint" class="hint"></span>
+        <div class="modal-actions">
+          <button class="btn ghost" id="editCancel" type="button">Cancel</button>
+          <button class="btn primary" id="editSave" type="button">Save changes</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Photo lightbox -->
+    <div class="modal-backdrop" id="lightboxModal" hidden>
+      <div class="modal lightbox" role="dialog" aria-modal="true" aria-labelledby="lightboxTitle">
+        <div class="lightbox-head">
+          <h3 id="lightboxTitle">Photo</h3>
+          <button class="btn ghost small" id="lightboxClose" type="button" aria-label="Close">✕</button>
+        </div>
+        <div class="lightbox-body">
+          <button class="lightbox-nav prev" id="lightboxPrev" type="button" aria-label="Previous photo">‹</button>
+          <img id="lightboxImage" alt="" />
+          <button class="lightbox-nav next" id="lightboxNext" type="button" aria-label="Next photo">›</button>
+        </div>
+        <div class="lightbox-foot">
+          <span id="lightboxCounter" class="hint"></span>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
 
     <script src="/static/app.js"></script>
   </body>
