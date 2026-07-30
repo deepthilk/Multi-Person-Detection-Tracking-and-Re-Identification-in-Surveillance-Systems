@@ -1,7 +1,11 @@
 # Person Registration & Identity Database
 
-**Status:** Phase 2 module — independent, no changes required in
-`detection/`, `tracking/`, `reidentification/`, `multicamera/`, or `web/`.
+**Status:** Merged into `main`. Verified compatible with Deepthi's actual
+merged Re-ID / cross-camera code (`registration/tests/test_phase3_handoff.py`
+imports her real `reidentification.cross_camera_match.resolve_names` and
+confirms the hand-off works end-to-end) — not just designed to be, tested
+to be. No changes were required in `detection/`, `tracking/`,
+`reidentification/`, `multicamera/`, or `web/`.
 
 ## What this module does
 
@@ -27,6 +31,7 @@ photos/alice_2.jpg ─┼─> embedder.py (reuses Deepthi's Re-ID backbone) ─>
 | `validate_setup.py` | Run this first to check your environment before registering anyone. |
 | `register.py` (repo root) | CLI entry point. Separate from `main.py` on purpose — zero merge-conflict risk. |
 | `tests/test_identity_db.py` | Fast unit tests for the database logic (no model download needed). |
+| `tests/test_phase3_handoff.py` | Integration test against Deepthi's **actual merged** `cross_camera_match.resolve_names()` — proves the hand-off works with real code, not just in theory. |
 
 ## Why embeddings are generated via Deepthi's Re-ID engine
 
@@ -82,8 +87,21 @@ python register.py bulk --dir known_persons
 python register.py list
 python register.py search --name ali
 
-# Run the fast unit tests (no model download required)
+# Replace a person's photos instead of adding to them
+python register.py add --name "Alice" --images new_photos/*.jpg --overwrite
+
+# Remove someone
+python register.py delete --name "Bob"
+
+# Back up / restore the whole database
+python register.py backup --path backups/db_2026-07-27.json
+python register.py restore --path backups/db_2026-07-27.json
+
+# Run the unit tests (no model download required)
 python -m registration.tests.test_identity_db
+
+# Run the Phase 3 hand-off acceptance test against Deepthi's real merged code
+python -m registration.tests.test_phase3_handoff
 ```
 
 ## Why this design avoids merge conflicts

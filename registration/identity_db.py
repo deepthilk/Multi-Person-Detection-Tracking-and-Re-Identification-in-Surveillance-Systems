@@ -121,6 +121,9 @@ class IdentityDatabase:
     def get_person(self, name: str) -> dict:
         return self._data.get(name)
 
+    def person_exists(self, name: str) -> bool:
+        return name.strip() in self._data
+
     def search_by_name(self, query: str) -> list:
         """
         Case-insensitive substring search. Returns a list of
@@ -170,6 +173,46 @@ class IdentityDatabase:
             name: np.asarray(record["average_embedding"], dtype=np.float32)
             for name, record in self._data.items()
         }
+
+    # ── backup / restore ─────────────────────────────────────────────────
+
+    def export_db(self, backup_path: str):
+        """
+        Write a standalone copy of the entire database (embeddings, images
+        list, metadata — everything) to `backup_path`. Useful before a risky
+        operation, or to hand a snapshot to a teammate for local testing.
+        """
+        backup_path = Path(backup_path)
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(backup_path, "w") as f:
+            json.dump(self._data, f, indent=2)
+        logger.info(f"Backed up {len(self._data)} person(s) -> {backup_path}")
+
+    def import_db(self, backup_path: str, merge: bool = True):
+        """
+        Restore from a backup produced by export_db().
+
+        Args:
+            merge: if True (default), backed-up persons are added on top of
+                whatever is already in the live database (existing photos
+                for the same name are combined via add_person's merge
+                logic). If False, the backup completely replaces the
+                current database.
+        """
+        with open(backup_path, "r") as f:
+            backup_data = json.load(f)
+
+        if not merge:
+            self._data = backup_data
+            self.save()
+            logger.info(f"Restored {len(self._data)} person(s) from {backup_path} (replaced)")
+            return
+
+        for name, record in backup_data.items():
+            embeddings = record["embeddings"]
+            image_paths = record["metadata"].get("image_paths", [])
+            self.add_person(name, embeddings, image_paths=image_paths)
+        logger.info(f"Merged {len(backup_data)} person(s) from {backup_path}")
 
     def __len__(self):
         return len(self._data)

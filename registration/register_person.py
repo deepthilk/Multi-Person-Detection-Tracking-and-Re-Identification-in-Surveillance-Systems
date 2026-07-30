@@ -16,7 +16,8 @@ from registration.identity_db import IdentityDatabase
 logger = logging.getLogger(__name__)
 
 
-def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -> dict:
+def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
+                     overwrite: bool = False) -> dict:
     """
     Register a known person from one or more images.
 
@@ -33,6 +34,10 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
         image_paths: list of file paths to photos of this person.
         db: optional existing IdentityDatabase instance (mainly for tests /
             batch registration so the JSON file isn't reloaded every call).
+        overwrite: if the name already exists and this is False (default),
+            the new photos are ADDED to the existing person (their average
+            embedding is recomputed over all photos, old + new). If True,
+            the old record is deleted first, so only the new photos count.
 
     Returns:
         The stored record for this person (dict), or raises ValueError if
@@ -45,6 +50,19 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
     if not image_paths:
         raise ValueError(f"No images provided for '{name}'")
 
+    db = db or IdentityDatabase()
+
+    if db.person_exists(name):
+        if overwrite:
+            db.delete_person(name)
+            logger.info(f"'{name}' already existed — replacing (--overwrite)")
+        else:
+            existing_count = db.get_person(name)["metadata"]["num_images"]
+            logger.warning(
+                f"'{name}' already has {existing_count} photo(s) registered. "
+                f"Adding {len(image_paths)} more (pass overwrite=True to replace instead)."
+            )
+
     logger.info(f"Registering '{name}' with {len(image_paths)} image(s)...")
 
     embeddings = embed_images(image_paths)
@@ -56,7 +74,6 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
 
     stored_paths = _copy_images(name, image_paths)
 
-    db = db or IdentityDatabase()
     db.add_person(name, embeddings, image_paths=stored_paths)
 
     logger.info(

@@ -21,6 +21,16 @@ Usage:
     # Search by (partial) name
     python register.py search --name ali
 
+    # Replace a person's photos instead of adding to them
+    python register.py add --name "Alice" --images new_photos/*.jpg --overwrite
+
+    # Remove someone
+    python register.py delete --name "Bob"
+
+    # Back up / restore the whole database
+    python register.py backup --path backups/db_2026-07-27.json
+    python register.py restore --path backups/db_2026-07-27.json
+
     # Sanity-check environment first
     python registration/validate_setup.py
 """
@@ -45,7 +55,7 @@ def cmd_add(args):
         matches = glob.glob(pattern)
         image_paths.extend(matches if matches else [pattern])
 
-    record = register_person(args.name, image_paths)
+    record = register_person(args.name, image_paths, overwrite=args.overwrite)
     print(f"\n✅ Registered '{args.name}'")
     print(f"   Images used : {record['metadata']['num_images']}")
     print(f"   Registered  : {record['metadata']['registered_at']}")
@@ -83,6 +93,39 @@ def cmd_bulk(args):
     print(f"\n✅ Bulk registration complete. {len(db)} person(s) in the database.")
 
 
+def cmd_delete(args):
+    from registration.identity_db import IdentityDatabase
+
+    db = IdentityDatabase()
+    if not db.person_exists(args.name):
+        print(f"'{args.name}' is not in the database — nothing to delete.")
+        return
+    if not args.yes:
+        confirm = input(f"Delete '{args.name}' and all their registered photos? [y/N] ")
+        if confirm.strip().lower() != "y":
+            print("Cancelled.")
+            return
+    db.delete_person(args.name)
+    print(f"✅ Deleted '{args.name}' from the identity database.")
+
+
+def cmd_backup(args):
+    from registration.identity_db import IdentityDatabase
+
+    db = IdentityDatabase()
+    db.export_db(args.path)
+    print(f"✅ Backed up {len(db)} person(s) -> {args.path}")
+
+
+def cmd_restore(args):
+    from registration.identity_db import IdentityDatabase
+
+    db = IdentityDatabase()
+    db.import_db(args.path, merge=not args.replace)
+    print(f"✅ Restored from {args.path} ({'replaced' if args.replace else 'merged'}). "
+          f"Database now has {len(db)} person(s).")
+
+
 def cmd_list(args):
     from registration.identity_db import IdentityDatabase
 
@@ -118,6 +161,8 @@ def main():
     p_add.add_argument("--name", required=True)
     p_add.add_argument("--images", nargs="+", required=True,
                         help="Image file paths or glob patterns")
+    p_add.add_argument("--overwrite", action="store_true",
+                        help="Replace this person's existing photos instead of adding to them")
     p_add.set_defaults(func=cmd_add)
 
     p_bulk = sub.add_parser("bulk", help="Register everyone under a folder-of-folders")
@@ -131,6 +176,21 @@ def main():
     p_search = sub.add_parser("search", help="Search registered persons by (partial) name")
     p_search.add_argument("--name", required=True)
     p_search.set_defaults(func=cmd_search)
+
+    p_delete = sub.add_parser("delete", help="Remove a registered person")
+    p_delete.add_argument("--name", required=True)
+    p_delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    p_delete.set_defaults(func=cmd_delete)
+
+    p_backup = sub.add_parser("backup", help="Export the whole database to a JSON file")
+    p_backup.add_argument("--path", required=True, help="Where to write the backup, e.g. backups/db_2026-07-27.json")
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_restore = sub.add_parser("restore", help="Restore the database from a backup JSON file")
+    p_restore.add_argument("--path", required=True)
+    p_restore.add_argument("--replace", action="store_true",
+                            help="Replace the current database entirely instead of merging")
+    p_restore.set_defaults(func=cmd_restore)
 
     args = parser.parse_args()
     return args.func(args)

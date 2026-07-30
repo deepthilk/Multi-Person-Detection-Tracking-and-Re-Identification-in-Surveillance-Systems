@@ -41,6 +41,6 @@ SEARCH_SETTINGS = {
     # Cosine similarity threshold used by IdentityDatabase.match() when
     # comparing a query embedding (e.g. from a live Re-ID track) against
     # registered persons.
-    "match_threshold": 0.55,
+    "match_threshold": 0.75,
     "top_k": 3,
 }
