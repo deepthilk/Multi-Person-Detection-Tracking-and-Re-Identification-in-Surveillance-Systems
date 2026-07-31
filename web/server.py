@@ -5,6 +5,7 @@ import uuid
 from typing import Dict
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import torch
@@ -18,6 +19,11 @@ from tracking.track_module import run_tracking
 from reidentification.reid_main import run_reid_pipeline
 from utils import render_reid_video
 
+try:
+    from registration_api import router as registration_router
+except ModuleNotFoundError:
+    from web.registration_api import router as registration_router
+
 
 WEB_DIR = ROOT_DIR / "web"
 STATIC_DIR = WEB_DIR / "static"
@@ -30,6 +36,16 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="Re-ID Cinematic Web")
 JOBS: Dict[str, dict] = {}
 
+# Dev-friendly CORS so the UI teammate's dev server can call this API.
+# Tighten the origins list for production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def _ensure_artifact(path: Path, label: str):
     if not path.exists():
@@ -39,6 +55,7 @@ def _ensure_artifact(path: Path, label: str):
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+app.include_router(registration_router)
 
 
 @app.get("/")

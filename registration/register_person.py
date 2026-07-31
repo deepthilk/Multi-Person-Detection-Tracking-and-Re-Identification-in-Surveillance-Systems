@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
-                     overwrite: bool = False) -> dict:
+                     overwrite: bool = False, num_augmentations: int = 5) -> dict:
     """
     Register a known person from one or more images.
 
@@ -63,9 +63,10 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
                 f"Adding {len(image_paths)} more (pass overwrite=True to replace instead)."
             )
 
-    logger.info(f"Registering '{name}' with {len(image_paths)} image(s)...")
+    logger.info(f"Registering '{name}' with {len(image_paths)} image(s) "
+                f"(num_augmentations={num_augmentations})...")
 
-    embeddings = embed_images(image_paths)
+    embeddings = embed_images(image_paths, num_augmentations=num_augmentations)
     if not embeddings:
         raise ValueError(
             f"None of the provided images for '{name}' produced a usable "

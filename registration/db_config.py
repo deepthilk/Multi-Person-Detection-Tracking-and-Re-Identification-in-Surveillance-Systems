@@ -41,6 +41,15 @@ SEARCH_SETTINGS = {
     # Cosine similarity threshold used by IdentityDatabase.match() when
     # comparing a query embedding (e.g. from a live Re-ID track) against
     # registered persons.
-    "match_threshold": 0.75,
+    #
+    # LOWERED from 0.75 → 0.55 to accommodate domain shift between
+    # high-resolution registration photos and low-resolution surveillance
+    # video crops. The Re-ID model's embeddings vary significantly with
+    # image quality, lighting, and compression — a threshold that works
+    # for same-domain matching (e.g. Market-1501 query/gallery) is too
+    # strict when comparing a clean studio photo to a blurry video frame
+    # of the same person. See embedder.py's video-simulation preprocessing
+    # for the complementary fix on the embedding side.
+    "match_threshold": 0.55,
     "top_k": 3,
 }
