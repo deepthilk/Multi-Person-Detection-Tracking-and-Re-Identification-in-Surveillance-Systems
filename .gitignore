@@ -19,3 +19,4 @@ reidentification/dataset/
 check_similarity.py
 photos/
 reidentification/model/model.py
+reidentification/weights/

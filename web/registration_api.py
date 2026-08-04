@@ -37,6 +37,9 @@ router = APIRouter(prefix="/api")
 UPLOAD_DIR = ROOT_DIR / "web" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — an image bigger than this is an error
+
 # name -> job dict (mirrors the pattern already used in server.py)
 AUTOFIX_JOBS: Dict[str, dict] = {}
 
@@ -52,6 +55,28 @@ def _get_detector():
     return _detector
 
 
+def _is_readable_image(path: Path) -> bool:
+    """Reject corrupt / non-image uploads BEFORE they reach the embedder."""
+    try:
+        import cv2
+        img = cv2.imread(str(path))
+        return img is not None and img.size > 0
+    except Exception:
+        return False
+
+
+def _clamp(value: int, lo: int, hi: int, name: str) -> int:
+    """Bound an integer form field so a client cannot start pathological jobs
+    (e.g. 1e9 augmentation passes or samples)."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{name} must be an integer")
+    if not lo <= value <= hi:
+        raise HTTPException(status_code=400, detail=f"{name} must be between {lo} and {hi}")
+    return value
+
+
 def _require_person(db, name) -> dict:
     record = db.get_person(name)
     if record is None:
@@ -60,12 +85,36 @@ def _require_person(db, name) -> dict:
 
 
 def _save_upload(file: UploadFile, prefix: str) -> Path:
+    """Save an uploaded file after validating type, size, and readability.
+    Invalid uploads are rejected with a clear 4xx and never reach the
+    embedder / database."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="Empty filename")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}' — use jpg, jpeg, png, or bmp",
+        )
+
     safe_name = Path(file.filename).name
     dest = UPLOAD_DIR / f"{prefix}_{uuid.uuid4().hex[:8]}_{safe_name}"
     with dest.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    size = dest.stat().st_size
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes)")
+    if size > MAX_UPLOAD_BYTES:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file exceeds the 20 MB limit")
+    if not _is_readable_image(dest):
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{file.filename}' is not a readable image (corrupt or wrong format)",
+        )
     return dest
 
 
@@ -131,6 +180,7 @@ def add_person(name: str = Form(...),
         raise HTTPException(status_code=400, detail="Name cannot be empty")
     if not files:
         raise HTTPException(status_code=400, detail="At least one image required")
+    augmentations = _clamp(augmentations, 0, 30, "augmentations")
 
     paths = [_save_upload(f, "reg") for f in files]
     try:
@@ -165,6 +215,7 @@ async def verify_person(name: str, test_image: UploadFile = File(...),
     db = IdentityDatabase()
     rec = _require_person(db, name)
     ref_avg = np.array(rec["average_embedding"], dtype=np.float32)
+    augmentations = _clamp(augmentations, 0, 30, "augmentations")
 
     path = _save_upload(test_image, "verify")
     feat = embed_image(str(path), num_augmentations=augmentations)
@@ -223,6 +274,10 @@ async def start_autofix(name: str, body: AutofixRequest):
     if not body.videos:
         raise HTTPException(status_code=400, detail="At least one video required")
 
+    samples = _clamp(body.samples, 1, 200, "samples")
+    top = _clamp(body.top, 1, 50, "top")
+    augmentations = _clamp(body.augmentations, 0, 30, "augmentations")
+
     for v in body.videos:
         if not Path(v).exists():
             raise HTTPException(status_code=404, detail=f"Video not found: {v}")
@@ -239,7 +294,7 @@ async def start_autofix(name: str, body: AutofixRequest):
 
     import asyncio
     asyncio.create_task(_run_autofix_job(
-        job_id, name, body.videos, body.samples, body.top, body.augmentations))
+        job_id, name, body.videos, samples, top, augmentations))
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -307,10 +362,15 @@ def get_autofix_crop(job_id: str, index: int):
     job = AUTOFIX_JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+
     cands = job.get("candidates", [])
-    if index < 0 or index >= len(cands):
+    pool = job.get("_pool", [])
+    if cands and 0 <= index < len(cands):
+        path = Path(cands[index]["crop_path"])
+    elif pool and 0 <= index < len(pool):
+        path = Path(pool[index])
+    else:
         raise HTTPException(status_code=404, detail="Candidate index out of range")
-    path = Path(cands[index]["crop_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="Crop file missing")
     return FileResponse(str(path), media_type="image/jpeg")
@@ -338,12 +398,187 @@ def confirm_autofix(name: str, body: AutofixConfirmRequest):
     if not Path(crop_path).exists():
         raise HTTPException(status_code=404, detail="Crop file missing")
 
-    register_person(name, [crop_path], overwrite=True,
-                    num_augmentations=body.augmentations)
+    try:
+        register_person(name, [crop_path], overwrite=True,
+                        num_augmentations=_clamp(body.augmentations, 0, 30, "augmentations"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     return {
         "registered": True,
         "name": name,
+        "source_video": cand["video"],
+        "frame": cand["frame"],
+        "similarity": cand["similarity"],
+        "crop_url": cand["crop_url"],
+    }
+
+
+# ── multi-person auto-fix (all registered persons, one scan) ─────────────────
+
+
+class AutofixAllRequest(BaseModel):
+    videos: list[str]
+    samples: int = 20
+    top: int = 5
+    augmentations: int = 5
+
+
+class AutofixAllConfirmRequest(BaseModel):
+    job_id: str
+    name: str
+    index: int
+    augmentations: int = 5
+
+
+@router.post("/autofix/all")
+async def start_autofix_all(body: AutofixAllRequest):
+    """Scan the given videos once and produce top-`top` candidate crops for
+    EVERY registered person. Use this when a session returned poor matches —
+    one pass over the videos, re-register each person from a picked crop.
+
+    Body (JSON):
+        {"videos": ["input/video1.mp4"], "samples": 20, "top": 5, "augmentations": 5}
+
+    Response: {"job_id": "...", "status": "queued"} — poll
+    GET /api/autofix/{job_id}; the completed job carries a `persons` array,
+    one entry per registered person with `candidates` (top 5, crop_urls).
+    """
+    if not body.videos:
+        raise HTTPException(status_code=400, detail="At least one video required")
+    samples = _clamp(body.samples, 1, 200, "samples")
+    top = _clamp(body.top, 1, 50, "top")
+    augmentations = _clamp(body.augmentations, 0, 30, "augmentations")
+    for v in body.videos:
+        if not Path(v).exists():
+            raise HTTPException(status_code=404, detail=f"Video not found: {v}")
+
+    db = IdentityDatabase()
+    names = db.list_persons()
+    if not names:
+        raise HTTPException(status_code=409, detail="No registered persons to auto-fix")
+
+    ref_embeddings = {
+        name: np.array(db.get_person(name)["average_embedding"], dtype=np.float32)
+        for name in names
+    }
+
+    job_id = uuid.uuid4().hex[:10]
+    AUTOFIX_JOBS[job_id] = {
+        "job_id": job_id,
+        "mode": "all",
+        "status": "queued",
+        "progress": 0,
+        "message": "Queued",
+        "persons": [],
+    }
+
+    import asyncio
+    asyncio.create_task(_run_autofix_all_job(
+        job_id, body.videos, ref_embeddings, samples, top, augmentations))
+    return {"job_id": job_id, "status": "queued"}
+
+
+async def _run_autofix_all_job(job_id, videos, ref_embeddings, samples, top, augmentations):
+    try:
+        job = AUTOFIX_JOBS[job_id]
+        job.update({"status": "running", "progress": 5, "message": "Loading detector"})
+
+        detector = _get_detector()
+        out_dir = get_autofix_dir()
+        threshold = SEARCH_SETTINGS["match_threshold"]
+
+        def on_video(done, total):
+            job.update({
+                "progress": 5 + int(85 * done / max(1, total)),
+                "message": f"Scanned {done}/{total} video(s)",
+            })
+
+        from registration.autofix import scan_videos_for_all_persons
+        best = scan_videos_for_all_persons(
+            videos, detector, ref_embeddings, out_dir,
+            samples=samples, augmentations=augmentations, top=top,
+            on_video=on_video)
+
+        # One crop pool for the whole job so the same crop shared by several
+        # persons is stored once and served through /crop/{pool_index}.
+        pool = []
+        pool_index = {}
+        for lst in best.values():
+            for cand in lst:
+                p = cand[-1]
+                if p not in pool_index:
+                    pool_index[p] = len(pool)
+                    pool.append(p)
+
+        persons = []
+        for name in ref_embeddings:
+            candidates = []
+            for idx, (sim, vid_name, fid, x1, y1, w, h, crop_path) in enumerate(best[name]):
+                pi = pool_index[crop_path]
+                candidates.append({
+                    "index": idx,
+                    "pool_index": pi,
+                    "video": vid_name,
+                    "frame": fid,
+                    "bbox": [x1, y1, x1 + w, y1 + h],
+                    "similarity": round(sim, 4),
+                    "above_threshold": sim >= threshold,
+                    "crop_url": f"/api/autofix/{job_id}/crop/{pi}",
+                    "crop_path": crop_path,
+                })
+            persons.append({"name": name, "candidates": candidates})
+
+        job.update({
+            "status": "completed",
+            "progress": 100,
+            "message": f"Top {top} candidate(s) for {len(persons)} person(s)",
+            "persons": persons,
+            "threshold": threshold,
+            "_pool": pool,
+        })
+    except Exception as exc:
+        AUTOFIX_JOBS[job_id].update({
+            "status": "error",
+            "progress": 100,
+            "message": str(exc),
+        })
+
+
+@router.post("/autofix/all/confirm")
+def confirm_autofix_all(body: AutofixAllConfirmRequest):
+    """Re-register one person from a crop picked in the batch gallery.
+
+    Body (JSON):
+        {"job_id": "abc123", "name": "Alice", "index": 2}
+    """
+    job = AUTOFIX_JOBS.get(body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    persons = job.get("persons", [])
+    person = next((p for p in persons if p["name"] == body.name), None)
+    if person is None:
+        raise HTTPException(status_code=404, detail=f"'{body.name}' not in this job")
+
+    cands = person.get("candidates", [])
+    if body.index < 0 or body.index >= len(cands):
+        raise HTTPException(status_code=404, detail="Candidate index out of range")
+
+    cand = cands[body.index]
+    crop_path = cand["crop_path"]
+    if not Path(crop_path).exists():
+        raise HTTPException(status_code=404, detail="Crop file missing")
+
+    try:
+        register_person(body.name, [crop_path], overwrite=True,
+                        num_augmentations=_clamp(body.augmentations, 0, 30, "augmentations"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "registered": True,
+        "name": body.name,
         "source_video": cand["video"],
         "frame": cand["frame"],
         "similarity": cand["similarity"],

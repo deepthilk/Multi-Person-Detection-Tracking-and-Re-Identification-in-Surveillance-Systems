@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_detection(video_path, output_path, conf_threshold=0.35, device='cuda'):
+def run_detection(video_path, output_path, conf_threshold=0.25, device='cuda'):
     """Run YOLOv8 person detection"""
     logger.info("=" * 60)
     logger.info("STEP 1: Running Person Detection (YOLOv8)")
@@ -54,9 +54,9 @@ def run_detection(video_path, output_path, conf_threshold=0.35, device='cuda'):
 
     frame_id        = 0
     all_detections  = {}
-    min_area        = 900
-    min_height      = 50
-    min_aspect      = 1.0
+    min_area        = 600
+    min_height      = 30
+    min_aspect      = 0.5
     max_aspect      = 4.5
     min_area_ratio  = 0.0008
 
@@ -169,7 +169,7 @@ def main():
                         help='Run up to step: 1=detection, 2=tracking, 3=reid')
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'],
                         help='Device to use')
-    parser.add_argument('--conf-threshold', type=float, default=0.35,
+    parser.add_argument('--conf-threshold', type=float, default=0.25,
                         help='Detection confidence threshold')
     parser.add_argument('--visualize', action='store_true',
                         help='Visualize results after pipeline')

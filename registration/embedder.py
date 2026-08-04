@@ -128,7 +128,7 @@ def _load_image(image_path_or_array):
     return image_path_or_array
 
 
-def embed_image(image_path_or_array, num_augmentations: int = 5) -> np.ndarray:
+def embed_image(image_path_or_array, num_augmentations: int = 5, seed: int | None = None) -> np.ndarray:
     """
     Produce a robust 698-dim descriptor for a person image.
 
@@ -150,6 +150,10 @@ def embed_image(image_path_or_array, num_augmentations: int = 5) -> np.ndarray:
         num_augmentations: how many augmented embeddings to average
             (default 5; 0 = use only the preprocessed base image, no
             random augmentation).
+        seed: RNG seed for the random augmentation. Defaults to
+            EMBEDDING_SETTINGS["seed"], making registration deterministic:
+            the same image always produces the same embedding, so the demo
+            can be re-run and reproduce identical numbers.
 
     Returns:
         698-dim float32 numpy array, or None if the image is unreadable.
@@ -177,6 +181,12 @@ def embed_image(image_path_or_array, num_augmentations: int = 5) -> np.ndarray:
     if base_feat is not None:
         embeddings.append(base_feat)
 
+    # Fix the RNG before generating augmentations so the same image always
+    # yields the same augmented set (deterministic registration / demo).
+    rng_seed = seed if seed is not None else EMBEDDING_SETTINGS.get("seed", 42)
+    random.seed(rng_seed)
+    np.random.seed(rng_seed)
+
     # Add randomly augmented versions
     for _ in range(num_augmentations):
         aug = _random_augment(preprocessed)
@@ -203,11 +213,11 @@ def embed_image(image_path_or_array, num_augmentations: int = 5) -> np.ndarray:
     return avg
 
 
-def embed_images(image_paths, num_augmentations: int = 5) -> list:
+def embed_images(image_paths, num_augmentations: int = 5, seed: int | None = None) -> list:
     """Embed a list of images, silently skipping any that fail."""
     embeddings = []
     for path in image_paths:
-        feat = embed_image(path, num_augmentations=num_augmentations)
+        feat = embed_image(path, num_augmentations=num_augmentations, seed=seed)
         if feat is not None:
             embeddings.append(feat)
     return embeddings

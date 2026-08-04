@@ -45,7 +45,10 @@ function goToTab(name) {
   });
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   if (name === "people") loadPersons();
-  if (name === "results" && currentSessionId) loadResults();
+  if (name === "results") {
+    loadStorage();
+    if (currentSessionId) loadResults();
+  }
   if (name === "telemetry") startTelemetry();
   else stopTelemetry();
   if (name === "process" && activePreviewCamId) {
@@ -337,27 +340,123 @@ $("#personSearch").addEventListener("input", (e) => {
 });
 
 // ── delete modal ─────────────────────────────────────────────────────────
-let deleteTarget = null;
+let deleteTarget = null; // { kind: "person"|"run"|"all", id: string|null }
 function openDeleteModal(name) {
-  deleteTarget = name;
+  deleteTarget = { kind: "person", id: name };
+  $("#confirmTitle").textContent = "Delete this person?";
   $("#confirmBody").textContent = `This removes "${name}"'s photos and embeddings from the identity database. This can't be undone.`;
   $("#confirmModal").hidden = false;
 }
 $("#confirmCancel").addEventListener("click", () => ($("#confirmModal").hidden = true));
 $("#confirmDelete").addEventListener("click", async () => {
   if (!deleteTarget) return;
+  const { kind, id } = deleteTarget;
+  $("#confirmDelete").disabled = true;
   try {
-    const resp = await fetch(`/api/persons/${encodeURIComponent(deleteTarget)}`, { method: "DELETE" });
-    if (!resp.ok) throw new Error("Delete failed");
-    toast(`${deleteTarget} removed`);
-    logEvent("warn", `Removed "${deleteTarget}" from the identity database`);
-    loadPersons($("#personSearch").value.trim());
+    if (kind === "person") {
+      const resp = await fetch(`/api/persons/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!resp.ok) throw new Error("Delete failed");
+      toast(`${id} removed`);
+      logEvent("warn", `Removed "${id}" from the identity database`);
+      loadPersons($("#personSearch").value.trim());
+    } else if (kind === "run") {
+      const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!resp.ok) throw new Error((await resp.text()) || "Delete failed");
+      toast("Run deleted");
+      afterSessionDelete();
+    } else if (kind === "all") {
+      const resp = await fetch(`/api/sessions`, { method: "DELETE" });
+      if (!resp.ok) throw new Error((await resp.text()) || "Delete failed");
+      toast("Completed runs cleared");
+      afterSessionDelete();
+    }
   } catch (err) {
     toast(err.message, true);
   } finally {
+    $("#confirmDelete").disabled = false;
     $("#confirmModal").hidden = true;
     deleteTarget = null;
   }
+});
+
+// ── run storage (Results tab) ────────────────────────────────────────────
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+async function loadStorage() {
+  try {
+    const resp = await fetch(`/api/storage`);
+    if (!resp.ok) throw new Error("Storage unavailable");
+    const data = await resp.json();
+    const thisRun = currentSessionId
+      ? data.sessions.find((s) => s.session_id === currentSessionId)
+      : null;
+    $("#storageRunCount").textContent = data.session_count;
+    $("#storageAllRuns").textContent = fmtBytes(data.total_size);
+    $("#storageThisRun").textContent = thisRun ? fmtBytes(thisRun.size) : "—";
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function resetResultsView() {
+  $("#statDetected").textContent = 0;
+  $("#statMatched").textContent = 0;
+  $("#statUnknown").textContent = 0;
+  $("#statCameras").textContent = 0;
+  $("#matchedList").innerHTML = "";
+  $("#unmatchedList").innerHTML = "";
+  lastMatched = [];
+}
+
+async function afterSessionDelete() {
+  if (currentSessionId) {
+    try {
+      const resp = await fetch(`/api/session/${currentSessionId}/progress`);
+      if (resp.ok) {
+        // session survived (still processing) — keep the UI attached to it
+        loadStorage();
+        return;
+      }
+    } catch (_) {}
+    currentSessionId = null;
+  }
+  resetResultsView();
+  Object.values(sessionVideoUrls).forEach((url) => URL.revokeObjectURL(url));
+  Object.keys(sessionVideoUrls).forEach((k) => delete sessionVideoUrls[k]);
+  Object.keys(realTrackCache).forEach((k) => delete realTrackCache[k]);
+  pausePreviewPlayback();
+  $("#previewPanel").hidden = true;
+  activePreviewCamId = null;
+  loadStorage();
+}
+
+$("#deleteRunBtn").addEventListener("click", () => {
+  if (!currentSessionId) {
+    toast("No active run to delete", true);
+    return;
+  }
+  deleteTarget = { kind: "run", id: currentSessionId };
+  $("#confirmTitle").textContent = "Delete this run?";
+  $("#confirmBody").textContent =
+    "This removes this run's output video, evidence frames, and uploaded source clip. Registered people are not affected.";
+  $("#confirmModal").hidden = false;
+});
+
+$("#clearRunsBtn").addEventListener("click", () => {
+  deleteTarget = { kind: "all", id: null };
+  $("#confirmTitle").textContent = "Clear all completed runs?";
+  $("#confirmBody").textContent =
+    "This removes output videos, evidence frames, and uploaded source clips for every completed run. Runs still processing and registered people are not affected.";
+  $("#confirmModal").hidden = false;
 });
 
 // ── edit modal ───────────────────────────────────────────────────────────
@@ -520,6 +619,20 @@ function sightingChips(sightings) {
     .join("");
 }
 
+function renderTopFrames(topFrames) {
+  if (!topFrames || !topFrames.length) return "";
+  const thumbs = topFrames
+    .map(
+      (f) =>
+        `<div class="evidence-thumb" title="Frame ${f.frame} @ ${f.time_sec}s · face match ${(f.similarity * 100).toFixed(0)}%">
+           <img src="${escapeHtml(f.url)}" alt="match frame" loading="lazy"/>
+           <span>${(f.similarity * 100).toFixed(0)}%</span>
+         </div>`
+    )
+    .join("");
+  return `<div class="evidence-strip">${thumbs}</div>`;
+}
+
 function renderMatched(matched) {
   const list = $("#matchedList");
   const empty = $("#matchedEmpty");
@@ -536,6 +649,7 @@ function renderMatched(matched) {
           <div class="result-name">${escapeHtml(m.name)}</div>
           <div class="result-sub">Seen on ${cams.length} camera${cams.length === 1 ? "" : "s"} · match confidence ${(m.similarity * 100).toFixed(0)}%</div>
           <div>${sightingChips(m.sightings)}</div>
+          ${renderTopFrames(m.top_frames)}
         </div>
       </div>
     `;
@@ -579,6 +693,7 @@ async function loadResults() {
     lastMatched = data.matched;
     renderMatched(lastMatched);
     renderUnmatched(data.unmatched);
+    loadStorage();
     logEvent(
       "info",
       `Results ready: ${data.summary.matched} matched, ${data.summary.unknown} unknown across ${data.summary.camera_count} camera(s)`
@@ -1226,9 +1341,40 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "ArrowRight") $("#lightboxNext").click();
 });
 
+async function restoreSession() {
+  if (currentSessionId) return;
+  try {
+    const resp = await fetch("/api/session/current");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data.session_id) return;
+    currentSessionId = data.session_id;
+    sessionCameraLabels = {};
+    const camIds = [];
+    data.cameras.forEach((c) => {
+      sessionCameraLabels[c.camera_id] = c.label;
+      camIds.push(c.camera_id);
+    });
+    populatePreviewCameras(camIds);
+    logEvent("info", `Re-attached to session ${currentSessionId} after refresh`);
+    const prog = await fetch(`/api/session/${currentSessionId}/progress`).then((r) => r.json());
+    const allDone = prog.cameras.every((c) => c.status === "completed" || c.status === "error");
+    if (allDone) {
+      goToTab("results");
+      loadResults();
+    } else {
+      goToTab("process");
+      startProgressPolling();
+    }
+  } catch (err) {
+    logEvent("warn", `Could not restore session: ${err.message}`);
+  }
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    init
    ══════════════════════════════════════════════════════════════════════ */
 
 loadPersons();
+restoreSession();
 logEvent("info", "Console initialized — awaiting camera input");

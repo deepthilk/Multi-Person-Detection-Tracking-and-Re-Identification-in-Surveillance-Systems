@@ -123,7 +123,7 @@ class ReIDConfig:
 
     # Size gates
     MIN_CROP_PX:     int   = 8      # min pixels after clamping
-    MIN_HEIGHT:      int   = 50
+    MIN_HEIGHT:      int   = 30     # lowered from 50 — keep small/far people
     MIN_AREA_RATIO:  float = 0.0008
     # Duplicate-detection merge (before any tracking/Re-ID even runs): when
     # YOLO/NMS produces two overlapping boxes for one physical person, they
@@ -927,7 +927,7 @@ class ReIDEngine:
 
             # Reject boxes smaller than 20×40px (800 area) before extraction
             # Filters edge/partial detections that create noise
-            if h < CFG.MIN_HEIGHT or w*h < min_area or w*h < 800:
+            if h < CFG.MIN_HEIGHT or w*h < min_area or w*h < 600:
                 continue
 
             # FIX (Bug 6): reject off-screen ghost bboxes before extraction

@@ -18,7 +18,7 @@ Output: Tracking + Re-ID Results
 
 ## Features
 
-- **YOLOv8 Detection**: Real-time person detection with 35% confidence threshold
+- **YOLOv8 Detection**: Real-time person detection with 25% confidence threshold
 - **DeepSORT Tracking**: Multi-object tracking with Hungarian algorithm and Kalman filtering
 - **OSNet Re-ID**: Person re-identification using deep metric learning
 - **Re-ID Pipeline**: Works with Market-1501-style appearance embeddings and local runtime assets
@@ -242,8 +242,12 @@ Edit `config.py` to customize system parameters:
 ```python
 # Detection settings
 DETECTION = {
-    'conf_threshold': 0.35,  # Lower = more detections
+    'conf_threshold': 0.25,  # Lower = more detections
     'imgsz': 960,             # YOLO input size
+    'min_height': 30,         # Min box height (px)
+    'min_area': 600,          # Min box area (px)
+    'min_aspect': 0.5,        # Min h/w ratio (catches sitting/crouching)
+    'max_aspect': 4.5,        # Max h/w ratio
 }
 
 # Tracking settings

@@ -223,6 +223,34 @@
             <span>Every detected person was matched to a known identity.</span>
           </div>
         </section>
+
+        <section class="panel reveal delay-2">
+          <div class="panel-head split">
+            <div>
+              <h2>Run Storage</h2>
+              <p>Disk space used by processed runs on this server.</p>
+            </div>
+          </div>
+          <div class="storage-summary">
+            <div class="storage-stat">
+              <span class="summary-value" id="storageRunCount">—</span>
+              <span class="summary-label">Completed runs</span>
+            </div>
+            <div class="storage-stat">
+              <span class="summary-value" id="storageAllRuns">—</span>
+              <span class="summary-label">Total on disk</span>
+            </div>
+            <div class="storage-stat">
+              <span class="summary-value" id="storageThisRun">—</span>
+              <span class="summary-label">This run</span>
+            </div>
+          </div>
+          <div class="storage-actions">
+            <button class="btn danger" id="deleteRunBtn" type="button">Delete this run</button>
+            <button class="btn ghost" id="clearRunsBtn" type="button">Clear completed runs</button>
+          </div>
+          <span class="hint" id="storageHint">Deleting a run removes its output video, evidence frames, and uploaded source clip from this server. Registered people are never removed.</span>
+        </section>
       </main>
       <!-- ══════════════════ VIEW: TELEMETRY ══════════════════ -->
       <main class="view" id="view-telemetry">

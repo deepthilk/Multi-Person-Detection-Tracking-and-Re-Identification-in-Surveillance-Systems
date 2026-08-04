@@ -33,17 +33,115 @@ import cv2
 logger = logging.getLogger(__name__)
 
 
+def _save_evidence_frame(video_path: str, frame_id: int, bbox, out_path: Path) -> Path | None:
+    """Crop a single video frame at the given bbox and save it as a JPEG.
+
+    Returns the written path, or None when the frame/bbox can't be recovered.
+    """
+    if not bbox:
+        return None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_id) - 1))
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            return None
+    except Exception:
+        logger.exception("Could not read evidence frame %s from %s", frame_id, video_path)
+        return None
+
+    try:
+        x, y, w, h = [int(v) for v in bbox]
+        if w <= 0 or h <= 0:
+            return None
+        mx = int(0.12 * w)
+        my = int(0.18 * h)
+        x1 = max(0, x - mx)
+        y1 = max(0, y - my)
+        x2 = min(frame.shape[1], x + w + mx)
+        y2 = min(frame.shape[0], y + h + my)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), crop)
+        return out_path
+    except Exception:
+        logger.exception("Could not save evidence frame %s", out_path)
+        return None
+
+
+def _resolve_identity_name(
+    sid,
+    body_feat,
+    face_candidates,
+    track_to_identity,
+    identity_db,
+    face_confirm,
+    match_threshold,
+    face_similarity=None,
+):
+    """Face-primary name resolution for one stable identity.
+
+    If a face was ever detected on this identity's tracks, the face decides:
+    the best candidate-frame similarity to a registered person's average face
+    that clears ``face_confirm`` names the person; if no face clears the bar
+    the identity stays Unknown (``None``). The body is consulted ONLY when the
+    identity never showed a face at all (e.g. back-to-camera), where a
+    body-only match is the only available signal.
+
+    ``face_similarity`` is injectable for tests; it defaults to SFace's cosine
+    similarity. ``identity_db`` needs ``_data`` and ``match(...)``.
+    """
+    if face_similarity is None:
+        from reidentification.face_cue import FaceCueExtractor
+        face_similarity = FaceCueExtractor.similarity
+
+    cands_for_sid = [
+        cands
+        for tid, cands in face_candidates.items()
+        if track_to_identity.get(tid) == sid
+    ]
+    if not cands_for_sid:
+        matches = identity_db.match(
+            body_feat, query_face_embedding=None, top_k=1, threshold=match_threshold
+        )
+        return matches[0] if matches else None
+
+    confirmed = []  # (name, face_sim) across every candidate frame
+    for cands in cands_for_sid:
+        for (_fid, _bbox, face_feat, _score, _fbox) in cands:
+            for name, record in identity_db._data.items():
+                avg = record.get("average_face_descriptor")
+                if avg is None:
+                    continue
+                sim = face_similarity(avg, face_feat)
+                if sim is not None and sim >= face_confirm:
+                    confirmed.append((name, sim))
+    if confirmed:
+        return max(confirmed, key=lambda c: c[1])
+    return None
+
+
 def run_camera_reid(
     video_path: str,
     tracking_json_path: str,
     output_json_path: str,
     device: str = "cpu",
     identity_db=None,
-    match_threshold: float = None,
+    match_threshold: float | None = None,
+    progress_callback=None,
 ):
     """
     Run Re-ID for one camera's video and resolve stable identities against
     a registered IdentityDatabase.
+
+    progress_callback(pct: int, message: str) is invoked periodically while
+    the (slow) per-frame face extraction runs, so a UI can show movement
+    instead of looking stuck at 60%.
 
     Returns:
         {
@@ -56,8 +154,18 @@ def run_camera_reid(
         }
     """
     from reidentification.reid_main import ReIDEngine
+    from reidentification.face_cue import FaceCueExtractor
 
     engine = ReIDEngine(device=device)
+
+    # The engine's internal face-based decisions (blend/switch/cluster) were
+    # designed for distinguishing identical uniforms, but in this crowd
+    # footage they over-fragment stable identities (3 people -> 6 tracks,
+    # and the same person split into two). Faces are still used for NAME
+    # RESOLUTION below via a separate extractor, so tracking keeps its
+    # original, stable behaviour while matching still benefits from faces.
+    engine.face_extractor.enabled = False
+    name_face_extractor = FaceCueExtractor()
 
     with open(tracking_json_path) as f:
         tracking_data = json.load(f)
@@ -67,7 +175,13 @@ def run_camera_reid(
     expected_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     results = {}
+    face_candidates = {}   # track_id -> [(frame_id, bbox, face_feat, yunet_score, face_bbox), ...]
     frame_id = 0
+    # Face extraction runs per detection and is the dominant cost of this
+    # stage. Candidate faces are only needed for name resolution, so sampling
+    # every 5th frame (~5 fps) is plenty and cuts the stage ~5x; the best
+    # frame across a track still wins.
+    face_stride = max(1, int(round(fps / 5)))
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -75,6 +189,25 @@ def run_camera_reid(
         frame_id += 1
         tracks = tracking_data.get(str(frame_id), [])
         results[frame_id] = engine.process_frame(frame, tracks, frame_id)
+        # Collect per-track face candidates for name resolution. The engine
+        # keeps only the last-seen face per identity (often blurrier than
+        # the best one); we keep every confident detection so the final
+        # name lookup can use the highest-quality face instead.
+        if frame_id % face_stride == 0:
+            for p in results[frame_id]:
+                tid = p.get("id")
+                bbox = p.get("bbox")
+                if tid is None or not bbox:
+                    continue
+                got = name_face_extractor.extract_with_box(frame, bbox)
+                if got is not None:
+                    face_feat, yunet_score, face_bbox = got
+                    face_candidates.setdefault(tid, []).append(
+                        (frame_id, bbox, face_feat, yunet_score, face_bbox)
+                    )
+        if progress_callback is not None and frame_id % max(1, face_stride * 2) == 0:
+            pct = int(60 + 26 * (frame_id / max(1, expected_frames)))
+            progress_callback(min(pct, 86), f"Matching known people ({frame_id}/{max(1, expected_frames)} frames)")
     cap.release()
 
     frames_read = frame_id
@@ -97,16 +230,56 @@ def run_camera_reid(
 
     # Name resolution happens BEFORE renumbering, in the original stable-id
     # space that engine.consolidated_features is keyed by.
+    #
+    # Strategy (face-primary): if a face was EVER detected on the identity,
+    # the face decides the name — the best candidate frame that clears the
+    # confirm bar (>= face_match_threshold) names the person, and if no face
+    # clears the bar the identity stays Unknown. The body is only consulted
+    # when NO face was ever seen on the track (e.g. back-to-camera). An
+    # inconclusive face must never be overruled by a body guess: that
+    # body-over-face fallback is what mislabelled a stranger as "Pranjali"
+    # in earlier runs despite a ~0.31 face (below the 0.30 veto bar).
     name_by_original_sid = {}
     if identity_db is not None and len(identity_db):
+        from registration.db_config import SEARCH_SETTINGS as _search_settings
+        face_confirm = _search_settings.get("face_match_threshold", 0.40)
         for sid, feat in engine.consolidated_features.items():
             try:
-                matches = identity_db.match(feat, top_k=1, threshold=match_threshold)
+                resolved = _resolve_identity_name(
+                    sid, feat, face_candidates, engine.track_to_identity,
+                    identity_db, face_confirm, match_threshold,
+                )
+                if resolved is not None:
+                    name_by_original_sid[sid] = resolved
             except Exception:
                 logger.exception("Name match failed for stable id %s — leaving unresolved", sid)
-                matches = []
-            if matches:
-                name_by_original_sid[sid] = matches[0]  # (name, similarity)
+
+    # Evidence frames: for each MATCHED identity, keep the top-5 frames whose
+    # per-frame face similarity to the matched person's average face is the
+    # highest. This is the honest "these are the moments that decided the
+    # match" list shown in the UI.
+    evidence_by_sid = {}
+    if name_by_original_sid and identity_db is not None:
+        for sid, (name, _sim) in name_by_original_sid.items():
+            record = identity_db._data.get(name)
+            avg_face = (record or {}).get("average_face_descriptor")
+            if avg_face is None:
+                continue
+            per_frame = {}
+            for tid, cands in face_candidates.items():
+                if engine.track_to_identity.get(tid) != sid:
+                    continue
+                for (fid, bbox, face_feat, _score, _fbox) in cands:
+                    sim = FaceCueExtractor.similarity(avg_face, face_feat)
+                    if sim is None:
+                        continue
+                    if fid not in per_frame or sim > per_frame[fid][0]:
+                        per_frame[fid] = (sim, bbox)
+            ranked = sorted(per_frame.items(), key=lambda kv: kv[1][0], reverse=True)[:5]
+            evidence_by_sid[sid] = [
+                {"frame": fid, "similarity": round(sim, 3), "bbox": bbox}
+                for fid, (sim, bbox) in ranked
+            ]
 
     # Renumber 1..N by first appearance, same rule as reid_main.run_reid_pipeline,
     # so on-screen labels stay stable and consistent with any rendered video.
@@ -140,8 +313,27 @@ def run_camera_reid(
         json.dump(results, f, indent=2)
 
     people = []
+    evidence_dir = Path(output_json_path).parent
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    output_stem = Path(output_json_path).stem
     for final_id, info in sorted(track_info.items()):
         match = name_by_original_sid.get(info["original_sid"])
+        top_frames = []
+        for i, ev in enumerate(evidence_by_sid.get(info["original_sid"], []), start=1):
+            crop_path = _save_evidence_frame(
+                video_path,
+                ev["frame"],
+                ev["bbox"],
+                evidence_dir / f"{output_stem}_track{final_id}_top{i}.jpg",
+            )
+            top_frames.append(
+                {
+                    "frame": ev["frame"],
+                    "time_sec": round(ev["frame"] / fps, 1),
+                    "similarity": ev["similarity"],
+                    "url": f"/outputs/{crop_path.name}" if crop_path else None,
+                }
+            )
         people.append(
             {
                 "track_id": final_id,
@@ -149,8 +341,12 @@ def run_camera_reid(
                 "similarity": round(float(match[1]), 3) if match else None,
                 "first_seen_sec": round(info["first_frame"] / fps, 1),
                 "last_seen_sec": round(info["last_frame"] / fps, 1),
+                "top_frames": top_frames,
             }
         )
+
+    if progress_callback is not None:
+        progress_callback(88, "Finalising matches")
 
     return {
         "fps": fps,
@@ -159,7 +355,6 @@ def run_camera_reid(
         "frames_expected": expected_frames,
         "frame_drop_rate": drop_rate,
     }
-
 
 def load_track_overlay(reid_json_path: str, people: list, fps: float, max_frames: int = 900) -> dict:
     """

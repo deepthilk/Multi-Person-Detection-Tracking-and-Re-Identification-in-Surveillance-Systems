@@ -452,6 +452,17 @@ def cmd_autofix(args):
 
 
 
+def cmd_self_check(args):
+    """Audit the identity database: per-person inventory, body/face
+    cross-similarity matrices, and closed-loop consistency (every stored
+    photo re-embedded deterministically must match back to its own person).
+    Writes a JSON report for pasting into a review."""
+    from registration.self_check import run_self_check, print_report
+
+    report = run_self_check(out_path=args.out)
+    print_report(report)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Person Registration & Identity Database")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -542,6 +553,12 @@ def main():
     p_restore.add_argument("--replace", action="store_true",
                             help="Replace the current database entirely instead of merging")
     p_restore.set_defaults(func=cmd_restore)
+
+    p_selfcheck = sub.add_parser("self-check",
+                                 help="Audit the identity database and write a JSON report")
+    p_selfcheck.add_argument("--out", default=None,
+                             help="Where to write the JSON report (e.g. reports/self_check.json)")
+    p_selfcheck.set_defaults(func=cmd_self_check)
 
     args = parser.parse_args()
     return args.func(args)

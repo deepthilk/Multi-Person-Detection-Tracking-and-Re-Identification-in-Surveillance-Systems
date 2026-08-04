@@ -9,9 +9,17 @@ Centralized settings for all modules
 
 DETECTION = {
     'model_path': 'models/yolov8s.pt',
-    'conf_threshold': 0.35,
+    'conf_threshold': 0.25,
     'imgsz': 960,
     'device': 'cuda',  # 'cuda' or 'cpu'
+    # Size/aspect gates — boxes failing any gate are dropped. Relaxed values
+    # (min_height 30, min_aspect 0.5) keep far/small or sitting/crouching
+    # people that a 1.0+ aspect gate used to discard.
+    'min_area': 600,
+    'min_height': 30,
+    'min_aspect': 0.5,
+    'max_aspect': 4.5,
+    'min_area_ratio': 0.0008,
 }
 
 # ==============================================================================

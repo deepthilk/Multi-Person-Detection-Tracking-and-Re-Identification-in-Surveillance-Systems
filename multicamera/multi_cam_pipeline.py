@@ -71,7 +71,7 @@ class MultiCameraPipeline:
     """
 
     def __init__(self, camera_configs=None, settings=None, device="cpu",
-                 conf_threshold=0.35):
+                 conf_threshold=0.25):
         self.camera_configs = camera_configs or CAMERAS
         self.settings = settings or MULTICAM_SETTINGS
         self.device = device
@@ -193,7 +193,7 @@ class MultiCameraPipeline:
 
 
 def run_multicamera_pipeline(camera_configs=None, device="cpu",
-                              conf_threshold=0.35, on_person_detected=None,
+                              conf_threshold=0.25, on_person_detected=None,
                               max_frames=None):
     """Convenience function mirroring the style of run_detection /
     run_tracking / run_reid_pipeline in the rest of the codebase."""

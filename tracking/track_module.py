@@ -130,6 +130,16 @@ def run_tracking(video_path: str, detections_path: str, output_path: str) -> dic
 
     cap.release()
 
+    # Merge nested/fragment tracks: with a two-tier (weak + strong) detection
+    # gate, the same physical person can briefly be tracked twice — once from a
+    # weak head/shoulders-only box at the frame edge and once from the full-body
+    # box that appears a couple of frames later. The fragment's bbox is almost
+    # entirely contained inside the full-body bbox over the same frames, so it
+    # looks like a NEW person to the Re-ID stage and produces a phantom identity
+    # (e.g. "Alice" that is really Prajna). Merge the contained track into the
+    # containing one so one person never becomes two.
+    tracking_results = _merge_nested_tracks(tracking_results)
+
     unique_ids = {t['id'] for tracks in tracking_results.values() for t in tracks}
     logger.info(f"✅ Tracking complete: {frame_id} frames, {len(unique_ids)} unique person IDs")
 
@@ -138,6 +148,82 @@ def run_tracking(video_path: str, detections_path: str, output_path: str) -> dic
         json.dump(tracking_results, f, indent=4)
 
     return tracking_results
+
+
+def _box_area(box):
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def _contained_ratio(inner, outer):
+    """Fraction of inner's area that lies inside outer (0.0-1.0)."""
+    inner_area = _box_area(inner)
+    if inner_area <= 0:
+        return 0.0
+    ix1 = max(inner[0], outer[0]); iy1 = max(inner[1], outer[1])
+    ix2 = min(inner[2], outer[2]); iy2 = min(inner[3], outer[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    return ((ix2 - ix1) * (iy2 - iy1)) / inner_area
+
+
+def _merge_nested_tracks(tracking_results: dict) -> dict:
+    """Drop fragment tracks whose bbox is almost fully contained inside another
+    track's bbox on the same frames (nested duplicate). Returns a new dict.
+
+    Only a SMALL, SHORT-LIVED track counts as a fragment. A real person
+    crossing behind another has a similarly-sized box (area ratio ~0.4-1.0)
+    and an independent life before/after; a duplicate created by the weak-tier
+    head/shoulders box is tiny (area ratio ~0.1) and dies within a few frames.
+    """
+    # Total frames per track (fragments are transient).
+    total_frames: dict = {}
+    for tracks in tracking_results.values():
+        for t in tracks:
+            total_frames[t['id']] = total_frames.get(t['id'], 0) + 1
+
+    # Count, for every ordered pair (contained, container), how many shared
+    # frames satisfy: inner bbox >= 80% contained in outer AND inner area is
+    # at most 35% of outer's area.
+    votes: dict = {}
+    for frame_id, tracks in tracking_results.items():
+        if len(tracks) < 2:
+            continue
+        boxes = {t['id']: t['bbox'] for t in tracks}
+        for a_id, a_box in boxes.items():
+            a_area = _box_area(a_box)
+            if a_area <= 0:
+                continue
+            for b_id, b_box in boxes.items():
+                if a_id == b_id:
+                    continue
+                b_area = _box_area(b_box)
+                if b_area <= 0:
+                    continue
+                if a_area > 0.35 * b_area:
+                    continue  # similarly-sized box — a real person, not a fragment
+                if _contained_ratio(a_box, b_box) >= 0.8:
+                    key = (a_id, b_id)
+                    votes[key] = votes.get(key, 0) + 1
+
+    # A fragment needs to be nested on several frames (not a one-off overlap)
+    # AND be short-lived overall (<= 12 frames) before we trust it.
+    drop_ids = set()
+    for (a_id, b_id), n in votes.items():
+        if n >= 3 and total_frames.get(a_id, 0) <= 12:
+            drop_ids.add(a_id)
+
+    if not drop_ids:
+        return tracking_results
+
+    logger.info(f"Merging {len(drop_ids)} nested fragment track(s): "
+                f"{sorted(drop_ids)} contained inside larger tracks — removing duplicates")
+
+    merged = {}
+    for frame_id, tracks in tracking_results.items():
+        kept = [t for t in tracks if t['id'] not in drop_ids]
+        if kept:
+            merged[frame_id] = kept
+    return merged
 
 
 if __name__ == "__main__":

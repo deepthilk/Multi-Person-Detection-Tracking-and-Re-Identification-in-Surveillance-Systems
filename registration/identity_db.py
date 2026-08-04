@@ -19,6 +19,7 @@ the functions in this file.
 
 import json
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -64,7 +65,7 @@ class IdentityDatabase:
 
     # ── writes ───────────────────────────────────────────────────────────
 
-    def add_person(self, name: str, embeddings: list, image_paths: list = None):
+    def add_person(self, name: str, embeddings: list, image_paths: list = None, face_embeddings: list = None):
         """
         Add or update a person.
 
@@ -72,6 +73,7 @@ class IdentityDatabase:
             name: unique display name, used as the lookup key.
             embeddings: list of 1-D numpy arrays / lists (one per image).
             image_paths: original source paths, stored as metadata only.
+            face_embeddings: optional list of face embedding vectors.
         """
         if not embeddings:
             raise ValueError(f"No usable embeddings for '{name}' — nothing to store")
@@ -79,12 +81,20 @@ class IdentityDatabase:
         vectors = [np.asarray(e, dtype=np.float32).tolist() for e in embeddings]
         average = np.mean(np.array(vectors, dtype=np.float32), axis=0).tolist()
 
+        face_vectors = [np.asarray(f, dtype=np.float32).tolist() for f in (face_embeddings or [])]
+        avg_face = np.mean(np.array(face_vectors, dtype=np.float32), axis=0).tolist() if face_vectors else None
+
         existing = self._data.get(name)
         if existing:
             # Registering more photos for someone already in the DB: append
             # rather than overwrite, and recompute the average.
             vectors = existing["embeddings"] + vectors
             average = np.mean(np.array(vectors, dtype=np.float32), axis=0).tolist()
+
+            existing_faces = existing.get("face_embeddings", [])
+            face_vectors = existing_faces + face_vectors
+            avg_face = np.mean(np.array(face_vectors, dtype=np.float32), axis=0).tolist() if face_vectors else existing.get("average_face_descriptor")
+
             num_images = existing["metadata"]["num_images"] + len(embeddings)
             all_paths = existing["metadata"].get("image_paths", []) + (image_paths or [])
             registered_at = existing["metadata"]["registered_at"]
@@ -96,6 +106,8 @@ class IdentityDatabase:
         self._data[name] = {
             "embeddings": vectors,
             "average_embedding": average,
+            "face_embeddings": face_vectors,
+            "average_face_descriptor": avg_face,
             "metadata": {
                 "registered_at": registered_at,
                 "last_updated": datetime.now().isoformat(),
@@ -104,14 +116,29 @@ class IdentityDatabase:
             },
         }
         self.save()
-        logger.info(f"✅ Registered '{name}' with {num_images} total image(s)")
+        logger.info(f"✅ Registered '{name}' with {num_images} total image(s) (faces: {len(face_vectors)})")
 
     def delete_person(self, name: str) -> bool:
         if name in self._data:
             del self._data[name]
             self.save()
+            self._remove_person_images(name)
             return True
         return False
+
+    def _remove_person_images(self, name: str):
+        """Remove the on-disk photo folder for this person, if any.
+
+        Deleting a person should not leave orphaned photos behind in
+        ``outputs/registration/images/<name>/``.
+        """
+        images_dir = Path(DB_SETTINGS["images_dir"]) / name
+        if images_dir.exists():
+            try:
+                shutil.rmtree(images_dir)
+                logger.info("Removed photo folder for deleted person: %s", images_dir)
+            except OSError as exc:
+                logger.warning("Could not remove photo folder %s: %s", images_dir, exc)
 
     # ── reads ────────────────────────────────────────────────────────────
 
@@ -136,28 +163,93 @@ class IdentityDatabase:
             if q in name.lower()
         ]
 
-    def match(self, query_embedding, top_k: int = None, threshold: float = None) -> list:
+    def match(self, query_embedding, query_face_embedding=None, top_k: int = None, threshold: float = None) -> list:
         """
-        Compare a query embedding (e.g. from a live Re-ID track) against
-        every registered person's average embedding.
+        Compare a query embedding against registered persons.
 
-        Returns a list of (name, similarity) sorted by similarity
-        descending, filtered by threshold, capped at top_k.
+        Body-only (no face available): cosine against the average body
+        embedding, threshold = match_threshold (0.55).
 
-        This is the function Deepthi's Re-ID module (or Pranjali's
-        dashboard) calls in Phase 3 to answer "who is this?".
+        Face available (query AND registered person both have a face):
+          * face_sim >= face_match_threshold (0.40) -> the face CONFIRMS the
+            identity on its own; the match score is the face similarity and
+            the bar is the lower face threshold. This is what recognises a
+            person who changed clothes / lighting between registration and
+            the live clip — the body cue (which hates outfit changes) no
+            longer drags a clear face below the body threshold.
+          * face_sim < face_veto_threshold (0.30) -> confident mismatch;
+            veto even a strong body score (two people can't share a face).
+          * otherwise -> the face is inconclusive, so the BODY decides
+            (threshold = match_threshold). An inconclusive face must not
+            pull a strong body match below the bar, otherwise a different
+            camera angle (smaller/partial faces) would suppress people who
+            genuinely match by appearance.
         """
         top_k = top_k or SEARCH_SETTINGS["top_k"]
-        threshold = threshold if threshold is not None else SEARCH_SETTINGS["match_threshold"]
+        body_threshold = threshold if threshold is not None else SEARCH_SETTINGS["match_threshold"]
+        face_confirm = SEARCH_SETTINGS.get("face_match_threshold", 0.40)
+        face_veto = SEARCH_SETTINGS.get("face_veto_threshold", 0.30)
+
+        from reidentification.face_cue import FaceCueExtractor
 
         scores = []
         for name, record in self._data.items():
-            sim = _cosine(query_embedding, record["average_embedding"])
-            if sim >= threshold:
+            body_sim = _cosine(query_embedding, record["average_embedding"])
+
+            avg_face = record.get("average_face_descriptor")
+            if query_face_embedding is not None and avg_face is not None:
+                face_sim = FaceCueExtractor.similarity(avg_face, query_face_embedding)
+                if face_sim is not None:
+                    if face_sim < face_veto:
+                        sim, bar = 0.0, face_veto
+                    elif face_sim >= face_confirm:
+                        sim, bar = face_sim, face_confirm
+                    else:
+                        sim, bar = body_sim, body_threshold
+                else:
+                    sim, bar = body_sim, body_threshold
+            else:
+                sim, bar = body_sim, body_threshold
+
+            if sim >= bar:
                 scores.append((name, sim))
 
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:top_k]
+
+    def cross_similarity(self, name: str) -> list:
+        """
+        Compare one registered person's average embeddings against every OTHER
+        person in the database.
+
+        Returns a list of dicts ``{"other", "body_sim", "face_sim"}`` sorted
+        by body similarity (highest first). ``face_sim`` is ``None`` when
+        either side lacks a face descriptor.
+
+        This backs the registration-time guardrails: it answers "which
+        existing registrant can the new person NOT be told apart from?" for
+        the body cue, the face cue, or both.
+        """
+        record = self._data.get(name)
+        if not record:
+            return []
+        avg_body = record.get("average_embedding")
+        avg_face = record.get("average_face_descriptor")
+
+        from reidentification.face_cue import FaceCueExtractor
+
+        results = []
+        for other, other_record in self._data.items():
+            if other == name:
+                continue
+            body_sim = _cosine(avg_body, other_record["average_embedding"])
+            face_sim = None
+            other_face = other_record.get("average_face_descriptor")
+            if avg_face is not None and other_face is not None:
+                face_sim = FaceCueExtractor.similarity(avg_face, other_face)
+            results.append({"other": other, "body_sim": body_sim, "face_sim": face_sim})
+        results.sort(key=lambda x: x["body_sim"], reverse=True)
+        return results
 
     def export_for_reid(self) -> dict:
         """

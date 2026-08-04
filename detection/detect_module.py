@@ -15,20 +15,28 @@ logger = logging.getLogger(__name__)
 
 class PersonDetector:
     """YOLOv8 based person detector"""
-    
+
     def __init__(
         self,
         model_path='models/yolov8s.pt',
-        conf_threshold=0.35,
+        conf_threshold=0.25,
         device='cuda',
-        min_area=900,
-        min_height=50,
-        min_aspect=1.0,
+        min_area=600,
+        min_height=30,
+        min_aspect=0.5,
         max_aspect=4.5,
         min_area_ratio=0.0008,
+        weak_conf_threshold=None,
     ):
         self.model_path = model_path
         self.conf_threshold = conf_threshold
+        # Detections at [weak_conf_threshold, conf_threshold) are "barely
+        # visible" people: kept only when they don't overlap a strong (>= conf)
+        # detection, so the main gate stays tight while edge/occluded people
+        # still get a chance to be tracked and matched.
+        self.weak_conf_threshold = (
+            weak_conf_threshold if weak_conf_threshold is not None else conf_threshold
+        )
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.min_area = min_area
         self.min_height = min_height
@@ -53,8 +61,10 @@ class PersonDetector:
         Returns:
             List of [x1, y1, w, h, score] detections
         """
-        results = self.model(frame, conf=self.conf_threshold, imgsz=imgsz, device=self.device)[0]
-        detections = []
+        run_conf = min(self.conf_threshold, self.weak_conf_threshold)
+        results = self.model(frame, conf=run_conf, imgsz=imgsz, device=self.device)[0]
+        strong = []
+        weak = []
         
         if results.boxes is not None:
             frame_h, frame_w = frame.shape[:2]
@@ -78,22 +88,49 @@ class PersonDetector:
 
                 if aspect < self.min_aspect or aspect > self.max_aspect:
                     continue
-                detections.append([x1, y1, w, h, float(score)])
+
+                det = [x1, y1, w, h, float(score)]
+                if score >= self.conf_threshold:
+                    strong.append((box, det))
+                elif score >= self.weak_conf_threshold:
+                    weak.append((box, det))
         
-        return detections
+        # Drop weak boxes that overlap a strong one (same person, fluctuating
+        # confidence) — only genuinely separate barely-visible people survive.
+        kept_weak = []
+        for wbox, det in weak:
+            if any(_iou(wbox, sbox) > 0.5 for sbox, _ in strong):
+                continue
+            kept_weak.append(det)
+        
+        return [det for _, det in strong] + kept_weak
+
+
+def _iou(a, b):
+    """Intersection over union for two [x1, y1, x2, y2] boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    a_area = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    b_area = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+    return inter / float(a_area + b_area - inter)
 
 
 def run_detection(
     video_path,
     output_path,
-    conf_threshold=0.35,
+    conf_threshold=0.25,
     imgsz=960,
     device='cuda',
-    min_area=900,
-    min_height=50,
-    min_aspect=1.0,
+    min_area=600,
+    min_height=30,
+    min_aspect=0.5,
     max_aspect=4.5,
     min_area_ratio=0.0008,
+    weak_conf_threshold=None,
 ):
     """
     Run person detection on entire video
@@ -101,7 +138,9 @@ def run_detection(
     Args:
         video_path: Input video path
         output_path: Output JSON path
-        conf_threshold: Detection confidence threshold
+        conf_threshold: Detection confidence threshold (strong tier)
+        weak_conf_threshold: Lower bound for "barely visible" people; kept only
+            when they don't overlap a strong detection
         imgsz: YOLO input image size
         device: 'cuda' or 'cpu'
     
@@ -116,6 +155,7 @@ def run_detection(
         min_aspect=min_aspect,
         max_aspect=max_aspect,
         min_area_ratio=min_area_ratio,
+        weak_conf_threshold=weak_conf_threshold,
     )
     
     cap = cv2.VideoCapture(video_path)

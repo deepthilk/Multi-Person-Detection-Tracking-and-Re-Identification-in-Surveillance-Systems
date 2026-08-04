@@ -220,6 +220,14 @@ so call this only when the user confirms the crop is the right person.
 
 Multipart field `file` (video). Returns `{"job_id": "..."}`.
 
+**Name-resolution rule (face-primary):** if a face was ever detected on a
+track, the face decides the name — the best frame whose similarity to a
+registered person's average face clears `face_match_threshold` (0.40) names the
+person, and if no face clears the bar the person stays `unknown`. The body
+(`match_threshold`, 0.55) is only consulted when a track never showed a face at
+all (e.g. back-to-camera). An inconclusive face is never overruled by a body
+guess.
+
 ### `GET /api/progress/{job_id}` — poll pipeline progress
 
 ```json
@@ -231,6 +239,178 @@ Multipart field `file` (video). Returns `{"job_id": "..."}`.
   "output_name": "<job_id>_reid.mp4"
 }
 ```
+
+### Session run storage & cleanup (multi-camera sessions)
+
+Every completed camera run leaves artifacts in `web/outputs` (`<session>_<cam>_reid.json`, `_reid.mp4`, `_reid_track*_top*.jpg`, `_manifest.json`) and the uploaded source clip in `web/uploads`. To keep disk use bounded, `server.py`:
+
+- deletes the `_detections.json` / `_tracking.json` intermediates for each camera as soon as its run finishes (the UI never reads them after completion);
+- prunes to the **newest 5 sessions** after each completed run and at startup — everything (outputs **and** the uploaded source clip) for older sessions is removed;
+- sweeps orphaned 10-hex-prefixed files in `web/outputs` at startup (legacy `/api/process` job outputs, crash leftovers).
+
+All deletion is strictly **session-scoped**: only files named `{10-hex-session}_{...}` are ever matched. Registered people — `outputs/registration/identity_db.json`, `web/uploads/registration/`, `reg_*`/`verify_*` photos, `outputs/registration/images/` — are never touched.
+
+#### `GET /api/storage` — disk usage per session
+
+```json
+{
+  "sessions": [
+    { "session_id": "77d2f62a4a", "size": 12539871, "files": 9 }
+  ],
+  "total_size": 12539871,
+  "session_count": 1
+}
+```
+
+#### `DELETE /api/sessions/{session_id}` — delete one completed run
+
+Deletes that session's outputs and source upload, and removes it from the in-memory index. Returns `409` if any of its cameras are still `running`/`queued`.
+
+```json
+{ "deleted": "77d2f62a4a", "removed_files": 9 }
+```
+
+#### `DELETE /api/sessions` — delete all completed runs
+
+Skips sessions with cameras still `running`/`queued`. Registered people are unaffected.
+
+```json
+{ "deleted": ["77d2f62a4a", "25852b24aa"], "removed_files": 18 }
+```
+
+---
+
+## Multi-person auto-fix (ALL registered persons, one scan)
+
+Use this when a session came back with poor matches / "Unknown" people. One
+scan pass over the videos produces the top-5 candidate crops for **every**
+registered person at once, then each person is re-registered from the crop
+the user picks. Same background-job pattern as above.
+
+### `POST /api/autofix/all` — start the batch scan
+
+JSON body:
+
+```json
+{
+  "videos": ["input/video1.mp4"],
+  "samples": 20,
+  "top": 5,
+  "augmentations": 5
+}
+```
+
+Response `200`: `{"job_id": "cbdb7550c8", "status": "queued"}`
+
+### `GET /api/autofix/{job_id}` — poll (batch shape)
+
+When `status == "completed"` the job contains a `persons` array:
+
+```json
+{
+  "job_id": "cbdb7550c8",
+  "mode": "all",
+  "status": "completed",
+  "progress": 100,
+  "message": "Top 5 candidate(s) for 3 person(s)",
+  "threshold": 0.55,
+  "persons": [
+    {
+      "name": "Alice",
+      "candidates": [
+        {
+          "index": 0,
+          "pool_index": 1,
+          "video": "video1",
+          "frame": 67,
+          "bbox": [300, 120, 380, 340],
+          "similarity": 0.914,
+          "above_threshold": true,
+          "crop_url": "/api/autofix/cbdb7550c8/crop/1",
+          "crop_path": "outputs/registration/_auto_fix/candidate_video1_67_300_120.jpg"
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `candidates` are sorted best-first; render them as a **horizontal row of
+  thumbnails** using `crop_url`.
+- Highlight the ones where `above_threshold` is `true` (a confident find).
+- `pool_index` is the shared crop pool — the same crop can appear for several
+  persons; the `crop_url` always works via the pool index.
+
+### `POST /api/autofix/all/confirm` — re-register a picked crop
+
+JSON body:
+
+```json
+{
+  "job_id": "cbdb7550c8",
+  "name": "Alice",
+  "index": 0,
+  "augmentations": 5
+}
+```
+
+Response `200`:
+
+```json
+{
+  "registered": true,
+  "name": "Alice",
+  "source_video": "video1",
+  "frame": 67,
+  "similarity": 0.914,
+  "crop_url": "/api/autofix/cbdb7550c8/crop/1"
+}
+```
+
+Call this once per person after the user clicks a crop. The crop becomes that
+person's registration image (`overwrite = true`).
+
+---
+
+## Target sightings / alerts
+
+After a session finishes, every tracked person that resolved to a registered
+name becomes a sighting. Alerts are **throttled per (name, camera)** for 5
+minutes, so a person standing in front of a camera doesn't spam the feed.
+
+### `GET /api/alerts`
+
+```json
+{
+  "alerts": [
+    {
+      "id": "a1827be925",
+      "timestamp": "2026-08-01T15:30:12",
+      "session_id": "sess_abc123",
+      "camera": "cam1",
+      "camera_label": "Camera 1",
+      "similarity": 0.91,
+      "first_seen_sec": 3.2,
+      "last_seen_sec": 12.7,
+      "person": {
+        "name": "Alice",
+        "num_images": 1,
+        "registered_at": "2026-07-30T23:51:30.016383",
+        "last_updated": "2026-07-30T23:51:47.503291",
+        "photos": ["/reg-photos/Alice/000_alice_1.jpg"]
+      }
+    }
+  ],
+  "count": 1
+}
+```
+
+Poll this to drive the notification UI. `person.photos` are ready for
+`<img src="...">`.
+
+### `DELETE /api/alerts` — clear the feed
+
+Response: `{"cleared": <number removed>}`
 
 ---
 
@@ -245,6 +425,12 @@ Multipart field `file` (video). Returns `{"job_id": "..."}`.
    - `POST /api/registration/{name}/autofix` with selected sources.
    - Poll; render gallery of `crop_url` thumbnails with similarity badges.
    - On user click → `POST .../autofix/confirm` → show success, refresh person list.
+4. **Multi-person auto-fix** (after a session with Unknowns):
+   - `POST /api/autofix/all` with the session's videos.
+   - Poll `GET /api/autofix/{job_id}`; for each person show a horizontal row
+     of up to 5 `crop_url` thumbnails.
+   - User clicks a crop per person → `POST /api/autofix/all/confirm` each →
+     refresh results / re-run the session to see names.
 
 ## Gotchas
 

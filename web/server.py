@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import logging
 import shutil
 import sys
@@ -33,6 +34,11 @@ try:
 except ModuleNotFoundError:
     from web.multicam_pipeline import run_camera_reid
 
+try:
+    from sightings import record_session_sightings
+except ModuleNotFoundError:
+    from web.sightings import record_session_sightings
+
 logger = logging.getLogger("web.server")
 
 WEB_DIR = ROOT_DIR / "web"
@@ -64,9 +70,12 @@ LOGS: List[dict] = []
 LATENCY_SAMPLES: List[dict] = []
 _MAX_LOGS = 500
 _MAX_LATENCY_SAMPLES = 200
+# completed sessions (outputs + source uploads) to retain on disk; older runs
+# are pruned after each completed camera job and at startup
+_KEEP_SESSIONS = 5
 
 
-def _log(level: str, message: str, camera_id: str = None):
+def _log(level: str, message: str, camera_id: str | None = None):
     entry = {
         "ts": time.time(),
         "level": level,  # "info" | "warn" | "critical"
@@ -79,7 +88,7 @@ def _log(level: str, message: str, camera_id: str = None):
     logger.info("[%s] %s", level.upper(), message)
 
 
-def _record_latency(stage: str, seconds: float, camera_id: str = None):
+def _record_latency(stage: str, seconds: float, camera_id: str | None = None):
     LATENCY_SAMPLES.append(
         {"ts": time.time(), "stage": stage, "seconds": round(seconds, 3), "camera_id": camera_id}
     )
@@ -221,7 +230,22 @@ def delete_person(name: str):
     db = _get_db()
     if not db.delete_person(name):
         raise HTTPException(status_code=404, detail=f"'{name}' is not registered")
+    _remove_person_staging(name)
     return JSONResponse({"deleted": name})
+
+
+def _remove_person_staging(name: str):
+    """Also drop the upload-staging folder for this person, so deleting them
+    via the UI removes every trace of their photos — the identity-db record,
+    the registered copies under outputs/registration/images/, and the staging
+    copies under web/uploads/registration/."""
+    staging = REG_UPLOAD_DIR / name
+    if staging.exists():
+        try:
+            shutil.rmtree(staging)
+            logger.info("Removed upload staging for deleted person: %s", staging)
+        except OSError as exc:
+            logger.warning("Could not remove staging folder %s: %s", staging, exc)
 
 
 def _save_uploads(name: str, files: List[UploadFile]) -> List[str]:
@@ -288,6 +312,23 @@ def start_session(
     return JSONResponse({"session_id": session_id, "cameras": list(cameras.keys())})
 
 
+@app.get("/api/session/current")
+def current_session():
+    """Return the most recent session (id + camera labels) so a page refresh
+    can re-attach to an in-progress or completed job instead of going blank."""
+    if not SESSIONS:
+        return {"session_id": None, "cameras": []}
+    session_id = next(reversed(SESSIONS))
+    session = SESSIONS[session_id]
+    return {
+        "session_id": session_id,
+        "cameras": [
+            {"camera_id": cam["camera_id"], "label": cam["label"]}
+            for cam in session["cameras"].values()
+        ],
+    }
+
+
 @app.get("/api/session/{session_id}/progress")
 def session_progress(session_id: str):
     session = SESSIONS.get(session_id)
@@ -320,10 +361,13 @@ def session_results(session_id: str):
             }
             if person.get("name"):
                 entry = matched_by_name.setdefault(
-                    person["name"], {"name": person["name"], "similarity": person["similarity"], "sightings": []}
+                    person["name"],
+                    {"name": person["name"], "similarity": person["similarity"], "sightings": [], "top_frames": []},
                 )
                 entry["sightings"].append(sighting)
                 entry["similarity"] = max(entry["similarity"], person["similarity"])
+                for tf in person.get("top_frames") or []:
+                    entry["top_frames"].append(tf)
             else:
                 unmatched.append(
                     {
@@ -333,6 +377,10 @@ def session_results(session_id: str):
                 )
 
     matched = sorted(matched_by_name.values(), key=lambda m: m["name"].lower())
+    for m in matched:
+        m["top_frames"] = sorted(
+            m.get("top_frames", []), key=lambda tf: tf["similarity"], reverse=True
+        )[:5]
     summary = {
         "camera_count": len(cams),
         "people_detected": total_people,
@@ -340,7 +388,196 @@ def session_results(session_id: str):
         "unknown": len(unmatched),
         "all_cameras_done": all(c["status"] in ("completed", "error") for c in cams.values()),
     }
+
+    if summary["all_cameras_done"] and not session.get("_sightings_recorded"):
+        session["_sightings_recorded"] = True
+        record_session_sightings(session_id, cams)
+
     return JSONResponse({"summary": summary, "matched": matched, "unmatched": unmatched})
+
+
+def _write_manifest(session_id: str, camera_id: str, cam: dict):
+    """Persist a completed/errored camera's summary so a server restart can
+    rebuild the in-memory session index and results stay viewable."""
+    manifest = {
+        "camera_id": cam["camera_id"],
+        "label": cam["label"],
+        "status": cam["status"],
+        "percent": cam["percent"],
+        "message": cam["message"],
+        "output_url": cam.get("output_url"),
+        "people": cam.get("people", []),
+        "fps": cam.get("fps"),
+        "frame_drop_rate": cam.get("frame_drop_rate"),
+        "reid_json_path": cam.get("reid_json_path"),
+    }
+    try:
+        with (OUTPUT_DIR / f"{session_id}_{camera_id}_manifest.json").open("w") as f:
+            json.dump(manifest, f)
+    except Exception:
+        logger.exception("Could not write manifest for session=%s camera=%s", session_id, camera_id)
+
+
+def _restore_sessions():
+    """Reconstruct finished sessions from on-disk manifests at startup, so the
+    UI's refresh/restart re-attach can surface completed results too."""
+    if not OUTPUT_DIR.exists():
+        return
+    by_session: Dict[str, dict] = {}
+    for mf in OUTPUT_DIR.glob("*_manifest.json"):
+        try:
+            data = json.loads(mf.read_text())
+        except Exception:
+            continue
+        session_id = mf.name.split("_")[0]
+        by_session.setdefault(session_id, {"cameras": {}})
+        by_session[session_id]["cameras"][data["camera_id"]] = {
+            "camera_id": data["camera_id"],
+            "label": data["label"],
+            "status": data["status"],
+            "percent": data["percent"],
+            "message": data["message"],
+            "output_url": data.get("output_url"),
+            "people": data.get("people", []),
+            "fps": data.get("fps"),
+            "frame_drop_rate": data.get("frame_drop_rate"),
+            "reid_json_path": data.get("reid_json_path"),
+        }
+    SESSIONS.update(by_session)
+    if by_session:
+        _log("info", f"Restored {len(by_session)} finished session(s) from disk")
+
+
+# ── run retention / cleanup ──────────────────────────────────────────────
+# Deletion and pruning are strictly session-scoped: they only match files named
+# `{10-hex-session}_{...}` inside OUTPUT_DIR and UPLOAD_DIR. Registration data
+# (uploads/registration/, reg_*/verify_* photos, identity_db.json, REG_IMAGES_DIR)
+# never matches that prefix and is therefore never touched by any delete path.
+
+def _session_artifact_files(session_id: str) -> List[Path]:
+    """Every file belonging to a session: outputs/{session}_* + the uploaded
+    source clip uploads/{session}_*. Directories are ignored."""
+    files = list(OUTPUT_DIR.glob(f"{session_id}_*")) + list(UPLOAD_DIR.glob(f"{session_id}_*"))
+    return [f for f in files if f.is_file()]
+
+
+def _delete_session_files(session_id: str) -> int:
+    removed = 0
+    for path in _session_artifact_files(session_id):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            logger.warning("Could not delete %s", path)
+    return removed
+
+
+def _discard(path: Path):
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        logger.warning("Could not delete %s", path)
+
+
+def _prune_sessions(keep_n: int = 5):
+    """Keep only the newest `keep_n` sessions (by most-recent artifact mtime).
+    Never prunes a session with cameras still queued/running. Session-scoped
+    only — registered people are never removed."""
+    if keep_n <= 0:
+        return
+    ranked = []
+    for sid, session in SESSIONS.items():
+        cams = session.get("cameras", {})
+        if any(c.get("status") in ("running", "queued") for c in cams.values()):
+            continue
+        recency = 0.0
+        for f in _session_artifact_files(sid):
+            try:
+                recency = max(recency, f.stat().st_mtime)
+            except OSError:
+                pass
+        ranked.append((sid, recency))
+    ranked.sort(key=lambda r: r[1], reverse=True)
+    for sid, _ in ranked[keep_n:]:
+        removed = _delete_session_files(sid)
+        SESSIONS.pop(sid, None)
+        if removed:
+            _log("info", f"Pruned old session {sid} — removed {removed} file(s)")
+
+
+def _sweep_orphan_artifacts():
+    """Startup-only sweep: remove 10-hex-prefixed files in OUTPUT_DIR and
+    UPLOAD_DIR that don't belong to any restored session (legacy /api/process
+    job outputs, uploaded clips whose session never completed, leftovers from
+    crashed runs). Safe because no jobs are in flight at startup. Registration
+    data (reg_*/verify_*/registration/) never matches the 10-hex pattern."""
+    live = set(SESSIONS.keys())
+    for directory in (OUTPUT_DIR, UPLOAD_DIR):
+        if not directory.exists():
+            continue
+        for f in directory.iterdir():
+            if not f.is_file():
+                continue
+            prefix = f.name.split("_")[0]
+            if (
+                len(prefix) == 10
+                and all(c in "0123456789abcdef" for c in prefix)
+                and prefix not in live
+            ):
+                try:
+                    f.unlink()
+                    _log("info", f"Swept orphan artifact {f.name}")
+                except OSError:
+                    logger.warning("Could not delete %s", f)
+
+
+@app.get("/api/storage")
+def get_storage():
+    sessions = []
+    total = 0
+    for sid in SESSIONS:
+        size = 0
+        files = 0
+        for f in _session_artifact_files(sid):
+            try:
+                size += f.stat().st_size
+                files += 1
+            except OSError:
+                pass
+        sessions.append({"session_id": sid, "size": size, "files": files})
+        total += size
+    sessions.sort(key=lambda s: s["size"], reverse=True)
+    return JSONResponse(
+        {"sessions": sessions, "total_size": total, "session_count": len(sessions)}
+    )
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str):
+    session = SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if any(c.get("status") in ("running", "queued") for c in session["cameras"].values()):
+        raise HTTPException(status_code=409, detail="Session is still processing")
+    removed = _delete_session_files(session_id)
+    SESSIONS.pop(session_id, None)
+    _log("warn", f"Deleted session {session_id} — removed {removed} file(s)")
+    return JSONResponse({"deleted": session_id, "removed_files": removed})
+
+
+@app.delete("/api/sessions")
+def delete_all_sessions():
+    deleted = []
+    removed = 0
+    for session_id, session in list(SESSIONS.items()):
+        if any(c.get("status") in ("running", "queued") for c in session["cameras"].values()):
+            continue
+        removed += _delete_session_files(session_id)
+        SESSIONS.pop(session_id, None)
+        deleted.append(session_id)
+    _log("warn", f"Deleted {len(deleted)} completed session(s) — removed {removed} file(s)")
+    return JSONResponse({"deleted": deleted, "removed_files": removed})
 
 
 def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: str):
@@ -360,6 +597,7 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             str(input_path),
             str(detections_path),
             conf_threshold=0.6,
+            weak_conf_threshold=0.4,
             min_height=50,
             min_area_ratio=0.001,
             device=device,
@@ -384,6 +622,7 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             str(reid_path),
             device=device,
             identity_db=db,
+            progress_callback=lambda pct, msg: cam.update({"percent": pct, "message": msg}),
         )
         _ensure_artifact(reid_path, "Re-ID output")
         _record_latency("reid", time.time() - t2, camera_id)
@@ -421,10 +660,18 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
 
         cam.update({"status": "completed", "percent": 100, "message": "Done"})
         _log("info", f"{label}: pipeline complete ({time.time() - t0:.1f}s total)", camera_id)
+        _write_manifest(session_id, camera_id, cam)
+        _prune_sessions(_KEEP_SESSIONS)
     except Exception as exc:
         logger.exception("Camera job failed: session=%s camera=%s", session_id, camera_id)
         cam.update({"status": "error", "percent": cam.get("percent", 0), "message": str(exc)})
         _log("critical", f"{label}: pipeline failed — {exc}", camera_id)
+        _write_manifest(session_id, camera_id, cam)
+    finally:
+        # detection/tracking jsons are pure intermediates — the UI only reads
+        # reid.json / reid.mp4 / top-frame jpgs, so drop them to curb clutter.
+        _discard(detections_path)
+        _discard(tracking_path)
 
 
 @app.get("/api/session/{session_id}/camera/{camera_id}/tracks")
@@ -450,6 +697,27 @@ def camera_tracks(session_id: str, camera_id: str):
 @app.get("/api/logs")
 def get_logs(since: int = 0):
     return JSONResponse({"logs": LOGS[since:], "next_since": len(LOGS)})
+
+
+# ── target sightings / alerts ────────────────────────────────────────────────
+
+@app.get("/api/alerts")
+def get_alerts():
+    try:
+        from sightings import get_alerts as _get_alerts
+    except ModuleNotFoundError:
+        from web.sightings import get_alerts as _get_alerts
+    alerts = _get_alerts()
+    return JSONResponse({"alerts": alerts, "count": len(alerts)})
+
+
+@app.delete("/api/alerts")
+def clear_alerts():
+    try:
+        from sightings import clear_alerts as _clear_alerts
+    except ModuleNotFoundError:
+        from web.sightings import clear_alerts as _clear_alerts
+    return JSONResponse({"cleared": _clear_alerts()})
 
 
 @app.get("/api/telemetry")
@@ -554,6 +822,7 @@ def _run_pipeline_job(job_id, input_path, detections_path, tracking_path, reid_p
             str(input_path),
             str(detections_path),
             conf_threshold=0.6,
+            weak_conf_threshold=0.4,
             min_height=50,
             min_area_ratio=0.001,
             device=device,
@@ -589,4 +858,7 @@ def _run_pipeline_job(job_id, input_path, detections_path, tracking_path, reid_p
 
 if __name__ == "__main__":
     import uvicorn
+    _restore_sessions()
+    _sweep_orphan_artifacts()
+    _prune_sessions(_KEEP_SESSIONS)
     uvicorn.run(app, host="0.0.0.0", port=8000)

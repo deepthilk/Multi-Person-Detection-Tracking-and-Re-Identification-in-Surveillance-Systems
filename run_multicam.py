@@ -28,7 +28,7 @@ def main():
         description="Multi-Camera Processing and Video Stream Management"
     )
     parser.add_argument("--device", type=str, default="cpu", choices=["cuda", "cpu"])
-    parser.add_argument("--conf-threshold", type=float, default=0.35)
+    parser.add_argument("--conf-threshold", type=float, default=0.25)
     parser.add_argument("--max-frames", type=int, default=None,
                          help="Optional cap on ticks processed (useful for quick tests)")
     args = parser.parse_args()
