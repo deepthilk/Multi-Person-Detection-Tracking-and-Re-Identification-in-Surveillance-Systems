@@ -26,6 +26,8 @@ class PersonDetector:
         min_aspect=1.0,
         max_aspect=4.5,
         min_area_ratio=0.0008,
+        dedup_cover_ratio=0.9,
+        edge_margin=2,
     ):
         self.model_path = model_path
         self.conf_threshold = conf_threshold
@@ -35,6 +37,8 @@ class PersonDetector:
         self.min_aspect = min_aspect
         self.max_aspect = max_aspect
         self.min_area_ratio = min_area_ratio
+        self.dedup_cover_ratio = dedup_cover_ratio
+        self.edge_margin = edge_margin
         
         logger.info(f"Loading YOLOv8 model from {model_path}")
         self.model = YOLO(model_path)
@@ -79,8 +83,55 @@ class PersonDetector:
                 if aspect < self.min_aspect or aspect > self.max_aspect:
                     continue
                 detections.append([x1, y1, w, h, float(score)])
-        
-        return detections
+
+        return self._clean_detections(detections, frame_w, frame_h)
+
+    def _clean_detections(self, detections, frame_w, frame_h):
+        """
+        Post-process raw YOLO detections to remove duplicates and partials:
+          1. Suppress a detection that is nearly fully contained in a larger one
+             (duplicate boxes on the same person).
+          2. Drop detections clipped at 2+ frame borders (corner/edge partials,
+             e.g. a head-only crop that cannot be reliably tracked or recognized).
+        """
+        if len(detections) > 1:
+            keep = [True] * len(detections)
+            for i in range(len(detections)):
+                if not keep[i]:
+                    continue
+                ax1, ay1, aw, ah = detections[i][0], detections[i][1], detections[i][2], detections[i][3]
+                for j in range(i + 1, len(detections)):
+                    if not keep[j]:
+                        continue
+                    bx1, by1, bw, bh = detections[j][0], detections[j][1], detections[j][2], detections[j][3]
+                    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+                    ix2, iy2 = min(ax1 + aw, bx1 + bw), min(ay1 + ah, by1 + bh)
+                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                    aa = aw * ah
+                    ba = bw * bh
+                    small = min(aa, ba)
+                    if small > 0 and inter / small >= self.dedup_cover_ratio:
+                        if aa < ba:
+                            keep[i] = False
+                            break
+                        keep[j] = False
+            detections = [d for d, k in zip(detections, keep) if k]
+
+        out = []
+        for d in detections:
+            x1, y1, w, h = d[0], d[1], d[2], d[3]
+            borders = 0
+            if x1 <= self.edge_margin:
+                borders += 1
+            if y1 <= self.edge_margin:
+                borders += 1
+            if x1 + w >= frame_w - self.edge_margin:
+                borders += 1
+            if y1 + h >= frame_h - self.edge_margin:
+                borders += 1
+            if borders < 2:
+                out.append(d)
+        return out
 
 
 def run_detection(
@@ -94,6 +145,8 @@ def run_detection(
     min_aspect=1.0,
     max_aspect=4.5,
     min_area_ratio=0.0008,
+    dedup_cover_ratio=0.9,
+    edge_margin=2,
 ):
     """
     Run person detection on entire video
@@ -104,6 +157,9 @@ def run_detection(
         conf_threshold: Detection confidence threshold
         imgsz: YOLO input image size
         device: 'cuda' or 'cpu'
+        dedup_cover_ratio: Suppress a detection when it is at least this
+            fraction covered by a larger detection (removes duplicate boxes)
+        edge_margin: Drop detections touching this many frame borders
     
     Returns:
         Dictionary of frame_id -> detections
@@ -116,6 +172,8 @@ def run_detection(
         min_aspect=min_aspect,
         max_aspect=max_aspect,
         min_area_ratio=min_area_ratio,
+        dedup_cover_ratio=dedup_cover_ratio,
+        edge_margin=edge_margin,
     )
     
     cap = cv2.VideoCapture(video_path)
