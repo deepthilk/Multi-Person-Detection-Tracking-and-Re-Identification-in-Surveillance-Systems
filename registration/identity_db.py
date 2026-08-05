@@ -64,7 +64,8 @@ class IdentityDatabase:
 
     # ── writes ───────────────────────────────────────────────────────────
 
-    def add_person(self, name: str, embeddings: list, image_paths: list = None):
+    def add_person(self, name: str, embeddings: list, image_paths: list = None,
+                   face_embeddings: list = None):
         """
         Add or update a person.
 
@@ -72,6 +73,9 @@ class IdentityDatabase:
             name: unique display name, used as the lookup key.
             embeddings: list of 1-D numpy arrays / lists (one per image).
             image_paths: original source paths, stored as metadata only.
+            face_embeddings: optional list of 128-dim face embeddings, one per
+                image where a confident face was detected. Stored as the
+                person's face gallery so search can match by face.
         """
         if not embeddings:
             raise ValueError(f"No usable embeddings for '{name}' — nothing to store")
@@ -79,12 +83,16 @@ class IdentityDatabase:
         vectors = [np.asarray(e, dtype=np.float32).tolist() for e in embeddings]
         average = np.mean(np.array(vectors, dtype=np.float32), axis=0).tolist()
 
+        face_embeddings = face_embeddings or []
+        face_vectors = [np.asarray(f, dtype=np.float32).tolist() for f in face_embeddings]
+
         existing = self._data.get(name)
         if existing:
             # Registering more photos for someone already in the DB: append
             # rather than overwrite, and recompute the average.
             vectors = existing["embeddings"] + vectors
             average = np.mean(np.array(vectors, dtype=np.float32), axis=0).tolist()
+            face_vectors = existing.get("face_embeddings", []) + face_vectors
             num_images = existing["metadata"]["num_images"] + len(embeddings)
             all_paths = existing["metadata"].get("image_paths", []) + (image_paths or [])
             registered_at = existing["metadata"]["registered_at"]
@@ -96,6 +104,7 @@ class IdentityDatabase:
         self._data[name] = {
             "embeddings": vectors,
             "average_embedding": average,
+            "face_embeddings": face_vectors,
             "metadata": {
                 "registered_at": registered_at,
                 "last_updated": datetime.now().isoformat(),
@@ -104,7 +113,10 @@ class IdentityDatabase:
             },
         }
         self.save()
-        logger.info(f"✅ Registered '{name}' with {num_images} total image(s)")
+        logger.info(
+            f"✅ Registered '{name}' with {num_images} total image(s) "
+            f"({len(face_vectors)} face(s))"
+        )
 
     def delete_person(self, name: str) -> bool:
         if name in self._data:
@@ -170,6 +182,83 @@ class IdentityDatabase:
             name: np.asarray(record["average_embedding"], dtype=np.float32)
             for name, record in self._data.items()
         }
+
+    def export_with_faces(self) -> dict:
+        """
+        Hand the whole database out with BOTH cues:
+        {name: {"appearance": np.ndarray(698,), "faces": [np.ndarray(128,), ...]}}.
+
+        `faces` is the per-person face gallery (may be empty for people
+        registered before face support, or whose photos never showed a face).
+        """
+        return {
+            name: {
+                "appearance": np.asarray(record["average_embedding"], dtype=np.float32),
+                "faces": [np.asarray(f, dtype=np.float32)
+                          for f in (record.get("face_embeddings") or [])],
+            }
+            for name, record in self._data.items()
+        }
+
+    def match_multimodal(self, query_appearance, query_faces=None, top_k: int = None,
+                         threshold: float = None) -> list:
+        """
+        Match a video identity against every registered person using BOTH
+        body appearance and face (when the query side has faces).
+
+        Score-level fusion:
+          - No faces available on either side  -> appearance similarity only.
+          - Face clearly confirms the person   -> face dominates (70/30).
+          - Face clearly disagrees             -> veto: a different face can't
+            be overridden by coincidental clothing similarity.
+          - Ambiguous face                     -> balanced 50/50 blend.
+
+        Returns a list of dicts:
+            {"name", "score", "appearance_sim", "face_sim", "cues"}
+        sorted by score descending, filtered by threshold, capped at top_k.
+        """
+        top_k = top_k or SEARCH_SETTINGS["top_k"]
+        threshold = threshold if threshold is not None else SEARCH_SETTINGS["match_threshold"]
+
+        from reidentification.face_cue import FaceCueExtractor
+
+        def _fuse(app_sim: float, face_sim) -> tuple:
+            if face_sim is None:
+                return app_sim, ["appearance"]
+            s = SEARCH_SETTINGS
+            if face_sim >= s["face_confirmed_threshold"]:
+                return (s["fused_weight_face_confirmed"] * face_sim +
+                        s["fused_weight_appearance_confirmed"] * app_sim), \
+                       ["appearance", "face"]
+            if face_sim < s["face_veto_threshold"]:
+                return min(app_sim, face_sim), ["appearance", "face(veto)"]
+            return (s["fused_weight_face_ambiguous"] * face_sim +
+                    s["fused_weight_appearance_ambiguous"] * app_sim), \
+                   ["appearance", "face"]
+
+        query_faces = query_faces or []
+        results = []
+        for name, record in self._data.items():
+            app_sim = _cosine(query_appearance, record["average_embedding"])
+            gallery_faces = record.get("face_embeddings") or []
+            face_sim = None
+            if query_faces and gallery_faces:
+                face_sim = max(
+                    FaceCueExtractor.similarity(q, g)
+                    for q in query_faces for g in gallery_faces
+                )
+            score, cues = _fuse(app_sim, face_sim)
+            if score >= threshold:
+                results.append({
+                    "name": name,
+                    "score": round(float(score), 4),
+                    "appearance_sim": round(float(app_sim), 4),
+                    "face_sim": round(float(face_sim), 4) if face_sim is not None else None,
+                    "cues": cues,
+                })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:top_k]
 
     def __len__(self):
         return len(self._data)

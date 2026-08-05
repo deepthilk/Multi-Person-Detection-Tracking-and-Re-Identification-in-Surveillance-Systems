@@ -1,6 +1,11 @@
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root on path
+
 import torchreid
-from configs.resnet50_market1501 import CONFIG
+from reidentification.training.configs.resnet50_market1501 import CONFIG
 
 # -----------------------------
 # Dataset

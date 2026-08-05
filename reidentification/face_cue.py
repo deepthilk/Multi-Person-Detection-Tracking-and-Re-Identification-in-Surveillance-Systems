@@ -51,15 +51,17 @@ class FaceCueExtractor:
     DIM = 128
 
     # How far down the bounding box to look for a face (head is at the top).
-    # Matches roughly the same "face zone" MultiCueExtractor already crops
-    # for its color-histogram cue, with a little extra margin.
+    # Slightly expanded from 0.30 to 0.35 — in video4 (uniformed people),
+    # the camera angle means faces can appear a bit lower than strict top-30%.
     HEAD_ZONE_TOP    = 0.0
-    HEAD_ZONE_BOTTOM = 0.30
+    HEAD_ZONE_BOTTOM = 0.35
 
     # Below this face-detector confidence (via the face's location size vs
     # the crop), skip — a tiny/partial face gives a noisy, unreliable
     # embedding that would do more harm than good.
-    MIN_FACE_PIXELS = 15   # min face-box side length in the (upsampled) crop
+    # Lowered from 15 to 10 — video4 has distant faces that are small but
+    # still detectable with enough upsampling.
+    MIN_FACE_PIXELS = 10   # min face-box side length in the (upsampled) crop
 
     def __init__(self, upsample_times: int = 2):
         self.enabled = _FACE_RECOGNITION_AVAILABLE

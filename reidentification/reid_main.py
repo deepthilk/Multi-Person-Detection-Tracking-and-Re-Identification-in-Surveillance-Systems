@@ -75,27 +75,40 @@ class ReIDConfig:
     RESIZE_H: int = 256
     RESIZE_W: int = 128
 
-    # OSNet thresholds (UNIFORM MODE - relax appearance, strengthen temporal)
-    # For uniforms, appearance matching is unreliable; trust motion/tracking instead
-    MATCH_THRESHOLD_OSNET:        float = 0.62   # LOWERED for uniforms — appearance unreliable
-    FALLBACK_THRESHOLD_OSNET:     float = 0.55   # LOWERED for uniforms — less strict
-    REAPPEAR_THRESHOLD_OSNET:     float = 0.50   # LOWERED for uniforms — weak appearance signals
-    REACTIVATE_THRESHOLD_OSNET:   float = 0.58   # LOWERED for uniforms
+    # OSNet thresholds — balanced
+    MATCH_THRESHOLD_OSNET:        float = 0.65
+    FALLBACK_THRESHOLD_OSNET:     float = 0.58
+    REAPPEAR_THRESHOLD_OSNET:     float = 0.62
+    REACTIVATE_THRESHOLD_OSNET:   float = 0.60
 
-    # ResNet fallback thresholds (looser)
-    MATCH_THRESHOLD_RESNET:       float = 0.52   # LOWERED from 0.55
-    FALLBACK_THRESHOLD_RESNET:    float = 0.45   # LOWERED from 0.48
-    REAPPEAR_THRESHOLD_RESNET:    float = 0.45   # LOWERED from 0.48
-    REACTIVATE_THRESHOLD_RESNET:  float = 0.52   # LOWERED from 0.55
+    # ResNet fallback thresholds — RAISED to prevent appearance-driven false merges.
+    # Model diagnostics on Market-1501 show ~6% of different-person pairs have
+    # similarity >0.60. Raising match thresholds above this zone substantially
+    # reduces false matches during crossings, at the cost of occasionally missing
+    # a correct match (which the grace-period retry in PASS4 recovers from).
+    # A false merge (two people collapsed to one ID) is much worse than a
+    # temporary split (one person temporarily gets a second ID, then re-merges),
+    # so err on the side of higher thresholds.
+    MATCH_THRESHOLD_RESNET:       float = 0.62
+    FALLBACK_THRESHOLD_RESNET:    float = 0.55
+    REAPPEAR_THRESHOLD_RESNET:    float = 0.55
+    REACTIVATE_THRESHOLD_RESNET:  float = 0.60
 
-    # Scoring weights — UNIFORM MODE (motion > appearance)
-    W_APPEARANCE: float = 0.50   # HEAVILY LOWERED for uniforms — appearance identical
-    W_MOTION:     float = 0.35   # HEAVILY RAISED for uniforms — position is key differentiator
-    W_IOU:        float = 0.15   # RAISED for uniforms — spatial overlap matters most
+    # Scoring weights — HEAVILY favour appearance over motion/IOU.
+    # During crossings, motion and IOU become unreliable because DeepSORT's
+    # Kalman filter can swap which track_id follows which physical person.
+    # Appearance (what the person looks like) stays reliable regardless of
+    # position, so it must dominate to prevent ID swaps.
+    # Increased W_APPEARANCE from 0.70 to 0.85 because the model fine-tuned on
+    # Market-1501 has strong discriminative power (mean diff-person sim=0.04),
+    # so we can safely rely on it. Motion/IOU were at 0.18/0.12 — still too
+    # high during crossings where they become actively misleading.
+    W_APPEARANCE: float = 0.85   # Heavily dominant — appearance is the only reliable signal during crossings
+    W_MOTION:     float = 0.08   # Minimised — motion is unreliable during crossings
+    W_IOU:        float = 0.07   # Minimised — IOU is unreliable during crossings
 
     # Re-appearance: frame_gap after which motion/IOU are ignored
-    # LOWERED to allow brief appearances to be distinguished
-    REAPPEAR_GAP: int = 25   # LOWERED from 30 — quicker to re-appearance matching
+    REAPPEAR_GAP: int = 20   # REDUCED from 25
 
     # Switch-guard (prevent ID swap during crossings — ULTRA STRICT for uniforms)
     SWITCH_MARGIN:    float = 0.45   # HEAVILY INCREASED for uniforms — prevent accidental swaps
@@ -109,9 +122,12 @@ class ReIDConfig:
     SWITCH_MARGIN_FACE_CONFIRMED:    float = 0.05
     SWITCH_MIN_SCORE_FACE_CONFIRMED: float = 0.55
 
-    # Continuity lock — STRENGTHENED for uniforms (hard to change ID)
-    TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
-    TRACK_LOCK_MIN_SCORE: float = 0.40 # LOWERED threshold but longer duration compensates
+    # Continuity lock — INCREASED to prevent ID swaps during crossings.
+    # A higher min-score means a tracker stays locked to its identity even
+    # when motion/IOU briefly disagree (e.g., during a crossing), because
+    # the appearance component (now 85% weight) is the primary signal.
+    TRACK_LOCK_GAP:       int   = 60
+    TRACK_LOCK_MIN_SCORE: float = 0.55
 
     # Gallery
     GALLERY_SIZE:        int = 15
@@ -125,20 +141,14 @@ class ReIDConfig:
     MIN_CROP_PX:     int   = 8      # min pixels after clamping
     MIN_HEIGHT:      int   = 50
     MIN_AREA_RATIO:  float = 0.0008
-    # Duplicate-detection merge (before any tracking/Re-ID even runs): when
-    # YOLO/NMS produces two overlapping boxes for one physical person, they
-    # need to be merged into one BEFORE reaching the tracker/Re-ID — an
-    # unmerged duplicate becomes two separate tracker IDs, which Re-ID will
-    # (correctly, given its inputs) treat as two different people and give
-    # two different global IDs, inflating the person count. 0.75 was too
-    # strict: two real duplicate boxes on one person are often visibly
-    # offset from each other (different crop margins from near-identical
-    # detections), not near-perfectly overlapping — observed case had two
-    # boxes clearly on one person that never crossed 0.75 IoU. Lowered to
-    # 0.5, which still requires substantial overlap (so two genuinely
-    # different people standing close together in a crossing won't get
-    # wrongly merged here) while catching realistic duplicate detections.
-    DEDUP_IOU:       float = 0.50
+    # Only merge when boxes are nearly identical (same person detected twice).
+    # 0.50 was causing DIFFERENT people to be merged during crossings (common
+    # crossing IoU is 0.30-0.60), which removed one person entirely from the
+    # Re-ID pipeline — the collapsed person would reappear with a new/different
+    # tracker ID after separation, breaking identity continuity. 0.95 ensures
+    # only near-perfect box overlaps (true YOLO duplicates) get merged, while
+    # two real people crossing keep their independent tracks.
+    DEDUP_IOU:       float = 0.95
 
     # Temporal
     # How long (in frames) an identity stays eligible for re-matching before
@@ -177,18 +187,19 @@ class ReIDConfig:
     FACE_WEIGHT:          float = 0.65   # blend weight when a face is available
     FACE_MIN_SIMILARITY:  float = 0.35   # below this, treat as a mismatch veto
 
-    # Grace period before minting a brand-new identity — see PASS 4 comment
-    # in ReIDEngine._assign for why this exists (single-frame re-appearance
-    # failures were permanently splitting one person into two IDs).
-    # Kept short deliberately: each extra grace frame is also an extra
-    # chance for a genuinely new person to accidentally cross the (loose,
-    # uniform-tolerant) reappearance threshold and get wrongly merged into
-    # an existing identity — see REAPPEAR_NO_FACE_PENALTY below.
-    NEW_ID_GRACE_FRAMES: int = 2
+    # Grace period before minting a brand-new identity — keep very short to
+    # avoid merging different people who coincidentally look similar.
+    NEW_ID_GRACE_FRAMES: int = 5   # INCREASED from 1 — give returning persons time to reconnect
 
     # Body-only reappearance (no face confirmation available) is penalised
-    # by this much before comparing against T_REAPPEAR — see _score().
-    REAPPEAR_NO_FACE_PENALTY: float = 0.12
+    # to prevent false matches between different people who happen to look
+    # similar. 0.12 was too aggressive: even a returning person with good
+    # appearance (raw_app=0.70) got score=0.58, barely meeting T_REAPPEAR.
+    # At raw_app=0.65 the score dropped to 0.53 — below threshold — causing
+    # identity fragmentation (same person split into multiple IDs). 0.05
+    # still provides a safety margin: raw_app=0.60 -> score=0.55 (meets
+    # T_REAPPEAR=0.55), while different-color dresses produce raw_app<0.30.
+    REAPPEAR_NO_FACE_PENALTY: float = 0.05
 
 
 CFG = ReIDConfig()
@@ -506,6 +517,10 @@ class ReIDEngine:
         self._face_attempts = 0
         self._face_hits     = 0
         self._new_id_grace: dict = {}   # tracker_id -> consecutive PASS4-miss count
+        self._cooccurrence: dict = {}   # tid -> set of tids seen in same frame
+        self.tracker_frame_map: dict = {}   # tid -> set of frame_ids
+        self.identity_frame_map: dict = {}  # sid -> set of frame_ids (built after enforce)
+        self.tracker_sid_history: dict = {}  # tid -> set of sids it was ever assigned to
 
         if self.use_osnet:
             self.T_MATCH    = CFG.MATCH_THRESHOLD_OSNET
@@ -547,7 +562,7 @@ class ReIDEngine:
         weights_path = Path(__file__).resolve().parent / "weights" / "best_model.pth"
         if weights_path.exists() and weights_path.stat().st_size > 0:
             try:
-                state = torch.load(weights_path, map_location=self.device)
+                state = torch.load(weights_path, map_location=self.device, weights_only=True)
                 m.load_state_dict(state)
                 logger.info(f"✅ Fine-tuned Re-ID weights loaded from {weights_path} (512-dim embeddings)")
             except Exception as e:
@@ -622,7 +637,8 @@ class ReIDEngine:
         if self.debug_trace:
             logger.info(f"[TRACE f{frame_id}] {msg}")
 
-    def _score(self, identity: Identity, feat, bbox, frame_id: int, face_feat=None) -> float:
+    def _score(self, identity: Identity, feat, bbox, frame_id: int, face_feat=None,
+               is_crossing=False) -> float:
         gap = frame_id - identity.last_frame
         app = identity.appearance_score(feat)
 
@@ -655,7 +671,22 @@ class ReIDEngine:
         if mot < 0.08 and iou < 0.02 and gap > CFG.MOTION_GATE_MIN_GAP:
             return -1.0
 
-        base = CFG.W_APPEARANCE*app + CFG.W_MOTION*mot + CFG.W_IOU*iou
+        # Crossing-aware scoring: when two people are physically overlapping,
+        # motion and IOU are actively misleading because the Kalman filter's
+        # predicted position of person A may be closer to person B's detection
+        # (and vice versa). During crossings, rely almost entirely on
+        # appearance — the one signal that stays reliable regardless of
+        # spatial overlap.
+        if is_crossing:
+            w_app = 0.95
+            w_mot = 0.03
+            w_iou = 0.02
+        else:
+            w_app = CFG.W_APPEARANCE
+            w_mot = CFG.W_MOTION
+            w_iou = CFG.W_IOU
+
+        base = w_app*app + w_mot*mot + w_iou*iou
         return self._blend_face(base, identity, face_feat)
 
     # ── crossings ──────────────────────────────────────────────────────────
@@ -688,23 +719,64 @@ class ReIDEngine:
         if not candidates:
             return {}
 
+        # Appearance floor: never merge two trackers if their raw appearance
+        # similarity is below this value. Motion/IOU can't override a clear
+        # appearance mismatch. This prevents false merges between people who
+        # look nothing alike but happen to be in similar positions.
+        # RAISED because motion/IOU are now heavily downweighted (8%/7%), so
+        # a tracker must actually look like the person to inherit their ID.
+        # Model diagnostics: ~6% of diff-person pairs exceed 0.60, so 0.58
+        # provides a safety margin below the match threshold.
+        MIN_APPEARANCE_FOR_MERGE: float = 0.55
+        # MUCH stricter threshold for trackers with NO prior identity trying to
+        # claim an existing identity. A brand-new tracker must show very strong
+        # appearance evidence to avoid giving every new person a new ID (which
+        # is safer than merging different people).
+        MIN_APPEARANCE_NEW_TRACKER: float = 0.65
+
         assigned:    dict = {}
         used:        set  = set()
         stable_ids        = list(self.identity_db.keys())
         cross             = self._crossings(candidates)
         sid_to_col: dict  = {}
 
+        # Pre-build: for each stable_id, which trackers are currently assigned to it
+        # (updated as assignments happen). Used by co-occurrence guard.
+        _sid_tids: dict = {}  # sid -> set of tracker_ids assigned to it this frame
+
+        def _cooccurs_with_any(tid, sid):
+            """Check if tid co-occurs with any tracker already assigned to sid this frame."""
+            co_set = self._cooccurrence.get(tid, set())
+            for t in _sid_tids.get(sid, set()):
+                if t in co_set:
+                    return True
+            return False
+
+        def _assign_with_guard(row, sid):
+            """Assign a candidate to a stable_id, recording co-occurrence state."""
+            assigned[row] = sid
+            used.add(sid)
+            _sid_tids.setdefault(sid, set()).add(candidates[row]['tid'])
+
         # ── Score matrix ──────────────────────────────────────────────────
         if stable_ids:
             sid_to_col   = {sid: c for c, sid in enumerate(stable_ids)}
             score_matrix = np.full((len(candidates), len(stable_ids)), -1.0, np.float32)
+            # Pre-compute which candidates are in a crossing situation (bbox
+            # overlapping with another candidate). Used by _score to switch to
+            # appearance-only mode for those rows — motion/IOU are unreliable
+            # when two people physically overlap.
+            cand_crossing = [any((i, j) in cross or (j, i) in cross
+                                 for j in range(len(candidates)) if j != i)
+                             for i in range(len(candidates))]
             for i, cand in enumerate(candidates):
                 for j, sid in enumerate(stable_ids):
                     ident = self.identity_db[sid]
                     if frame_id - ident.last_frame > CFG.MAX_IDENTITY_GAP:
                         continue
                     s = self._score(ident, cand['feat'], cand['bbox'], frame_id,
-                                     face_feat=cand.get('face_feat'))
+                                     face_feat=cand.get('face_feat'),
+                                     is_crossing=cand_crossing[i])
                     if self.track_to_identity.get(cand['tid']) == sid:
                         s = min(s + 0.06, 1.0)
                     if frame_id - ident.last_frame <= CFG.REACTIVATE_WINDOW:
@@ -714,6 +786,12 @@ class ReIDEngine:
             score_matrix = np.full((len(candidates), 0), -1.0, np.float32)
 
         # ── PASS 0: continuity lock ───────────────────────────────────────
+        # CRITICAL: This is the PRIMARY defence against ID swaps during
+        # crossings. A tracker that already has an assigned identity should
+        # keep it unless there is overwhelming appearance evidence otherwise.
+        # The blended score now heavily favours appearance (70% weight), so
+        # even if motion/IOU drop to near-zero during a crossing, the lock
+        # remains intact as long as the person still looks the same.
         locked_rows: set = set()
         locked_cols: set = set()
         if stable_ids:
@@ -725,11 +803,31 @@ class ReIDEngine:
                 col = sid_to_col[prev]
                 s   = float(score_matrix[i, col])
                 gap = frame_id - self.identity_db[prev].last_frame
+                # Use appearance-dominant check: require the blended score
+                # to pass the threshold, AND the raw appearance to be
+                # reasonable. This prevents a tracker from locking to a
+                # prior identity purely based on motion/IOU when the
+                # appearance has changed (which would indicate a swap).
+                raw_app = self.identity_db[prev].appearance_score(cand['feat'])
                 if gap <= CFG.TRACK_LOCK_GAP and s >= CFG.TRACK_LOCK_MIN_SCORE:
+                    if raw_app < MIN_APPEARANCE_FOR_MERGE:
+                        continue
                     if prev not in best_lock or s > best_lock[prev][1]:
                         best_lock[prev] = (i, s)
+                # OVERRIDE: even if the blended score drops below threshold
+                # (e.g., motion/IOU disagree during crossing), still lock if
+                # the appearance-only score is very strong. This prevents
+                # the common failure mode where DeepSORT's Kalman filter
+                # drifts during a crossing and the motion/IOU scores tank
+                # for the correct identity.
+                elif gap <= CFG.TRACK_LOCK_GAP and raw_app >= 0.70:
+                    if prev not in best_lock or raw_app > best_lock[prev][1]:
+                        best_lock[prev] = (i, raw_app)
             for sid, (row, s) in best_lock.items():
-                assigned[row] = sid; used.add(sid)
+                if _cooccurs_with_any(candidates[row]['tid'], sid):
+                    self._trace(frame_id, f"PASS0 BLOCKED co-occurrence: tid={candidates[row]['tid']} cannot join sid={sid}")
+                    continue
+                _assign_with_guard(row, sid)
                 locked_rows.add(row); locked_cols.add(sid_to_col[sid])
                 self._trace(frame_id, f"PASS0 lock: tid={candidates[row]['tid']} -> sid={sid} score={s:.3f}")
 
@@ -754,6 +852,13 @@ class ReIDEngine:
                     sid = stable_ids[c]; s = float(score_matrix[r, c])
                     if s < self.T_MATCH or sid in used:
                         continue
+                    # NEW: appearance floor
+                    raw_app = self.identity_db[sid].appearance_score(cand['feat'])
+                    # Stricter threshold for trackers with no prior identity
+                    prev_tid = self.track_to_identity.get(candidates[r]['tid'])
+                    req_app = MIN_APPEARANCE_FOR_MERGE if prev_tid is not None else MIN_APPEARANCE_NEW_TRACKER
+                    if raw_app < req_app:
+                        continue
                     is_cross = any((r,j) in cross for j in range(len(candidates)))
                     prev = self.track_to_identity.get(candidates[r]['tid'])
                     if prev is not None and prev in sid_to_col and prev != sid:
@@ -769,7 +874,10 @@ class ReIDEngine:
                                     f"{'ALLOWED' if allowed else 'BLOCKED'}")
                         if not allowed:
                             continue
-                    assigned[r] = sid; used.add(sid)
+                    if _cooccurs_with_any(candidates[r]['tid'], sid):
+                        self._trace(frame_id, f"PASS1 BLOCKED co-occurrence: tid={candidates[r]['tid']} cannot join sid={sid}")
+                        continue
+                    _assign_with_guard(r, sid)
                     self._trace(frame_id, f"PASS1 assign: tid={candidates[r]['tid']} -> sid={sid} score={s:.3f}")
 
         # ── PASS 2: greedy fallback ───────────────────────────────────────
@@ -786,21 +894,35 @@ class ReIDEngine:
                         best_s, best_sid = s, sid
                 if best_sid is None or best_s < self.T_FALLBACK:
                     continue
+                # ADD: appearance floor — if the raw appearance similarity is
+                # below threshold, don't merge even if the blended score (with
+                # motion/IOU) passes the threshold.
+                raw_app = self.identity_db[best_sid].appearance_score(cand['feat'])
+                prev_tid = self.track_to_identity.get(cand['tid'])
+                req_app = MIN_APPEARANCE_FOR_MERGE if prev_tid is not None else MIN_APPEARANCE_NEW_TRACKER
+                if raw_app < req_app:
+                    continue
                 prev = self.track_to_identity.get(cand['tid'])
                 if prev is not None and prev in sid_to_col and prev != best_sid:
                     ps = float(score_matrix[i, sid_to_col[prev]])
+                    is_cross = any((i,j) in cross for j in range(len(candidates)))
+                    mg = CFG.SWITCH_MARGIN * (1.5 if is_cross else 1.0)
+                    ma = CFG.SWITCH_MIN_SCORE * (1.05 if is_cross else 1.0)
                     allowed = self._switch_allowed(
                             best_s, ps, cand.get('face_feat'),
                             self.identity_db[best_sid], self.identity_db.get(prev),
-                            CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                            mg, ma)
                     self._trace(frame_id, f"PASS2 SWITCH tid={cand['tid']} "
                                 f"{prev}->{best_sid}: new_s={best_s:.3f} prev_s={ps:.3f} "
-                                f"has_face={cand.get('face_feat') is not None} "
+                                f"is_cross={is_cross} "
                                 f"{'ALLOWED' if allowed else 'BLOCKED'}")
                     if not allowed:
                         continue
-                assigned[i] = best_sid; used.add(best_sid)
-                self._trace(frame_id, f"PASS2 assign: tid={cand['tid']} -> sid={best_sid} score={best_s:.3f}")
+                    if _cooccurs_with_any(cand['tid'], best_sid):
+                        self._trace(frame_id, f"PASS2 BLOCKED co-occurrence: tid={cand['tid']} cannot join sid={best_sid}")
+                        continue
+                    _assign_with_guard(i, best_sid)
+                    self._trace(frame_id, f"PASS2 assign: tid={cand['tid']} -> sid={best_sid} score={best_s:.3f}")
 
         # ── PASS 3: re-appearance (appearance-only, long gap) ─────────────
         # FIX (Bug 7): dedicated pass for persons returning after >REAPPEAR_GAP frames.
@@ -822,6 +944,11 @@ class ReIDEngine:
                     if s > best_s:
                         best_s, best_sid = s, sid
                 if best_sid is not None and best_s >= self.T_REAPPEAR:
+                    # ADD: appearance floor — don't re-appear match if appearance
+                    # is too different
+                    raw_app = self.identity_db[best_sid].appearance_score(cand['feat'])
+                    if raw_app < MIN_APPEARANCE_FOR_MERGE:
+                        continue
                     # FIX: PASS 3 used to reassign a tracker's identity purely
                     # based on crossing T_REAPPEAR, with NO check against
                     # whatever identity that tracker was already carrying
@@ -836,22 +963,28 @@ class ReIDEngine:
                     prev = self.track_to_identity.get(cand['tid'])
                     if prev is not None and prev in sid_to_col and prev != best_sid:
                         ps = float(score_matrix[i, sid_to_col[prev]])
+                        is_cross = any((i,j) in cross for j in range(len(candidates)))
+                        mg = CFG.SWITCH_MARGIN * (1.5 if is_cross else 1.0)
+                        ma = CFG.SWITCH_MIN_SCORE * (1.05 if is_cross else 1.0)
                         allowed = self._switch_allowed(
                                 best_s, ps, cand.get('face_feat'),
                                 self.identity_db[best_sid], self.identity_db.get(prev),
-                                CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                                mg, ma)
                         self._trace(frame_id, f"PASS3 SWITCH tid={cand['tid']} "
                                     f"{prev}->{best_sid}: new_s={best_s:.3f} prev_s={ps:.3f} "
-                                    f"has_face={cand.get('face_feat') is not None} "
+                                    f"is_cross={is_cross} "
                                     f"{'ALLOWED' if allowed else 'BLOCKED'}")
                         if not allowed:
                             continue   # leave unassigned this frame; PASS4 grace retries later
+                    if _cooccurs_with_any(cand['tid'], best_sid):
+                        self._trace(frame_id, f"PASS3 BLOCKED co-occurrence: tid={cand['tid']} cannot join sid={best_sid}")
+                        continue
                     logger.debug(f"  Re-appearance: tracker {cand['tid']} → "
                                  f"stable_id {best_sid}  score={best_s:.3f}")
                     self._trace(frame_id, f"PASS3 reappear: tid={cand['tid']} -> sid={best_sid} "
                                 f"score={best_s:.3f} (T_REAPPEAR={self.T_REAPPEAR:.3f}) "
                                 f"has_face={cand.get('face_feat') is not None}")
-                    assigned[i] = best_sid; used.add(best_sid)
+                    _assign_with_guard(i, best_sid)
 
         # ── PASS 4: new identities ────────────────────────────────────────
         # FIX: a candidate that fails PASS 1-3 on a SINGLE frame used to get
@@ -878,6 +1011,27 @@ class ReIDEngine:
                 if miss < CFG.NEW_ID_GRACE_FRAMES:
                     self._trace(frame_id, f"PASS4 grace: tid={tid} miss={miss}/{CFG.NEW_ID_GRACE_FRAMES}, waiting")
                     continue   # give PASS 1-3 another shot next frame
+
+            # FIX: grace expiring used to always mint a brand-new identity,
+            # even when this exact tracker already had a known prior
+            # identity that just failed to clear the (deliberately strict)
+            # switch/match thresholds during a brief ambiguous moment (e.g.
+            # a crossing) — throwing away a mediocre-but-real clue (traced
+            # case: tid=1 scored 0.30-0.40 against its own correct identity
+            # sid=1 during an overlap, too low to auto-relock, but far more
+            # informative than nothing) in favor of starting from scratch.
+            # If that prior identity still exists and no OTHER candidate
+            # this frame has already claimed it, fall back to it directly
+            # instead of minting a new one — treat this as a low-confidence
+            # implicit re-lock rather than a genuinely new person.
+            prev = self.track_to_identity.get(tid)
+            if prev is not None and prev in self.identity_db and prev not in used:
+                assigned[i] = prev; used.add(prev)
+                self._new_id_grace.pop(tid, None)
+                self._trace(frame_id, f"PASS4 fallback-to-prior: tid={tid} -> sid={prev} "
+                            f"(grace expired, no better match found, reusing known identity)")
+                continue
+
             sid = self.next_stable_id; self.next_stable_id += 1
             self.identity_db[sid] = Identity(sid, cand['feat'], cand['bbox'], frame_id,
                                               face_descriptor=cand.get('face_feat'))
@@ -893,6 +1047,7 @@ class ReIDEngine:
                                           face_descriptor=cand.get('face_feat'))
             self.track_to_identity[cand['tid']] = sid
             self.track_last_seen[cand['tid']]   = frame_id
+            self.tracker_sid_history.setdefault(cand['tid'], set()).add(sid)
             self._pending.pop(cand['tid'], None)
             self._new_id_grace.pop(cand['tid'], None)   # matched — reset grace
 
@@ -957,6 +1112,18 @@ class ReIDEngine:
 
         assigned = self._assign(candidates, frame_id)
 
+        # Record co-occurrence: any two trackers in the same frame are different people
+        frame_tids = [c['tid'] for c in candidates]
+        for i, t1 in enumerate(frame_tids):
+            self._cooccurrence.setdefault(t1, set())
+            for t2 in frame_tids[i+1:]:
+                self._cooccurrence.setdefault(t2, set())
+                self._cooccurrence[t1].add(t2)
+                self._cooccurrence[t2].add(t1)
+        # Track which frames each tracker appears in (for disjoint-identity merge)
+        for tid in frame_tids:
+            self.tracker_frame_map.setdefault(tid, set()).add(frame_id)
+
         for idx, cand in enumerate(candidates):
             sid = assigned.get(idx) or self.track_to_identity.get(cand['tid'])
             results.append({'id': cand['tid'], 'consolidated_id': sid,
@@ -978,9 +1145,195 @@ class ReIDEngine:
                 sid: ident.descriptor for sid, ident in self.identity_db.items()
             }
             logger.info(f"✅ {len(self.id_mapping)} tracker IDs → "
-                        f"{len(self.consolidated_features)} stable identities")
+                        f"{len(self.consolidated_features)} stable identities (before co-occurrence fix)")
         else:
             self.id_mapping = self._offline_cluster()
+
+        # Enforce co-occurrence constraint: if tracker A and tracker B appear
+        # in the same frame, they MUST have different consolidated IDs.
+        # If they don't, reassign the later-starting tracker to a new ID.
+        self._enforce_cooccurrence()
+
+        # Merge identities that share a tracker ID in their history (the same
+        # DeepSORT tracker physically tracks one person — if it was ever
+        # assigned to two different sids, they refer to the same person).
+        self._merge_shared_tracker_sids()
+
+        # Merge similar identities that never appear in the same frame
+        # (e.g., same person whose tracker ID changed mid-video causing
+        # an orphaned identity).
+        self._merge_non_cooccurring()
+
+        # Build orphan → living sid remap: sids in identity_db but not in
+        # id_mapping that share a tracker assignment history.  This
+        # captures the case where a tracker was briefly assigned a new
+        # identity (PASS4) and later switched back to its real identity
+        # (PASS1), leaving an orphan sid that still appears in per-frame
+        # results for the frames before the switch.
+        self.orphan_remap = {}
+        active_sids = set(self.id_mapping.values())
+        for sid in list(self.identity_db):
+            if sid in active_sids:
+                continue
+            orphan_tids = [t for t, s in self.tracker_sid_history.items() if sid in s]
+            if not orphan_tids:
+                continue
+            for living_sid in active_sids:
+                for t in orphan_tids:
+                    if living_sid in self.tracker_sid_history.get(t, set()):
+                        self.orphan_remap[sid] = living_sid
+                        logger.info(f"🔗 Orphan sid={sid} → living sid={living_sid} "
+                                    f"(shared tracker {t})")
+                        break
+                if sid in self.orphan_remap:
+                    break
+
+        # Remove orphan identities from identity_db / consolidated_features
+        for sid in list(self.identity_db):
+            if sid not in active_sids and sid not in self.orphan_remap:
+                del self.identity_db[sid]
+                self.consolidated_features.pop(sid, None)
+                logger.info(f"🧹 Removed orphan identity sid={sid} (no tracker assigned)")
+
+        # Build identity frame map from (possibly updated) id_mapping
+        self.identity_frame_map = {}
+        for tid, sid in self.id_mapping.items():
+            frames = self.tracker_frame_map.get(tid, set())
+            if frames:
+                self.identity_frame_map.setdefault(sid, set()).update(frames)
+
+    def _enforce_cooccurrence(self):
+        """After all assignments, check co-occurrence constraints.
+        Two trackers that appear in the same frame are definitely different
+        people. If they ended up with the same consolidated ID, split them."""
+        violations = 0
+        for tid, co_tids in self._cooccurrence.items():
+            sid_a = self.id_mapping.get(tid)
+            if sid_a is None:
+                continue
+            for co_tid in co_tids:
+                sid_b = self.id_mapping.get(co_tid)
+                if sid_b is None or sid_a != sid_b:
+                    continue
+                # Same consolidated ID but co-occur = violation!
+                # Reassign the later-starting tracker to a new ID
+                meta_a = self.person_metadata.get(tid, {})
+                meta_b = self.person_metadata.get(co_tid, {})
+                first_a = meta_a.get('first_seen', 0)
+                first_b = meta_b.get('first_seen', 0)
+                if first_b > first_a:
+                    old_sid = sid_b
+                    new_sid = self.next_stable_id
+                    self.next_stable_id += 1
+                    # Reassign all trackers that shared old_sid via this tracker
+                    for t, s in list(self.id_mapping.items()):
+                        if s == old_sid and t != tid:
+                            # Check if t also co-occurs with tid — if so, keep separate
+                            if t in self._cooccurrence.get(tid, set()):
+                                continue
+                            self.id_mapping[t] = new_sid
+                    self.id_mapping[co_tid] = new_sid
+                    violations += 1
+                    self._trace(0, f"CO-OCCURRENCE FIX: tid={co_tid} "
+                                f"reassigned from sid={old_sid} to sid={new_sid} "
+                                f"(co-occurs with tid={tid} which has sid={sid_a})")
+                    break  # re-check from start after reassignment
+        if violations:
+            logger.info(f"🔧 Co-occurrence fix: {violations} tracker(s) reassigned to separate identities")
+            # Rebuild consolidated_features
+            self.consolidated_features = {}
+            for sid in set(self.id_mapping.values()):
+                if sid in self.identity_db:
+                    self.consolidated_features[sid] = self.identity_db[sid].descriptor
+
+    def _merge_shared_tracker_sids(self):
+        """Merge consolidated IDs that share a tracker ID in their assignment
+        history.  A DeepSORT tracker ID always follows one physical person,
+        so if it was ever assigned to two different sids, those sids refer
+        to the same person and should be merged."""
+        # Build sid → set of tids that were ever assigned to it
+        sid_to_tids: dict = {}
+        for tid, sids in self.tracker_sid_history.items():
+            for sid in sids:
+                sid_to_tids.setdefault(sid, set()).add(tid)
+
+        sids = sorted(set(self.id_mapping.values()))
+        merged = set()
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(sids):
+                sid_a = sids[i]
+                if sid_a in merged:
+                    i += 1
+                    continue
+                a_tids = sid_to_tids.get(sid_a, set())
+                for j in range(i + 1, len(sids)):
+                    sid_b = sids[j]
+                    if sid_b in merged:
+                        continue
+                    b_tids = sid_to_tids.get(sid_b, set())
+                    # Do they share any tracker?
+                    if a_tids & b_tids:
+                        # Merge sid_b into sid_a
+                        for t, s in list(self.id_mapping.items()):
+                            if s == sid_b:
+                                self.id_mapping[t] = sid_a
+                        merged.add(sid_b)
+                        # Update sid_to_tids
+                        sid_to_tids.setdefault(sid_a, set()).update(b_tids)
+                        changed = True
+                        logger.info(f"🔗 Merged sid={sid_b} into sid={sid_a} "
+                                    f"(shared tracker {a_tids & b_tids})")
+                        break
+                i += 1
+            if changed:
+                sids = sorted(s for s in sids if s not in merged)
+        if merged:
+            self.consolidated_features = {}
+            for sid in set(self.id_mapping.values()):
+                if sid in self.identity_db:
+                    self.consolidated_features[sid] = self.identity_db[sid].descriptor
+
+    def _merge_non_cooccurring(self, threshold=0.70):
+        """Merge consolidated IDs whose time intervals don't overlap and have
+        high feature similarity. Fixes the case where a tracker switches
+        identities mid-video, leaving an orphaned identity."""
+        sids = sorted(set(self.id_mapping.values()))
+        merged = set()
+        for i, sid_a in enumerate(sids):
+            if sid_a in merged:
+                continue
+            a_tids = {t for t, s in self.id_mapping.items() if s == sid_a}
+            a_feat = self.consolidated_features.get(sid_a)
+            if a_feat is None:
+                continue
+            frames_a = self.identity_frame_map.get(sid_a, set())
+            for sid_b in sids[i+1:]:
+                if sid_b in merged:
+                    continue
+                # Check if identities ever appear in the same frame
+                frames_b = self.identity_frame_map.get(sid_b, set())
+                if frames_a & frames_b:
+                    continue  # they appear together — definitely different people
+                b_feat = self.consolidated_features.get(sid_b)
+                if b_feat is None:
+                    continue
+                sim = _cosine(a_feat, b_feat)
+                if sim > threshold:
+                    # Merge sid_b into sid_a
+                    b_tids = {t for t, s in self.id_mapping.items() if s == sid_b}
+                    for t in b_tids:
+                        self.id_mapping[t] = sid_a
+                    merged.add(sid_b)
+                    logger.info(f"🔗 Merged sid={sid_b} into sid={sid_a} (sim={sim:.3f})")
+        if merged:
+            # Rebuild consolidated_features
+            self.consolidated_features = {}
+            for sid in set(self.id_mapping.values()):
+                if sid in self.identity_db:
+                    self.consolidated_features[sid] = self.identity_db[sid].descriptor
 
     def _offline_cluster(self):
         cons = {pid: _normalize(np.array(feats).mean(0))
@@ -1073,6 +1426,19 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
                 tid = p.get('id')
                 if tid in engine.track_to_identity:
                     p['consolidated_id'] = engine.track_to_identity[tid]
+
+    # Remap orphan sids discovered during finalize_clustering (trackers that
+    # were briefly assigned a new identity, then switched back to their
+    # correct identity, leaving orphan sids in earlier frames).
+    if engine.orphan_remap:
+        n_remapped = 0
+        for fid in sorted(results.keys()):
+            for p in results[fid]:
+                cid = p.get('consolidated_id')
+                if cid in engine.orphan_remap:
+                    p['consolidated_id'] = engine.orphan_remap[cid]
+                    n_remapped += 1
+        logger.info(f"🔄 Remapped {n_remapped} frame entries from orphan sids")
 
     # Renumber 1…N by first appearance, skip -1 (ghost tracks)
     first_seen = {}

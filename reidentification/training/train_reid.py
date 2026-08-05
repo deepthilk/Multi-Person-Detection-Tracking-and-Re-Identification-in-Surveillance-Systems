@@ -129,7 +129,7 @@ def train(args):
 
     start_epoch = 1
     if args.resume and Path(args.resume).exists():
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
         logger.info(f"Resumed from {args.resume} at epoch {start_epoch}")

@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 
 from registration.db_config import DB_SETTINGS
-from registration.embedder import embed_images
+from registration.embedder import embed_images_with_face
 from registration.identity_db import IdentityDatabase
 
 logger = logging.getLogger(__name__)
@@ -21,12 +21,15 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
     Register a known person from one or more images.
 
     Steps:
-      1. Generate a 698-dim embedding per image (via registration.embedder,
-         which reuses Deepthi's Re-ID backbone so the vectors are directly
-         comparable to live-camera embeddings).
+      1. Generate a 698-dim body-appearance embedding per image (via
+         registration.embedder, which reuses Deepthi's Re-ID backbone so the
+         vectors are directly comparable to live-camera embeddings) PLUS a
+         128-dim face embedding per image where a confident face is visible —
+         the stored face gallery is what lets search match by face.
       2. Copy the source images into outputs/registration/images/<name>/
          so the database can be rebuilt or audited later.
-      3. Store name + embeddings + metadata in the identity database.
+      3. Store name + embeddings + face gallery + metadata in the identity
+         database.
 
     Args:
         name: person's display name (also the lookup key — must be unique).
@@ -47,20 +50,25 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
 
     logger.info(f"Registering '{name}' with {len(image_paths)} image(s)...")
 
-    embeddings = embed_images(image_paths)
-    if not embeddings:
+    results = embed_images_with_face(image_paths)
+    if not results:
         raise ValueError(
             f"None of the provided images for '{name}' produced a usable "
             f"embedding (check they exist, are readable, and are large enough)"
         )
 
+    embeddings = [r["appearance"] for r in results]
+    face_embeddings = [r["face"] for r in results if r["face"] is not None]
+
     stored_paths = _copy_images(name, image_paths)
 
     db = db or IdentityDatabase()
-    db.add_person(name, embeddings, image_paths=stored_paths)
+    db.add_person(name, embeddings, image_paths=stored_paths,
+                  face_embeddings=face_embeddings)
 
     logger.info(
-        f"✅ '{name}' registered: {len(embeddings)}/{len(image_paths)} images used"
+        f"✅ '{name}' registered: {len(embeddings)}/{len(image_paths)} images used, "
+        f"{len(face_embeddings)} face(s) in gallery"
     )
     return db.get_person(name)
 

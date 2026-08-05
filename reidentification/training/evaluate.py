@@ -131,7 +131,7 @@ def main():
     model = ResNetReIDBackbone().to(device)
     weights_path = Path(args.weights)
     if weights_path.exists() and weights_path.stat().st_size > 0:
-        state = torch.load(weights_path, map_location=device)
+        state = torch.load(weights_path, map_location=device, weights_only=True)
         model.load_state_dict(state)
         logger.info(f"Loaded fine-tuned weights from {weights_path}")
     else:

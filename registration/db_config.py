@@ -43,4 +43,15 @@ SEARCH_SETTINGS = {
     # registered persons.
     "match_threshold": 0.55,
     "top_k": 3,
+
+    # Face + appearance score-level fusion (IdentityDatabase.match_multimodal).
+    # Face similarity uses FaceCueExtractor.similarity (0..1, higher = same
+    # person; face_recognition's conventional same-person Euclidean cutoff
+    # ~0.6 maps to ~0.33, so "confirmed" is set comfortably above that).
+    "face_confirmed_threshold": 0.40,   # >= this: faces clearly say "same person"
+    "face_veto_threshold": 0.20,        # <  this: faces clearly say "different person"
+    "fused_weight_face_confirmed": 0.70,    # face dominates a confirmed match
+    "fused_weight_appearance_confirmed": 0.30,
+    "fused_weight_face_ambiguous": 0.50,    # balanced when the face is ambiguous
+    "fused_weight_appearance_ambiguous": 0.50,
 }

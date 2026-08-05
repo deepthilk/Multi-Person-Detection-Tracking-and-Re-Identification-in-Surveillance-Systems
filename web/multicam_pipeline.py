@@ -40,24 +40,31 @@ def run_camera_reid(
     device: str = "cpu",
     identity_db=None,
     match_threshold: float = None,
+    sample_every: int = 6,
+    max_faces_per_track: int = 30,
+    face_upsample: int = 3,
 ):
     """
     Run Re-ID for one camera's video and resolve stable identities against
-    a registered IdentityDatabase.
+    a registered IdentityDatabase using face + body-appearance matching
+    (registration.identity_db.match_multimodal).
 
     Returns:
         {
           "fps": float,
           "people": [
              {"track_id": int, "name": str|None, "similarity": float|None,
+              "face_sim": float|None, "cues": [str], 
               "first_seen_sec": float, "last_seen_sec": float},
              ...
           ]
         }
     """
+    from reidentification.face_cue import FaceCueExtractor
     from reidentification.reid_main import ReIDEngine
 
     engine = ReIDEngine(device=device)
+    gallery_face_extractor = FaceCueExtractor(upsample_times=face_upsample)
 
     with open(tracking_json_path) as f:
         tracking_data = json.load(f)
@@ -65,6 +72,11 @@ def run_camera_reid(
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     expected_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    # Face gallery per tracker id, sampled to keep overhead low (the engine
+    # already runs face detection internally, so we only add a fraction more).
+    tid_faces = {}
+    tid_face_count = {}
 
     results = {}
     frame_id = 0
@@ -74,7 +86,23 @@ def run_camera_reid(
             break
         frame_id += 1
         tracks = tracking_data.get(str(frame_id), [])
-        results[frame_id] = engine.process_frame(frame, tracks, frame_id)
+        frame_results = engine.process_frame(frame, tracks, frame_id)
+        results[frame_id] = frame_results
+
+        for p in frame_results:
+            tid = p.get("id")
+            if tid is None or p.get("feature_dim", 0) == 0:
+                continue
+            tid_face_count.setdefault(tid, 0)
+            if len(tid_faces.get(tid, [])) >= max_faces_per_track:
+                continue
+            if tid_face_count[tid] % sample_every != 0:
+                tid_face_count[tid] += 1
+                continue
+            tid_face_count[tid] += 1
+            face = gallery_face_extractor.extract(frame, p["bbox"])
+            if face is not None:
+                tid_faces.setdefault(tid, []).append(face)
     cap.release()
 
     frames_read = frame_id
@@ -87,6 +115,13 @@ def run_camera_reid(
 
     engine.finalize_clustering()
 
+    # Pool faces per stable identity using the FINAL tracker->sid mapping.
+    sid_faces = {}
+    for tid, sid in engine.id_mapping.items():
+        faces = tid_faces.get(tid, [])
+        if faces:
+            sid_faces.setdefault(sid, []).extend(faces)
+
     # Resolve any remaining None consolidated_ids (mirrors reid_main.run_reid_pipeline)
     for fid in sorted(results.keys()):
         for p in results[fid]:
@@ -96,17 +131,22 @@ def run_camera_reid(
                     p["consolidated_id"] = engine.track_to_identity[tid]
 
     # Name resolution happens BEFORE renumbering, in the original stable-id
-    # space that engine.consolidated_features is keyed by.
+    # space that engine.consolidated_features is keyed by. Uses face + body
+    # appearance fusion; degrades to appearance-only when no faces exist.
     name_by_original_sid = {}
     if identity_db is not None and len(identity_db):
         for sid, feat in engine.consolidated_features.items():
             try:
-                matches = identity_db.match(feat, top_k=1, threshold=match_threshold)
+                matches = identity_db.match_multimodal(
+                    feat, sid_faces.get(sid, []),
+                    top_k=1, threshold=match_threshold,
+                )
             except Exception:
                 logger.exception("Name match failed for stable id %s — leaving unresolved", sid)
                 matches = []
             if matches:
-                name_by_original_sid[sid] = matches[0]  # (name, similarity)
+                m = matches[0]
+                name_by_original_sid[sid] = (m["name"], m["score"], m["face_sim"], m["cues"])
 
     # Renumber 1..N by first appearance, same rule as reid_main.run_reid_pipeline,
     # so on-screen labels stay stable and consistent with any rendered video.
@@ -147,6 +187,8 @@ def run_camera_reid(
                 "track_id": final_id,
                 "name": match[0] if match else None,
                 "similarity": round(float(match[1]), 3) if match else None,
+                "face_sim": round(float(match[2]), 3) if match and match[2] is not None else None,
+                "cues": match[3] if match else [],
                 "first_seen_sec": round(info["first_frame"] / fps, 1),
                 "last_seen_sec": round(info["last_frame"] / fps, 1),
             }

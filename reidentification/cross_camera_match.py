@@ -58,13 +58,45 @@ class CrossCameraMatcher:
     `add_camera`, then call `resolve()` once every camera has been added.
     """
 
-    def __init__(self, match_threshold: float = CROSS_CAM_MATCH_THRESHOLD):
+    def __init__(self, match_threshold: float = CROSS_CAM_MATCH_THRESHOLD,
+                 face_match_threshold: float = 0.50,
+                 face_descriptors: dict = None):
         self.match_threshold = match_threshold
+        # Face cosine threshold (used when BOTH sides have a face embedding).
+        # Faces are dress-invariant, so cross-video matching of the SAME
+        # person in different clothes has to lean on faces, not appearance.
+        # 0.50 cleanly separates same-person (>=0.54) from different-person
+        # (<=0.28) on the project's footage.
+        self.face_match_threshold = face_match_threshold
+        # (camera_id, local_id) -> 128-dim face embedding (optional side
+        # channel, same design philosophy as reidentification/face_cue.py).
+        self.face_descriptors = dict(face_descriptors or {})
+        # global_id -> running-average face descriptor
+        self._global_face_descriptors: dict = {}
         # global_id -> running-average descriptor for that global identity
         self._global_descriptors: dict = {}
         self._next_global_id = 1
         # (camera_id, local_id) -> global_id
         self.local_to_global: dict = {}
+
+    def _pair_sim(self, camera_id, local_id, gid, local_desc):
+        """Effective similarity between a local identity and a global one:
+        face similarity when both sides have a face (dress-invariant),
+        otherwise body-appearance similarity. Returns (sim, threshold)."""
+        face_local = self.face_descriptors.get((camera_id, local_id))
+        face_global = self._global_face_descriptors.get(gid)
+        if face_local is not None and face_global is not None:
+            return _cosine(face_local, face_global), self.face_match_threshold
+        return _cosine(local_desc, self._global_descriptors[gid]), self.match_threshold
+
+    def _store_global(self, gid, desc, camera_id, local_id):
+        """Register/refresh a global identity's descriptors (and face)."""
+        self._global_descriptors[gid] = desc.copy()
+        face = self.face_descriptors.get((camera_id, local_id))
+        if face is not None:
+            self._global_face_descriptors[gid] = face.copy()
+        else:
+            self._global_face_descriptors.pop(gid, None)
 
     def add_camera(self, camera_id: str, consolidated_features: dict):
         """
@@ -81,7 +113,7 @@ class CrossCameraMatcher:
             for lid in local_ids:
                 gid = self._next_global_id
                 self._next_global_id += 1
-                self._global_descriptors[gid] = consolidated_features[lid].copy()
+                self._store_global(gid, consolidated_features[lid], camera_id, lid)
                 self.local_to_global[(camera_id, lid)] = gid
             return
 
@@ -89,15 +121,15 @@ class CrossCameraMatcher:
         cost = np.zeros((len(local_ids), len(global_ids)), dtype=np.float32)
         for i, lid in enumerate(local_ids):
             for j, gid in enumerate(global_ids):
-                sim = _cosine(consolidated_features[lid], self._global_descriptors[gid])
+                sim, _thr = self._pair_sim(camera_id, lid, gid, consolidated_features[lid])
                 cost[i, j] = 1.0 - sim   # Hungarian minimizes cost -> use distance
 
         row_idx, col_idx = linear_sum_assignment(cost)
         matched_local = set()
         for r, c in zip(row_idx, col_idx):
-            sim = 1.0 - cost[r, c]
-            if sim >= self.match_threshold:
-                lid, gid = local_ids[r], global_ids[c]
+            lid, gid = local_ids[r], global_ids[c]
+            sim, thr = self._pair_sim(camera_id, lid, gid, consolidated_features[lid])
+            if sim >= thr:
                 self.local_to_global[(camera_id, lid)] = gid
                 # running average keeps the global descriptor representative
                 # of every camera view seen so far, not just the first
@@ -107,6 +139,14 @@ class CrossCameraMatcher:
                 self._global_descriptors[gid] /= (
                     np.linalg.norm(self._global_descriptors[gid]) + 1e-8
                 )
+                face_local = self.face_descriptors.get((camera_id, lid))
+                if face_local is not None:
+                    if gid in self._global_face_descriptors:
+                        self._global_face_descriptors[gid] = (
+                            0.7 * self._global_face_descriptors[gid] + 0.3 * face_local
+                        )
+                    else:
+                        self._global_face_descriptors[gid] = face_local.copy()
                 matched_local.add(lid)
 
         # Anything left over is a genuinely new person, first seen on this camera
@@ -115,7 +155,7 @@ class CrossCameraMatcher:
                 continue
             gid = self._next_global_id
             self._next_global_id += 1
-            self._global_descriptors[gid] = consolidated_features[lid].copy()
+            self._store_global(gid, consolidated_features[lid], camera_id, lid)
             self.local_to_global[(camera_id, lid)] = gid
 
     def get_global_id(self, camera_id: str, local_id: int):
@@ -151,6 +191,8 @@ def resolve_names(global_descriptors: dict, registered_persons: dict,
 def run_cross_camera_matching(camera_results: dict, camera_engines: dict,
                                registered_persons: dict = None,
                                match_threshold: float = CROSS_CAM_MATCH_THRESHOLD,
+                               face_match_threshold: float = 0.50,
+                               face_descriptors: dict = None,
                                output_json_path: str = "outputs/cross_camera/global_identities.json"):
     """
     camera_results: {camera_id: results} — the per-frame dict returned by
@@ -161,6 +203,10 @@ def run_cross_camera_matching(camera_results: dict, camera_engines: dict,
     registered_persons: optional {name: np.ndarray(698,)} from
                     registration.identity_db.IdentityDatabase().export_for_reid()
                     — if omitted, global identities are left unnamed.
+    face_descriptors: optional {(camera_id, local_id): np.ndarray(128,)} face
+                    embeddings — when both sides of a pair have one, matching
+                    falls back to face similarity so the SAME person is still
+                    merged across cameras even after a change of clothes.
 
     Returns and saves a combined structure:
         {
@@ -169,7 +215,11 @@ def run_cross_camera_matching(camera_results: dict, camera_engines: dict,
           "global_identities": {1: {"name": "Alice", ...}, 2: {...}, ...}
         }
     """
-    matcher = CrossCameraMatcher(match_threshold=match_threshold)
+    matcher = CrossCameraMatcher(
+        match_threshold=match_threshold,
+        face_match_threshold=face_match_threshold,
+        face_descriptors=face_descriptors,
+    )
     for cam_id, engine in camera_engines.items():
         matcher.add_camera(cam_id, engine.consolidated_features)
 

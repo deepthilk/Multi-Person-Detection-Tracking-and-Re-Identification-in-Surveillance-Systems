@@ -39,7 +39,7 @@ class PersonTracker:
 
     def __init__(
         self,
-        max_age: int            = 5,    # CHANGED from 30 — prevents off-screen ghost bboxes
+        max_age: int            = 20,   # INCREASED from 5 — reduce track fragmentation
         n_init: int             = 2,    # CHANGED from 3  — faster track confirmation
         max_iou_distance: float = 0.7,
         max_cosine_distance: float = 0.3,  # CHANGED from 0.2 — better occlusion handling

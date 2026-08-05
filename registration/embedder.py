@@ -91,3 +91,71 @@ def embed_images(image_paths) -> list:
         if feat is not None:
             embeddings.append(feat)
     return embeddings
+
+
+_face_extractor = None
+
+
+def _get_face_extractor(upsample_times: int):
+    """Lazily build (and cache) the face extractor used to build registration
+    face galleries. Separate from the engine's internal instance so tuning
+    upsampling here never changes live Re-ID face-cue behaviour."""
+    global _face_extractor
+    if _face_extractor is None or _face_extractor.upsample_times != upsample_times:
+        from reidentification.face_cue import FaceCueExtractor
+        _face_extractor = FaceCueExtractor(upsample_times=upsample_times)
+    return _face_extractor
+
+
+def embed_image_with_face(image_path_or_array, face_upsample: int = 3) -> dict:
+    """
+    Produce BOTH the 698-dim body-appearance descriptor and, when a confident
+    face is visible, a 128-dim face embedding for a person image.
+
+    Registration stores the face vectors as a per-person gallery so the search
+    side can match by FACE in addition to body appearance ("register a person
+    with many faces, then find them in the video"). The face extractor is the
+    same FaceCueExtractor the live Re-ID engine uses, so the vectors live in
+    the exact same space as faces detected during tracking.
+
+    `face_upsample` is the dlib detection upsampling. Surveillance body crops
+    contain small (20-40px) faces, which need more upsampling (3-4) to find;
+    a frontal face photo works fine at the default.
+
+    Returns {"appearance": np.ndarray(698,) | None, "face": np.ndarray(128,) | None},
+    or None if the image can't be read / is too small.
+    """
+    if isinstance(image_path_or_array, str):
+        image = cv2.imread(image_path_or_array)
+        if image is None:
+            logger.warning(f"Could not read image: {image_path_or_array}")
+            return None
+    else:
+        image = image_path_or_array
+
+    h, w = image.shape[:2]
+    min_size = EMBEDDING_SETTINGS["min_image_size"]
+    if h < min_size or w < min_size:
+        logger.warning(f"Image too small ({w}x{h}), skipping")
+        return None
+
+    engine = _get_engine()
+    bbox = [0, 0, w, h]
+
+    appearance = engine.extract_feature(image, bbox)
+    face = None
+    if appearance is not None:
+        face = _get_face_extractor(face_upsample).extract(image, bbox)
+    return {"appearance": appearance, "face": face}
+
+
+def embed_images_with_face(image_paths, face_upsample: int = 3) -> list:
+    """Embed a list of images for registration, silently skipping any whose
+    body-appearance descriptor fails (a missing face is NOT a failure — it's
+    just stored without a face vector)."""
+    out = []
+    for path in image_paths:
+        res = embed_image_with_face(path, face_upsample=face_upsample)
+        if res is not None and res["appearance"] is not None:
+            out.append(res)
+    return out

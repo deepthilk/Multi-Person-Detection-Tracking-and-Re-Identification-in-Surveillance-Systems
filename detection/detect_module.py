@@ -23,7 +23,7 @@ class PersonDetector:
         device='cuda',
         min_area=900,
         min_height=50,
-        min_aspect=1.0,
+        min_aspect=0.5,
         max_aspect=4.5,
         min_area_ratio=0.0008,
         dedup_cover_ratio=0.9,
@@ -142,7 +142,7 @@ def run_detection(
     device='cuda',
     min_area=900,
     min_height=50,
-    min_aspect=1.0,
+    min_aspect=0.5,
     max_aspect=4.5,
     min_area_ratio=0.0008,
     dedup_cover_ratio=0.9,
@@ -157,6 +157,7 @@ def run_detection(
         conf_threshold: Detection confidence threshold
         imgsz: YOLO input image size
         device: 'cuda' or 'cpu'
+        min_aspect: Minimum box height/width (0.5 allows seated/wide people)
         dedup_cover_ratio: Suppress a detection when it is at least this
             fraction covered by a larger detection (removes duplicate boxes)
         edge_margin: Drop detections touching this many frame borders
