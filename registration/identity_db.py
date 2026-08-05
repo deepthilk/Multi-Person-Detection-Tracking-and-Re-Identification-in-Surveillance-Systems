@@ -73,7 +73,7 @@ class IdentityDatabase:
             name: unique display name, used as the lookup key.
             embeddings: list of 1-D numpy arrays / lists (one per image).
             image_paths: original source paths, stored as metadata only.
-            face_embeddings: optional list of 128-dim face embeddings, one per
+            face_embeddings: optional list of 512-dim face embeddings, one per
                 image where a confident face was detected. Stored as the
                 person's face gallery so search can match by face.
         """
@@ -220,7 +220,7 @@ class IdentityDatabase:
         top_k = top_k or SEARCH_SETTINGS["top_k"]
         threshold = threshold if threshold is not None else SEARCH_SETTINGS["match_threshold"]
 
-        from reidentification.face_cue import FaceCueExtractor
+        from reidentification.insight_face import InsightFaceExtractor
 
         def _fuse(app_sim: float, face_sim) -> tuple:
             if face_sim is None:
@@ -244,7 +244,7 @@ class IdentityDatabase:
             face_sim = None
             if query_faces and gallery_faces:
                 face_sim = max(
-                    FaceCueExtractor.similarity(q, g)
+                    InsightFaceExtractor.similarity(q, g)
                     for q in query_faces for g in gallery_faces
                 )
             score, cues = _fuse(app_sim, face_sim)

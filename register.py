@@ -28,7 +28,12 @@ Usage:
 import argparse
 import glob
 import logging
+import sys
 from pathlib import Path
+
+# Windows cp1252 consoles crash printing emoji — force UTF-8 for stdout.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +48,13 @@ def cmd_add(args):
     image_paths = []
     for pattern in args.images:
         matches = glob.glob(pattern)
+        if not matches and glob.has_magic(pattern):
+            # e.g. the user wrote *.jpg but the photos are .jpeg/.png/.bmp
+            stem = pattern.rsplit("*", 1)[0]
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
+                matches = glob.glob(stem + ext)
+                if matches:
+                    break
         image_paths.extend(matches if matches else [pattern])
 
     record = register_person(args.name, image_paths)

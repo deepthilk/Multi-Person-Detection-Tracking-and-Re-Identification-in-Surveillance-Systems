@@ -98,31 +98,32 @@ _face_extractor = None
 
 def _get_face_extractor(upsample_times: int):
     """Lazily build (and cache) the face extractor used to build registration
-    face galleries. Separate from the engine's internal instance so tuning
-    upsampling here never changes live Re-ID face-cue behaviour."""
+    face galleries. Separate from the engine's internal instance so it never
+    changes live Re-ID face-cue behaviour. Backed by InsightFace (ArcFace
+    w600k_mbf) — `upsample_times` is accepted for backward compatibility but
+    ignored (the insightface detector sizes the input via det_size)."""
     global _face_extractor
-    if _face_extractor is None or _face_extractor.upsample_times != upsample_times:
-        from reidentification.face_cue import FaceCueExtractor
-        _face_extractor = FaceCueExtractor(upsample_times=upsample_times)
+    if _face_extractor is None:
+        from reidentification.insight_face import InsightFaceExtractor
+        _face_extractor = InsightFaceExtractor()
     return _face_extractor
 
 
 def embed_image_with_face(image_path_or_array, face_upsample: int = 3) -> dict:
     """
     Produce BOTH the 698-dim body-appearance descriptor and, when a confident
-    face is visible, a 128-dim face embedding for a person image.
+    face is visible, a 512-dim ArcFace face embedding for a person image.
 
     Registration stores the face vectors as a per-person gallery so the search
     side can match by FACE in addition to body appearance ("register a person
     with many faces, then find them in the video"). The face extractor is the
-    same FaceCueExtractor the live Re-ID engine uses, so the vectors live in
-    the exact same space as faces detected during tracking.
+    same InsightFaceExtractor the search side uses, so the vectors live in the
+    exact same space as faces collected from the video.
 
-    `face_upsample` is the dlib detection upsampling. Surveillance body crops
-    contain small (20-40px) faces, which need more upsampling (3-4) to find;
-    a frontal face photo works fine at the default.
+    `face_upsample` is accepted for backward compatibility but ignored
+    (insightface sizes input via det_size).
 
-    Returns {"appearance": np.ndarray(698,) | None, "face": np.ndarray(128,) | None},
+    Returns {"appearance": np.ndarray(698,) | None, "face": np.ndarray(512,) | None},
     or None if the image can't be read / is too small.
     """
     if isinstance(image_path_or_array, str):
@@ -145,7 +146,8 @@ def embed_image_with_face(image_path_or_array, face_upsample: int = 3) -> dict:
     appearance = engine.extract_feature(image, bbox)
     face = None
     if appearance is not None:
-        face = _get_face_extractor(face_upsample).extract(image, bbox)
+        face = _get_face_extractor(face_upsample).extract(image, bbox,
+                                                          use_head_region=False)
     return {"appearance": appearance, "face": face}
 
 
