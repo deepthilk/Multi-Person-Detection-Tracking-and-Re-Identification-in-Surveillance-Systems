@@ -169,9 +169,14 @@ def search_registered_in_video(
     persons = []
     for name in identity_db.list_persons():
         m = best_by_person.get(name)
+        # match_multimodal already filters by the branch-appropriate threshold
+        # (0.55 appearance-only / ambiguous, 0.45 face-confirmed, face-veto
+        # never returned), so a returned match IS a match — re-applying the
+        # plain appearance threshold here would wrongly downgrade a
+        # face-confirmed hit like v3 sid=2 (score 0.52, face 0.535 >= 0.45).
         persons.append({
             "name": name,
-            "matched": m is not None and m["score"] >= threshold,
+            "matched": m is not None,
             "best_score": round(m["score"], 4) if m else None,
             "appearance_sim": m["appearance_sim"] if m else None,
             "face_sim": m["face_sim"] if m else None,
@@ -232,6 +237,25 @@ def _render_search_video(video_path, frame_people, tid_to_sid, sid_label,
         logger.error("Render: failed to initialize VideoWriter")
         return
 
+    # Number unknown identities Unknown-Id1, Unknown-Id2, ... by first
+    # appearance (instead of exposing the internal stable-id).
+    known_sids = set(sid_label.keys())
+    first_appear = {}
+    for fid in sorted(frame_people.keys()):
+        for _bbox, tid in frame_people[fid]:
+            sid = tid_to_sid.get(tid)
+            if sid is not None and sid not in first_appear:
+                first_appear[sid] = fid
+    unknown_label = {}
+    idx = 0
+    unknown_sids = sorted(
+        {s for s in tid_to_sid.values() if s is not None and s not in known_sids},
+        key=lambda s: first_appear.get(s, float("inf")),
+    )
+    for sid in unknown_sids:
+        idx += 1
+        unknown_label[sid] = f"Unknown-Id{idx}"
+
     frame_id = 0
     while True:
         ret, frame = cap.read()
@@ -243,7 +267,9 @@ def _render_search_video(video_path, frame_people, tid_to_sid, sid_label,
             if sid is None:
                 continue
             name = sid_label.get(sid)
-            color = (0, 255, 0) if name else (0, 0, 255)
+            if name is None:
+                name = unknown_label.get(sid, f"Unknown {sid}")
+            color = (0, 255, 0) if sid in known_sids else (0, 0, 255)
             label = name if name else f"Unknown {sid}"
             x1, y1, x2, y2 = map(int, bbox)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)

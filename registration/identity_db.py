@@ -208,7 +208,13 @@ class IdentityDatabase:
 
         Score-level fusion:
           - No faces available on either side  -> appearance similarity only.
-          - Face clearly confirms the person   -> face dominates (70/30).
+          - Face clearly confirms the person   -> face dominates (70/30), and
+            the match threshold is the FACE threshold (face_confirmed_threshold),
+            not the appearance one: once the face itself clearly says "same
+            person" (measured separation: same-person >= 0.54, different-person
+            <= 0.28), a weak body-appearance blend must not drag the result
+            below the appearance threshold. Real case: v3 sid=2 matched deeps'
+            face at 0.536 but app=0.483 -> blended 0.520, just under 0.55.
           - Face clearly disagrees             -> veto: a different face can't
             be overridden by coincidental clothing similarity.
           - Ambiguous face                     -> balanced 50/50 blend.
@@ -223,18 +229,18 @@ class IdentityDatabase:
         from reidentification.insight_face import InsightFaceExtractor
 
         def _fuse(app_sim: float, face_sim) -> tuple:
-            if face_sim is None:
-                return app_sim, ["appearance"]
             s = SEARCH_SETTINGS
+            if face_sim is None:
+                return app_sim, ["appearance"], threshold
             if face_sim >= s["face_confirmed_threshold"]:
-                return (s["fused_weight_face_confirmed"] * face_sim +
-                        s["fused_weight_appearance_confirmed"] * app_sim), \
-                       ["appearance", "face"]
+                score = (s["fused_weight_face_confirmed"] * face_sim +
+                         s["fused_weight_appearance_confirmed"] * app_sim)
+                return score, ["appearance", "face"], s["face_confirmed_threshold"]
             if face_sim < s["face_veto_threshold"]:
-                return min(app_sim, face_sim), ["appearance", "face(veto)"]
+                return min(app_sim, face_sim), ["appearance", "face(veto)"], threshold
             return (s["fused_weight_face_ambiguous"] * face_sim +
                     s["fused_weight_appearance_ambiguous"] * app_sim), \
-                   ["appearance", "face"]
+                   ["appearance", "face"], threshold
 
         query_faces = query_faces or []
         results = []
@@ -247,8 +253,8 @@ class IdentityDatabase:
                     InsightFaceExtractor.similarity(q, g)
                     for q in query_faces for g in gallery_faces
                 )
-            score, cues = _fuse(app_sim, face_sim)
-            if score >= threshold:
+            score, cues, eff_thresh = _fuse(app_sim, face_sim)
+            if score >= eff_thresh:
                 results.append({
                     "name": name,
                     "score": round(float(score), 4),

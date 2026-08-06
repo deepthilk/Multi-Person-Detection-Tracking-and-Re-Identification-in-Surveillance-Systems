@@ -201,6 +201,33 @@ class ReIDConfig:
     # T_REAPPEAR=0.55), while different-color dresses produce raw_app<0.30.
     REAPPEAR_NO_FACE_PENALTY: float = 0.05
 
+    # Face evidence used in finalize_clustering to SPLIT a false merge:
+    # two trackers assigned to the same identity whose faces never agree
+    # above this similarity are treated as different people (e.g. a brand-new
+    # tracker claimed by PASS3 reappearance on body appearance alone).
+    # Threshold is on the dlib/face_recognition similarity scale (same person
+    # typically > 0.40, different people well below). Union uses the MAX
+    # pairwise similarity so a few noisy face detections never over-split.
+    FACE_SAME_TRACK_SPLIT: float = 0.40
+    # Below this face similarity two trackers are treated as CONFIRMED
+    # different people and are split apart even if their body appearance is
+    # nearly identical (dlib sim: 0.25 ↔ distance 0.675, above the ~0.6
+    # same-person cutoff). Guards the body-only _merge_non_cooccurring path
+    # from merging two lookalike people whose faces clearly differ.
+    FACE_SAME_TRACK_VETO:   float = 0.25
+
+    # Appearance fallback for trackers with NO face evidence: a merged
+    # tracker must show VERY strong track-average appearance (≥ 0.65, the
+    # same MIN_APPEARANCE_NEW_TRACKER bar PASS 1/2/3/4 apply to brand-new
+    # trackers) to be kept on an existing identity. A single noisy frame can
+    # cross T_REAPPEAR (v3: tid=6 → sid=1 at 0.740 single-frame) while the
+    # accumulated track-average says otherwise (tid6↔sid1 = 0.632) — split.
+    APPEARANCE_SPLIT_THRESHOLD: float = 0.65
+
+    # Max face embeddings cached per tracker (recent samples only — enough to
+    # build a reliable same/different-person signal without unbounded memory).
+    TRACK_FACE_GALLERY_SIZE: int = 12
+
 
 CFG = ReIDConfig()
 
@@ -544,6 +571,7 @@ class ReIDEngine:
         self._frame_id:          int  = 0
         self.person_features:    dict = {}
         self.person_metadata:    dict = {}
+        self.tracker_faces:      dict = {}   # tid -> list of face embeddings (capped)
         self.id_mapping:         dict = {}
         self.consolidated_features: dict = {}
 
@@ -947,7 +975,23 @@ class ReIDEngine:
                     # ADD: appearance floor — don't re-appear match if appearance
                     # is too different
                     raw_app = self.identity_db[best_sid].appearance_score(cand['feat'])
-                    if raw_app < MIN_APPEARANCE_FOR_MERGE:
+                    # FIX: PASS 3 was the only pass that ignored the new-tracker
+                    # distinction — PASS 1/2/4 all require a MUCH stricter raw
+                    # appearance (MIN_APPEARANCE_NEW_TRACKER=0.65) before a
+                    # brand-new tracker (no prior identity) may claim an existing
+                    # stable identity, but PASS 3 used the loose 0.55 bar for
+                    # everyone. That let a new tracker get swallowed by the first
+                    # identity it crossed T_REAPPEAR against (the v3 false merge:
+                    # tid=6 -> sid=1 at score 0.740, has_face=False). Mirror the
+                    # same convention here so new trackers cannot be claimed by
+                    # an existing identity on weak appearance evidence alone.
+                    prev_tid = self.track_to_identity.get(cand['tid'])
+                    req_app = (MIN_APPEARANCE_FOR_MERGE if prev_tid is not None
+                               else MIN_APPEARANCE_NEW_TRACKER)
+                    if raw_app < req_app:
+                        self._trace(frame_id, f"PASS3 BLOCKED appearance floor: "
+                                    f"tid={cand['tid']} sid={best_sid} raw_app={raw_app:.3f} "
+                                    f"< req_app={req_app:.3f} (new_tracker={prev_tid is None})")
                         continue
                     # FIX: PASS 3 used to reassign a tracker's identity purely
                     # based on crossing T_REAPPEAR, with NO check against
@@ -1100,6 +1144,12 @@ class ReIDEngine:
                 self._face_attempts += 1
                 if face_feat is not None:
                     self._face_hits += 1
+                    # Keep a bounded per-tracker face gallery (latest samples)
+                    # so finalize_clustering can detect false merges by face.
+                    gallery = self.tracker_faces.setdefault(pid, [])
+                    gallery.append(face_feat)
+                    if len(gallery) > CFG.TRACK_FACE_GALLERY_SIZE:
+                        del gallery[:len(gallery) - CFG.TRACK_FACE_GALLERY_SIZE]
                 self._store(pid, feat, frame_id)
                 candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': face_feat})
                 self._pending.pop(pid, None)
@@ -1133,6 +1183,116 @@ class ReIDEngine:
 
     # ── finalize ───────────────────────────────────────────────────────────
 
+    def _split_false_merges(self):
+        """Undo live false merges (PASS3 reappearance, lookalike body-only
+        merges) using per-tracker face AND full-track appearance evidence.
+
+        When a sid carries several trackers, union trackers that are
+        convincingly the SAME person:
+          • strong face similarity (max pairwise ≥ FACE_SAME_TRACK_SPLIT), or
+          • clear face mismatch (max pairwise < FACE_SAME_TRACK_VETO) vetoes a
+            union even when bodies look the same, or
+          • with no face evidence on both sides, a union requires VERY strong
+            track-average appearance (≥ APPEARANCE_SPLIT_THRESHOLD).
+        Trackers left in separate groups were merged on single-frame evidence
+        alone — keep the largest group on the original sid, mint a new sid for
+        each other group and rebuild its descriptor from the stored
+        per-tracker appearance features.
+        """
+        sid_tids: dict = {}
+        for tid, sid in self.id_mapping.items():
+            sid_tids.setdefault(sid, []).append(tid)
+
+        def _face_sim(ta, tb):
+            fa = [f for f in self.tracker_faces.get(ta, []) if f is not None]
+            fb = [f for f in self.tracker_faces.get(tb, []) if f is not None]
+            if not fa or not fb:
+                return None
+            return float(max(self.face_extractor.similarity(a, b)
+                             for a in fa for b in fb))
+
+        def _track_mean(tid):
+            feats = self.person_features.get(tid)
+            if not feats:
+                return None
+            return _normalize(np.mean(np.asarray(feats, dtype=np.float32), axis=0))
+
+        def _same_person(ta, tb, means):
+            fs = _face_sim(ta, tb)
+            ma, mb = means.get(ta), means.get(tb)
+            asim = float(_cosine(ma, mb)) if (ma is not None and mb is not None) else None
+            if fs is not None:
+                if fs >= CFG.FACE_SAME_TRACK_SPLIT:
+                    return True
+                if fs < CFG.FACE_SAME_TRACK_VETO:
+                    return False
+            return asim is not None and asim >= CFG.APPEARANCE_SPLIT_THRESHOLD
+
+        split_count = 0
+        for sid, tids in sorted(sid_tids.items()):
+            if len(tids) < 2:
+                continue
+            means = {t: _track_mean(t) for t in tids}
+            evidence = [t for t in tids
+                        if means.get(t) is not None or self.tracker_faces.get(t)]
+            if len(evidence) < 2:
+                continue
+            parent = {t: t for t in evidence}
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+            for i, ta in enumerate(evidence):
+                for tb in evidence[i+1:]:
+                    if _same_person(ta, tb, means):
+                        ra, rb = find(ta), find(tb)
+                        if ra != rb:
+                            parent[ra] = rb
+            groups: dict = {}
+            for t in evidence:
+                groups.setdefault(find(t), []).append(t)
+            # Trackers with no evidence at all stay with the largest group.
+            keep_group = max(groups.values(), key=len)
+            for t in tids:
+                if t not in parent:
+                    keep_group.append(t)
+            if len(groups) < 2:
+                counts = {t: len(self.tracker_faces.get(t, [])) for t in tids}
+                sims = []
+                for i, ta in enumerate(tids):
+                    for tb in tids[i+1:]:
+                        fs = _face_sim(ta, tb)
+                        ma, mb = means.get(ta), means.get(tb)
+                        asim = (_cosine(ma, mb) if ma is not None and mb is not None else None)
+                        parts = [f"app={asim:.3f}" if asim is not None else "app=–"]
+                        if fs is not None:
+                            parts.append(f"face={fs:.3f}")
+                        sims.append(f"{ta}↔{tb} {' '.join(parts)}")
+                logger.info(f"👥 sid={sid} trackers={sorted(tids)} face_counts={counts} "
+                            f"-> kept together ({', '.join(sims) or 'no evidence'})")
+                continue
+            counts = {t: len(self.tracker_faces.get(t, [])) for t in tids}
+            logger.info(f"👥 sid={sid} trackers={sorted(tids)} face_counts={counts} "
+                        f"-> splitting {len(groups)} face/appearance groups")
+            for extra in sorted(groups.values(), key=len, reverse=True)[1:]:
+                new_sid = self.next_stable_id; self.next_stable_id += 1
+                for t in extra:
+                    self.id_mapping[t] = new_sid
+                feats = []
+                for t in extra:
+                    feats.extend(self.person_features.get(t, []))
+                if feats:
+                    self.consolidated_features[new_sid] = _normalize(
+                        np.mean(np.asarray(feats, dtype=np.float32), axis=0))
+                split_count += 1
+                logger.info(f"🔀 SPLIT: sid={sid} trackers {sorted(extra)} "
+                            f"-> new sid={new_sid} (evidence says different people)")
+        if split_count:
+            logger.info(f"🔀 Split: {split_count} false merge(s) undone "
+                        f"({len(self.id_mapping)} trackers → "
+                        f"{len(set(self.id_mapping.values()))} identities)")
+
     def finalize_clustering(self):
         if self.face_extractor.enabled and self._face_attempts > 0:
             rate = 100.0 * self._face_hits / self._face_attempts
@@ -1163,6 +1323,14 @@ class ReIDEngine:
         # (e.g., same person whose tracker ID changed mid-video causing
         # an orphaned identity).
         self._merge_non_cooccurring()
+
+        # LAST: split false merges using per-tracker face + track-average
+        # appearance evidence. Runs after every merge pass so a PASS3
+        # reappearance false-merge (a brand-new tracker claimed by an
+        # existing identity on a single-frame body-appearance score, with no
+        # face confirmation) can be undone when the accumulated evidence says
+        # they are different people.
+        self._split_false_merges()
 
         # Build orphan → living sid remap: sids in identity_db but not in
         # id_mapping that share a tracker assignment history.  This
@@ -1418,6 +1586,21 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
 
     cap.release()
     engine.finalize_clustering()
+
+    # Sync every frame entry's consolidated_id to the FINAL id_mapping.
+    # finalize_clustering may have changed assignments (co-occurrence fix,
+    # face-based split of false merges, non-cooccurring merges) AFTER the
+    # per-frame results were written, so they can be stale. Recomputing from
+    # id_mapping makes them consistent with the final identities.
+    n_synced = 0
+    for fid in sorted(results.keys()):
+        for p in results[fid]:
+            tid = p.get('id')
+            if tid in engine.id_mapping and p.get('consolidated_id') != engine.id_mapping[tid]:
+                p['consolidated_id'] = engine.id_mapping[tid]
+                n_synced += 1
+    if n_synced:
+        logger.info(f"🔗 Synced {n_synced} frame entries to final id mapping")
 
     # Resolve any remaining None consolidated_ids
     for fid in sorted(results.keys()):
