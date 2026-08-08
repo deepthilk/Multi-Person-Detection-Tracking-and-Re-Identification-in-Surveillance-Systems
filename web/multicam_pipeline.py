@@ -167,14 +167,10 @@ def run_camera_reid(
 
     engine = ReIDEngine(device=device)
 
-    # The engine's internal face-based decisions (blend/switch/cluster) were
-    # designed for distinguishing identical uniforms, but in this crowd
-    # footage they over-fragment stable identities (3 people -> 6 tracks,
-    # and the same person split into two). Faces are still used for NAME
-    # RESOLUTION below via a separate extractor, so tracking keeps its
-    # original, stable behaviour while matching still benefits from faces.
-    # The engine's face extractor is left at its default (enabled=False when
-    # created by ReIDEngine.__init__), so no face work runs inside the engine.
+    # The engine's internal face-based decisions (blend/switch/cluster)
+    # distinguish identical uniforms via face similarity. Face extraction
+    # runs inside process_frame() and populates each candidate's face_feat.
+    # Name resolution below uses its own face extractor for the final naming.
     name_face_extractor = get_cached_face_extractor()
 
     with open(tracking_json_path) as f:
@@ -227,6 +223,12 @@ def run_camera_reid(
             pct = int(60 + 26 * (frame_id / max(1, expected_frames)))
             progress_callback(min(pct, 86), f"Matching known people ({frame_id}/{max(1, expected_frames)} frames)")
     cap.release()
+
+    # Diagnostic: how many face candidates were collected for name resolution?
+    total_fc = sum(len(v) for v in face_candidates.values())
+    tracks_with_fc = len(face_candidates)
+    logger.info("Name-resolution face candidates: %d tracks with faces, %d total candidates",
+                tracks_with_fc, total_fc)
 
     frames_read = frame_id
     # OpenCV's reported frame count is often an estimate (container metadata,

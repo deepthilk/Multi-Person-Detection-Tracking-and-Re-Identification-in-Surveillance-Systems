@@ -1052,7 +1052,11 @@ class ReIDEngine:
                 ]))
 
                 self._store(pid, feat, frame_id)
-                candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': None})
+                face_feat = self.face_extractor.extract(frame, bbox)
+                self._face_attempts += 1
+                if face_feat is not None:
+                    self._face_hits += 1
+                candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': face_feat})
                 self._pending.pop(pid, None)
 
         assigned = self._assign(candidates, frame_id)
