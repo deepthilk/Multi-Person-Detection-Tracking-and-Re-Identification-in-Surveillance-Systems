@@ -84,7 +84,7 @@ def test_match_and_export_for_reid():
 
         exported = db.export_for_reid()
         assert set(exported.keys()) == {"Alice", "Bob"}
-        assert exported["Alice"].shape == (698,)
+        assert exported["Alice"]["average_embedding"].shape == (698,)
         print("✅ test_match_and_export_for_reid passed")
     finally:
         shutil.rmtree(tmp_dir)

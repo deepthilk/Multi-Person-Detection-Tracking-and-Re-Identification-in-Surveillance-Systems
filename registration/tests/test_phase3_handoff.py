@@ -48,7 +48,7 @@ def test_export_for_reid_matches_cross_camera_match_contract():
 
         registered_persons = db.export_for_reid()
         assert set(registered_persons.keys()) == {"Alice", "Bob"}
-        assert registered_persons["Alice"].shape == (698,)
+        assert registered_persons["Alice"]["average_embedding"].shape == (698,)
 
         # A "global descriptor" from cross-camera matching that's a close
         # (but not identical) match to Alice — simulates a real camera

@@ -63,7 +63,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from reidentification.face_cue import FaceCueExtractor  # optional face-based cue
+from reidentification.face_cue import FaceCueExtractor, get_cached_face_extractor  # optional face-based cue
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,12 +113,15 @@ class ReIDConfig:
     TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
     TRACK_LOCK_MIN_SCORE: float = 0.40 # LOWERED threshold but longer duration compensates
 
-    # Gallery
-    GALLERY_SIZE:        int = 15
-    GALLERY_SAMPLE_RATE: int = 6
+    # Gallery — larger + more frequent updates reduce identity drift by
+    # keeping a more diverse set of appearance snapshots per person.
+    GALLERY_SIZE:        int = 25
+    GALLERY_SAMPLE_RATE: int = 4
 
-    # EMA
-    EMA_ALPHA: float = 0.10
+    # EMA — higher alpha adapts the running descriptor faster when a
+    # person's appearance shifts (lighting change, angle change), reducing
+    # slow drift where the identity gradually "slides" toward a different person.
+    EMA_ALPHA: float = 0.15
     EMA_VEL:   float = 0.25
 
     # Size gates
@@ -175,7 +178,7 @@ class ReIDConfig:
     # Faces stay distinctive even in identical uniforms, unlike body
     # appearance — this directly targets the uniform-crossing failure mode.
     FACE_WEIGHT:          float = 0.65   # blend weight when a face is available
-    FACE_MIN_SIMILARITY:  float = 0.35   # below this, treat as a mismatch veto
+    FACE_MIN_SIMILARITY:  float = 0.30   # below this, treat as a mismatch veto (ArcFace scale)
 
     # Grace period before minting a brand-new identity — see PASS 4 comment
     # in ReIDEngine._assign for why this exists (single-frame re-appearance
@@ -364,6 +367,46 @@ class MultiCueExtractor:
             logger.debug(f"Deep extraction error: {e}")
             return None
 
+    def extract_deep_batch(self, model, frame, bboxes):
+        """Batch deep feature extraction — single forward pass for all crops."""
+        tensors = []
+        valid_indices = []
+        for i, bbox in enumerate(bboxes):
+            x1, y1, x2, y2 = map(int, bbox)
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            tensors.append(self.transform(Image.fromarray(rgb)))
+            valid_indices.append(i)
+
+        results = [None] * len(bboxes)
+        if not tensors:
+            return results
+
+        batch = torch.stack(tensors, dim=0).to(self.device)
+        with torch.no_grad():
+            feats = model(batch)
+        if isinstance(feats, (list, tuple)):
+            feats = feats[0]
+        if feats.dim() > 2:
+            feats = feats.view(feats.size(0), -1)
+        feats = nn.functional.normalize(feats, p=2, dim=1)
+        feats_np = feats.cpu().numpy()
+
+        for j, idx in enumerate(valid_indices):
+            v = feats_np[j]
+            if len(v) > self.DEEP_DIM:
+                v = v[:self.DEEP_DIM]
+            elif len(v) < self.DEEP_DIM:
+                v = np.pad(v, (0, self.DEEP_DIM - len(v)))
+            results[idx] = v
+        return results
+
     def build(self, model, frame, bbox):
         deep = self.extract_deep(model, frame, bbox)
         if deep is None:
@@ -486,6 +529,47 @@ class Identity:
 #  Re-ID Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Reuse one ResNet-50 Re-ID model per device across all video jobs. Building
+# the backbone and torch.load'ing the 100 MB fine-tuned checkpoint for every
+# camera run wasted seconds of startup; the weights are immutable once loaded,
+# so consecutive runs share them safely. Only the engine's *state* (tracking
+# maps, identity clusters) is per-run, and that is untouched by caching.
+_reid_model_cache = {}
+
+
+def _load_reid_model(name, device) -> nn.Module:
+    key = (name, str(device))
+    m = _reid_model_cache.get(key)
+    if m is not None:
+        return m
+
+    # Skip torchreid import (TensorFlow dependency chain causes hangs)
+    # Use ResNetReIDBackbone directly (ResNet-50 + metric learning head)
+    m = ResNetReIDBackbone().to(device)
+
+    # If a fine-tuned checkpoint exists (see reidentification/training/
+    # train_reid.py), load it. Falls back to the ImageNet-only backbone
+    # exactly as before if the file is missing/empty/unloadable, so
+    # nothing else in the pipeline (registration/embedder.py included)
+    # has to change either way.
+    weights_path = Path(__file__).resolve().parent / "weights" / "best_model.pth"
+    if weights_path.exists() and weights_path.stat().st_size > 0:
+        try:
+            state = torch.load(weights_path, map_location=device)
+            m.load_state_dict(state)
+            logger.info(f"✅ Fine-tuned Re-ID weights loaded from {weights_path} (512-dim embeddings)")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not load fine-tuned weights ({e}); "
+                            f"using ImageNet-only backbone instead")
+    else:
+        logger.info("✅ ResNet-50 + Re-ID head loaded (ImageNet weights only — "
+                    "no fine-tuned checkpoint found, 512-dim embeddings)")
+
+    m.eval()
+    _reid_model_cache[key] = m
+    return m
+
+
 class ReIDEngine:
     def __init__(self, model_name="osnet_x1_0", device="cuda", debug_trace=False):
         self.device    = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -497,7 +581,7 @@ class ReIDEngine:
                                           # happened from watching a video
         self.model     = self._load_model(model_name)
         self.extractor = MultiCueExtractor(self.device, self.use_osnet)
-        self.face_extractor = FaceCueExtractor()
+        self.face_extractor = get_cached_face_extractor()
         if self.face_extractor.enabled:
             logger.info("✅ Face-based Re-ID cue enabled (helps distinguish identical uniforms)")
         # Diagnostics: how often is a face actually found? If this stays near
@@ -535,30 +619,7 @@ class ReIDEngine:
     # ── model ──────────────────────────────────────────────────────────────
 
     def _load_model(self, name):
-        # Skip torchreid import (TensorFlow dependency chain causes hangs)
-        # Use ResNetReIDBackbone directly (ResNet-50 + metric learning head)
-        m = ResNetReIDBackbone().to(self.device)
-
-        # If a fine-tuned checkpoint exists (see reidentification/training/
-        # train_reid.py), load it. Falls back to the ImageNet-only backbone
-        # exactly as before if the file is missing/empty/unloadable, so
-        # nothing else in the pipeline (registration/embedder.py included)
-        # has to change either way.
-        weights_path = Path(__file__).resolve().parent / "weights" / "best_model.pth"
-        if weights_path.exists() and weights_path.stat().st_size > 0:
-            try:
-                state = torch.load(weights_path, map_location=self.device)
-                m.load_state_dict(state)
-                logger.info(f"✅ Fine-tuned Re-ID weights loaded from {weights_path} (512-dim embeddings)")
-            except Exception as e:
-                logger.warning(f"⚠️  Could not load fine-tuned weights ({e}); "
-                                f"using ImageNet-only backbone instead")
-        else:
-            logger.info("✅ ResNet-50 + Re-ID head loaded (ImageNet weights only — "
-                        "no fine-tuned checkpoint found, 512-dim embeddings)")
-
-        m.eval()
-        return m
+        return _load_reid_model(name, self.device)
 
     # ── feature ────────────────────────────────────────────────────────────
 
@@ -919,19 +980,23 @@ class ReIDEngine:
         results   = []
         candidates = []
 
+        # ── Phase 1: filter tracks and collect valid bboxes ──────────────
+        valid_tracks = []  # (pid, bbox) for tracks passing size/off-screen gates
+
         for track in self._dedupe(tracking_data):
             pid  = track['id']
             bbox = track['bbox']
             x1,y1,x2,y2 = bbox
             w,h = x2-x1, y2-y1
 
-            # Reject boxes smaller than 20×40px (800 area) before extraction
-            # Filters edge/partial detections that create noise
             if h < CFG.MIN_HEIGHT or w*h < min_area or w*h < 600:
+                logger.debug("Dropped tiny bbox: tid=%s %dx%d (%dpx²) min_area=%d",
+                             pid, w, h, w*h, min_area)
                 continue
 
-            # FIX (Bug 6): reject off-screen ghost bboxes before extraction
             if not _valid_bbox(bbox, frame_w, frame_h):
+                logger.debug("Off-screen ghost bbox: tid=%s bbox=%s frame=%s",
+                             pid, bbox, frame_id)
                 existing = self.track_to_identity.get(pid)
                 if existing is None:
                     self._pending[pid] = frame_id
@@ -939,21 +1004,56 @@ class ReIDEngine:
                                 'bbox': bbox, 'feature_dim': 0, 'matches': []})
                 continue
 
-            feat = self.extract_feature(frame, bbox)
-            if feat is not None:
-                face_feat = self.face_extractor.extract(frame, bbox)
-                self._face_attempts += 1
-                if face_feat is not None:
-                    self._face_hits += 1
+            valid_tracks.append((pid, bbox))
+
+        # ── Phase 2: batch deep feature extraction + per-crop cues ───────
+        if valid_tracks:
+            bboxes = [t[1] for t in valid_tracks]
+            deep_feats = self.extractor.extract_deep_batch(self.model, frame, bboxes)
+
+            w_d = CFG.CUE_DEEP
+            w_c = CFG.CUE_COLOR_ZONE / 3.0
+            w_t = CFG.CUE_TEXTURE
+            w_p = CFG.CUE_PROPORTION
+
+            for j, (pid, bbox) in enumerate(valid_tracks):
+                deep = deep_feats[j]
+                if deep is None:
+                    logger.debug("Feature extraction failed: tid=%s bbox=%s frame=%s",
+                                 pid, bbox, frame_id)
+                    existing = self.track_to_identity.get(pid)
+                    if existing is None:
+                        self._pending[pid] = frame_id
+                    results.append({'id': pid, 'consolidated_id': existing,
+                                    'bbox': bbox, 'feature_dim': 0, 'matches': []})
+                    continue
+
+                face_c  = _zone_hist(self.extractor._crop(frame, bbox, 0.00, 0.18))
+                upper_c = _zone_hist(self.extractor._crop(frame, bbox, 0.15, 0.50))
+                lower_c = _zone_hist(self.extractor._crop(frame, bbox, 0.48, 0.85))
+
+                torso = self.extractor._crop(frame, bbox, 0.12, 0.55)
+                lbp   = (_lbp_histogram(cv2.cvtColor(torso, cv2.COLOR_BGR2GRAY), self.extractor.LBP_DIM)
+                         if torso is not None else np.zeros(self.extractor.LBP_DIM, dtype=np.float32))
+
+                x1, y1, x2, y2 = map(int, bbox)
+                W = max(1, min(frame.shape[1], x2) - max(0, x1))
+                H = max(1, min(frame.shape[0], y2) - max(0, y1))
+                prop = np.array([
+                    float(np.clip(H / W / 4.0, 0, 1)),
+                    0.15,
+                    float(np.clip(W / frame.shape[1], 0, 1)),
+                    float(np.clip(H / frame.shape[0], 0, 1)),
+                ], dtype=np.float32)
+
+                feat = _normalize(np.concatenate([
+                    deep*w_d, face_c*w_c, upper_c*w_c, lower_c*w_c,
+                    lbp*w_t, prop*w_p,
+                ]))
+
                 self._store(pid, feat, frame_id)
-                candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': face_feat})
+                candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': None})
                 self._pending.pop(pid, None)
-            else:
-                existing = self.track_to_identity.get(pid)
-                if existing is None:
-                    self._pending[pid] = frame_id
-                results.append({'id': pid, 'consolidated_id': existing,
-                                'bbox': bbox, 'feature_dim': 0, 'matches': []})
 
         assigned = self._assign(candidates, frame_id)
 
@@ -980,6 +1080,8 @@ class ReIDEngine:
             logger.info(f"✅ {len(self.id_mapping)} tracker IDs → "
                         f"{len(self.consolidated_features)} stable identities")
         else:
+            logger.warning("⚠️  No tracker IDs assigned — all detections may have been "
+                           "dropped (too small, off-screen, or feature extraction failed)")
             self.id_mapping = self._offline_cluster()
 
     def _offline_cluster(self):

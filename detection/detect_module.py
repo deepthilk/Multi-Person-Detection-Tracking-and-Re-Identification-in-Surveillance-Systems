@@ -12,6 +12,52 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Reuse a single YOLO instance across videos instead of re-loading the
+# weights (and re-parsing the .pt) on every job — the model itself is
+# stateless between runs. Cached per (model_path, conf, weak_conf, device);
+# a multi-camera session shares one detector, cutting a few seconds of
+# startup per camera.
+_detector_cache = {}
+
+
+def get_cached_detector(
+    model_path='models/yolov8s.pt',
+    conf_threshold=0.25,
+    device='cuda',
+    min_area=600,
+    min_height=30,
+    min_aspect=0.5,
+    max_aspect=4.5,
+    min_area_ratio=0.0008,
+    weak_conf_threshold=None,
+):
+    key = (
+        model_path,
+        conf_threshold,
+        weak_conf_threshold,
+        device if torch.cuda.is_available() else 'cpu',
+        min_area,
+        min_height,
+        min_aspect,
+        max_aspect,
+        min_area_ratio,
+    )
+    detector = _detector_cache.get(key)
+    if detector is None:
+        detector = PersonDetector(
+            model_path=model_path,
+            conf_threshold=conf_threshold,
+            device=device,
+            min_area=min_area,
+            min_height=min_height,
+            min_aspect=min_aspect,
+            max_aspect=max_aspect,
+            min_area_ratio=min_area_ratio,
+            weak_conf_threshold=weak_conf_threshold,
+        )
+        _detector_cache[key] = detector
+    return detector
+
 
 class PersonDetector:
     """YOLOv8 based person detector"""
@@ -147,7 +193,7 @@ def run_detection(
     Returns:
         Dictionary of frame_id -> detections
     """
-    detector = PersonDetector(
+    detector = get_cached_detector(
         conf_threshold=conf_threshold,
         device=device,
         min_area=min_area,

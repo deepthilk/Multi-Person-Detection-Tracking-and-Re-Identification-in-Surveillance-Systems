@@ -95,26 +95,54 @@ def _simulate_video_quality(image: np.ndarray) -> np.ndarray:
 
 
 def _random_augment(image: np.ndarray) -> np.ndarray:
-    """Apply a random augmentation to simulate different viewing conditions."""
+    """Apply random augmentations to simulate diverse viewing conditions.
+
+    The augmentation pipeline covers the main sources of domain shift
+    between a clean registration photo and a low-quality surveillance frame:
+      - brightness / contrast variation (different lighting)
+      - blur (camera defocus, motion blur, low resolution)
+      - resolution downgrade (distance from camera)
+      - horizontal flip (mirror or different camera angle)
+      - JPEG artefact intensity (varying compression)
+      - Gaussian noise (sensor noise in low light)
+    """
     aug = image.copy()
 
     # Random brightness / contrast jitter
-    alpha = 1.0 + random.uniform(-0.25, 0.25)
-    beta = random.randint(-35, 35)
+    alpha = 1.0 + random.uniform(-0.30, 0.30)
+    beta = random.randint(-40, 40)
     aug = cv2.convertScaleAbs(aug, alpha=alpha, beta=beta)
 
     # Random blur (sometimes more, sometimes less)
-    if random.random() > 0.5:
+    if random.random() > 0.4:
         k = random.choice([3, 5])
-        blur_sigma = random.uniform(0.3, 1.0)
+        blur_sigma = random.uniform(0.3, 1.2)
         aug = cv2.GaussianBlur(aug, (k, k), blur_sigma)
 
-    # Random downscale + upscale (simulates variable resolution)
-    if random.random() > 0.4:
+    # Random downscale + upscale (simulates variable resolution / distance)
+    if random.random() > 0.35:
         h, w = aug.shape[:2]
-        factor = random.uniform(0.25, 0.65)
+        factor = random.uniform(0.20, 0.70)
         small = cv2.resize(aug, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
         aug = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # Random horizontal flip (mirror, or different camera angle)
+    if random.random() > 0.5:
+        aug = cv2.flip(aug, 1)
+
+    # Random JPEG compression at varying quality levels
+    if random.random() > 0.4:
+        quality = random.randint(40, 80)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        success, enc = cv2.imencode(".jpg", aug, encode_param)
+        if success:
+            aug = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+
+    # Random Gaussian noise (simulates sensor noise in low light)
+    if random.random() > 0.6:
+        sigma = random.uniform(3, 12)
+        noise = np.random.normal(0, sigma, aug.shape).astype(np.float32)
+        aug = np.clip(aug.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
     return aug
 

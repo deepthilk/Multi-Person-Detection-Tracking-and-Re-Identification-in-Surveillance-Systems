@@ -986,13 +986,17 @@ function resizeOverlayCanvas() {
  * (the backend only has data once Re-ID has run — see /camera/{id}/tracks).
  * Safe to call speculatively; 409 just means "not ready yet".
  */
-async function maybeFetchRealTracks(camId) {
+async function maybeFetchRealTracks(camId, _retryCount) {
   if (!currentSessionId || realTrackCache[camId]) return;
   realTrackCache[camId] = { fetching: true, fps: 25, frames: [] };
+  const retries = _retryCount || 0;
   try {
     const resp = await fetch(`/api/session/${currentSessionId}/camera/${camId}/tracks`);
     if (resp.status === 409) {
-      delete realTrackCache[camId]; // not ready — try again once status flips to completed
+      delete realTrackCache[camId];
+      if (retries < 5) {
+        setTimeout(() => maybeFetchRealTracks(camId, retries + 1), 2000);
+      }
       return;
     }
     if (!resp.ok) throw new Error("Could not load detections for this camera");
@@ -1004,7 +1008,11 @@ async function maybeFetchRealTracks(camId) {
     }
   } catch (err) {
     delete realTrackCache[camId];
-    logEvent("warn", `Could not load detections for ${sessionCameraLabels[camId] || camId}: ${err.message}`);
+    if (retries < 3) {
+      setTimeout(() => maybeFetchRealTracks(camId, retries + 1), 2000);
+    } else {
+      logEvent("warn", `Could not load detections for ${sessionCameraLabels[camId] || camId}: ${err.message}`);
+    }
   }
 }
 

@@ -139,7 +139,8 @@ def resolve_names(global_descriptors: dict, registered_persons: dict,
     names = {}
     for gid, desc in global_descriptors.items():
         best_name, best_sim = None, 0.0
-        for name, reg_desc in registered_persons.items():
+        for name, record in registered_persons.items():
+            reg_desc = record["average_embedding"] if isinstance(record, dict) else record
             sim = _cosine(desc, reg_desc)
             if sim > best_sim:
                 best_name, best_sim = name, sim

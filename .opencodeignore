@@ -1,0 +1,11 @@
+# Ignore large media, virtual environments, and weights
+venv/
+.venv/
+__pycache__/
+datasets/
+weights/
+*.mp4
+*.jpg
+photos/
+models/
+reidentification/dataset/

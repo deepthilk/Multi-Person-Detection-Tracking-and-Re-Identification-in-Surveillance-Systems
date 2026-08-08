@@ -48,30 +48,30 @@ SEARCH_SETTINGS = {
     # comparing a query embedding (e.g. from a live Re-ID track) against
     # registered persons.
     #
-    # LOWERED from 0.75 → 0.55 to accommodate domain shift between
-    # high-resolution registration photos and low-resolution surveillance
-    # video crops. The Re-ID model's embeddings vary significantly with
-    # image quality, lighting, and compression — a threshold that works
-    # for same-domain matching (e.g. Market-1501 query/gallery) is too
-    # strict when comparing a clean studio photo to a blurry video frame
-    # of the same person. See embedder.py's video-simulation preprocessing
-    # for the complementary fix on the embedding side.
-    "match_threshold": 0.55,
+    # Body-only match threshold (cosine of 698-dim body descriptors).
+    #
+    # Must be ABOVE the inter-person body similarity range (0.90–0.96 for
+    # uniformed subjects, per guardrail measurements) to prevent false
+    # positives between different people wearing similar outfits.  At 0.85,
+    # same-person cross-domain matches (0.90+) still pass, while different-
+    # person matches (0.90–0.96) are correctly rejected.  If face detection
+    # succeeds, this threshold is irrelevant — face decides at 0.40.
+    "match_threshold": 0.85,
     "top_k": 3,
 
-    # Face-aware matching bars (SFace/ONNX cosine scale, see face_cue.py):
+    # Face-aware matching bars (ArcFace/ONNX cosine scale, see face_cue.py):
     #   * Above `face_match_threshold` a visible face CONFIRMS the identity on
     #     its own — a strong face beats a weak body score, which is exactly
-    #     the "same person, different outfit/lighting" case. SFace's own
-    #     same-person cutoff is ~0.363; live different-people peaks here
-    #     stayed under 0.33, so 0.40 sits safely between them.
+    #     the "same person, different outfit/lighting" case. ArcFace-R100's
+    #     same-person cosine is typically 0.4–0.7; different-people peaks
+    #     around 0.20–0.25, so 0.40 sits safely between them.
     #   * Below `face_veto_threshold` a confident face is a MISMATCH — two
     #     different people can't share a face, so it vetoes even a strong
     #     body-appearance score.
-    # Between the two the match falls back to the soft 0.75*face + 0.25*body
-    # blend against `match_threshold`.
-    "face_match_threshold": 0.40,
-    "face_veto_threshold": 0.30,
+    # Between the two the match falls back to the body score against
+    # `match_threshold`.
+    "face_match_threshold": 0.45,
+    "face_veto_threshold": 0.25,
 }
 
 # ==============================================================================

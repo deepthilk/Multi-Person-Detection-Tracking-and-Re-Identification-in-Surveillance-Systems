@@ -82,9 +82,9 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
 
     face_embeddings = []
     try:
-        from reidentification.face_cue import FaceCueExtractor
+        from reidentification.face_cue import get_cached_face_extractor
         import cv2
-        face_extractor = FaceCueExtractor()
+        face_extractor = get_cached_face_extractor()
         for path in stored_paths:
             img = cv2.imread(path)
             if img is not None:

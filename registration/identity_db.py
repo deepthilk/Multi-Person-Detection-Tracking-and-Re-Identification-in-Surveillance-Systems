@@ -75,6 +75,7 @@ class IdentityDatabase:
             image_paths: original source paths, stored as metadata only.
             face_embeddings: optional list of face embedding vectors.
         """
+        name = name.strip()
         if not embeddings:
             raise ValueError(f"No usable embeddings for '{name}' — nothing to store")
 
@@ -82,7 +83,10 @@ class IdentityDatabase:
         average = np.mean(np.array(vectors, dtype=np.float32), axis=0).tolist()
 
         face_vectors = [np.asarray(f, dtype=np.float32).tolist() for f in (face_embeddings or [])]
-        avg_face = np.mean(np.array(face_vectors, dtype=np.float32), axis=0).tolist() if face_vectors else None
+        avg_face = np.mean(np.array(face_vectors, dtype=np.float32), axis=0) if face_vectors else None
+        if avg_face is not None:
+            avg_face /= np.linalg.norm(avg_face) + 1e-8  # re-normalize to unit length
+            avg_face = avg_face.tolist()
 
         existing = self._data.get(name)
         if existing:
@@ -93,7 +97,12 @@ class IdentityDatabase:
 
             existing_faces = existing.get("face_embeddings", [])
             face_vectors = existing_faces + face_vectors
-            avg_face = np.mean(np.array(face_vectors, dtype=np.float32), axis=0).tolist() if face_vectors else existing.get("average_face_descriptor")
+            avg_face = np.mean(np.array(face_vectors, dtype=np.float32), axis=0) if face_vectors else None
+            if avg_face is not None:
+                avg_face /= np.linalg.norm(avg_face) + 1e-8
+                avg_face = avg_face.tolist()
+            else:
+                avg_face = existing.get("average_face_descriptor")
 
             num_images = existing["metadata"]["num_images"] + len(embeddings)
             all_paths = existing["metadata"].get("image_paths", []) + (image_paths or [])
@@ -177,7 +186,7 @@ class IdentityDatabase:
             person who changed clothes / lighting between registration and
             the live clip — the body cue (which hates outfit changes) no
             longer drags a clear face below the body threshold.
-          * face_sim < face_veto_threshold (0.30) -> confident mismatch;
+          * face_sim < face_veto_threshold (0.25) -> confident mismatch;
             veto even a strong body score (two people can't share a face).
           * otherwise -> the face is inconclusive, so the BODY decides
             (threshold = match_threshold). An inconclusive face must not
@@ -188,7 +197,7 @@ class IdentityDatabase:
         top_k = top_k or SEARCH_SETTINGS["top_k"]
         body_threshold = threshold if threshold is not None else SEARCH_SETTINGS["match_threshold"]
         face_confirm = SEARCH_SETTINGS.get("face_match_threshold", 0.40)
-        face_veto = SEARCH_SETTINGS.get("face_veto_threshold", 0.30)
+        face_veto = SEARCH_SETTINGS.get("face_veto_threshold", 0.25)
 
         from reidentification.face_cue import FaceCueExtractor
 
@@ -262,7 +271,13 @@ class IdentityDatabase:
         identity_db.json directly.
         """
         return {
-            name: np.asarray(record["average_embedding"], dtype=np.float32)
+            name: {
+                "average_embedding": np.asarray(record["average_embedding"], dtype=np.float32),
+                "average_face_descriptor": (
+                    np.asarray(record["average_face_descriptor"], dtype=np.float32)
+                    if record.get("average_face_descriptor") is not None else None
+                ),
+            }
             for name, record in self._data.items()
         }
 
@@ -303,7 +318,8 @@ class IdentityDatabase:
         for name, record in backup_data.items():
             embeddings = record["embeddings"]
             image_paths = record["metadata"].get("image_paths", [])
-            self.add_person(name, embeddings, image_paths=image_paths)
+            face_embeddings = record.get("face_embeddings", [])
+            self.add_person(name, embeddings, image_paths=image_paths, face_embeddings=face_embeddings)
         logger.info(f"Merged {len(backup_data)} person(s) from {backup_path}")
 
     def __len__(self):

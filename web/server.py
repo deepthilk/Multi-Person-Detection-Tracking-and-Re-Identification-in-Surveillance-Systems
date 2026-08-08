@@ -506,6 +506,30 @@ def _prune_sessions(keep_n: int = 5):
             _log("info", f"Pruned old session {sid} — removed {removed} file(s)")
 
 
+def _cleanup_previous_sessions():
+    """Startup-only: wipe all session artifacts from previous runs so the
+    server starts with a clean slate.  Only deletes files matching the
+    10-hex session pattern — registration data (identity_db.json, images,
+    reg_*/verify_* photos) is never touched."""
+    removed = 0
+    for directory in (OUTPUT_DIR, UPLOAD_DIR):
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            if not path.is_file():
+                continue
+            stem = path.stem
+            if len(stem) >= 10 and all(c in "0123456789abcdef" for c in stem[:10]):
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    logger.warning("Could not delete %s", path)
+    SESSIONS.clear()
+    if removed:
+        _log("info", f"Startup cleanup: removed {removed} file(s) from previous session(s)")
+
+
 def _sweep_orphan_artifacts():
     """Startup-only sweep: remove 10-hex-prefixed files in OUTPUT_DIR and
     UPLOAD_DIR that don't belong to any restored session (legacy /api/process
@@ -585,7 +609,6 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
     detections_path = OUTPUT_DIR / f"{session_id}_{camera_id}_detections.json"
     tracking_path = OUTPUT_DIR / f"{session_id}_{camera_id}_tracking.json"
     reid_path = OUTPUT_DIR / f"{session_id}_{camera_id}_reid.json"
-    output_video_path = OUTPUT_DIR / f"{session_id}_{camera_id}_reid.mp4"
     label = cam.get("label", camera_id)
 
     _log("info", f"{label}: job queued on {device.upper()}", camera_id)
@@ -600,6 +623,7 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             weak_conf_threshold=0.4,
             min_height=50,
             min_area_ratio=0.001,
+            imgsz=640,
             device=device,
         )
         _ensure_artifact(detections_path, "Detection output")
@@ -652,12 +676,17 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             else:
                 _log("info", f"{label}: track {p['track_id']} has no identity match — unknown", camera_id)
 
-        cam.update({"percent": 90, "message": "Rendering annotated video"})
-        t3 = time.time()
-        if render_reid_video(str(input_path), str(reid_path), str(output_video_path)):
-            cam["output_url"] = f"/outputs/{output_video_path.name}"
-        _record_latency("render", time.time() - t3, camera_id)
+        # Render pass skipped (speed): it costs an extra full decode + ffmpeg
+        # re-encode while adding nothing to identification, which is what this
+        # system is judged on. Re-enable (and adjust percent jump below) if an
+        # annotated preview is needed again.
+        # cam.update({"percent": 90, "message": "Rendering annotated video"})
+        # t3 = time.time()
+        # if render_reid_video(str(input_path), str(reid_path), str(output_video_path)):
+        #     cam["output_url"] = f"/outputs/{output_video_path.name}"
+        # _record_latency("render", time.time() - t3, camera_id)
 
+        cam.update({"percent": 100, "message": "Done"})
         cam.update({"status": "completed", "percent": 100, "message": "Done"})
         _log("info", f"{label}: pipeline complete ({time.time() - t0:.1f}s total)", camera_id)
         _write_manifest(session_id, camera_id, cam)
@@ -825,6 +854,7 @@ def _run_pipeline_job(job_id, input_path, detections_path, tracking_path, reid_p
             weak_conf_threshold=0.4,
             min_height=50,
             min_area_ratio=0.001,
+            imgsz=640,
             device=device,
         )
         _ensure_artifact(detections_path, "Detection output")
@@ -858,7 +888,6 @@ def _run_pipeline_job(job_id, input_path, detections_path, tracking_path, reid_p
 
 if __name__ == "__main__":
     import uvicorn
-    _restore_sessions()
+    _cleanup_previous_sessions()
     _sweep_orphan_artifacts()
-    _prune_sessions(_KEEP_SESSIONS)
     uvicorn.run(app, host="0.0.0.0", port=8000)

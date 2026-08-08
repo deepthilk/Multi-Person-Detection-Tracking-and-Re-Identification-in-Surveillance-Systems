@@ -285,7 +285,8 @@ def resolve_names_by_body(all_tracks: list, track_to_gid: dict, registered_perso
     names = {}
     for gid, t in gid_to_track.items():
         best_name, best_sim = None, 0.0
-        for name, reg_desc in registered_persons.items():
+        for name, record in registered_persons.items():
+            reg_desc = record["average_embedding"] if isinstance(record, dict) else record
             sim = float(_cosine(t.avg_body, reg_desc))
             if sim > best_sim:
                 best_name, best_sim = name, sim
