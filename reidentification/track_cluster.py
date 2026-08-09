@@ -10,14 +10,14 @@ score, gated by 5+ interacting thresholds (switch-guard, grace period,
 reappearance threshold, continuity lock, face-mismatch veto). Every bug
 found debugging this project came from two of those thresholds interacting
 badly in some specific edge case (a crossing, a brief occlusion, a person
-re-entering frame). That's not bad luck — it's the predictable cost of a
+re-entering frame). That's not bad luck - it's the predictable cost of a
 system that has to make an irreversible judgment call every frame from a
 single, often-noisy, single-frame observation.
 
 This module replaces that per-frame decision-making with a much simpler,
 more robust two-stage design:
 
-  1. Let DeepSORT finish tracking the WHOLE video first (unchanged — Lekha's
+  1. Let DeepSORT finish tracking the WHOLE video first (unchanged - Lekha's
      multicam module already does this correctly). This gives a handful of
      track segments per camera (typically 10-30 for a short video with a
      few people), each with a track_id, a start/end frame, and a bbox per
@@ -29,7 +29,7 @@ more robust two-stage design:
      confidence) face descriptor for that track. Averaging over dozens of
      frames is inherently far less noisy than trusting any single frame.
 
-  3. Do ONE global comparison across all tracks (from all cameras at once —
+  3. Do ONE global comparison across all tracks (from all cameras at once -
      this also replaces the separate cross_camera_match.py step, since
      there's no reason to treat "different camera" specially once matching
      happens at the track level instead of the frame level) and merge
@@ -40,7 +40,7 @@ more robust two-stage design:
      simultaneously-visible boxes), which rules out an entire class of
      accidental merges for free.
 
-No online decision, no grace period, no per-frame switch-guard — one clean
+No online decision, no grace period, no per-frame switch-guard - one clean
 offline clustering pass over averaged, far more reliable descriptors.
 
 Not a silver bullet: extreme occlusion where DeepSORT itself never recovers
@@ -104,7 +104,7 @@ class TrackDescriptor:
 
     def overlaps(self, other: "TrackDescriptor") -> bool:
         """True only if both tracks are in the SAME camera and were active
-        during any shared frame range — the hard veto against merging two
+        during any shared frame range - the hard veto against merging two
         simultaneously-visible people."""
         if self.camera_id != other.camera_id:
             return False
@@ -131,7 +131,7 @@ def _track_similarity(t1: TrackDescriptor, t2: TrackDescriptor):
 
 def build_track_descriptors(camera_id: str, video_path: str, tracking_json_path: str,
                              engine: ReIDEngine, max_frames=None) -> dict:
-    """Runs feature extraction (reusing the existing body+face extractors —
+    """Runs feature extraction (reusing the existing body+face extractors -
     no reimplementation) over every frame of one camera's video, grouped by
     DeepSORT track_id, and returns {track_id: TrackDescriptor}."""
     with open(tracking_json_path) as f:
@@ -175,7 +175,7 @@ def build_track_descriptors(camera_id: str, video_path: str, tracking_json_path:
     for t in tracks.values():
         t.finalize()
 
-    logger.info(f"✅ [{camera_id}] {len(tracks)} track(s) extracted")
+    logger.info(f"[OK]  [{camera_id}] {len(tracks)} track(s) extracted")
     return tracks
 
 
@@ -202,7 +202,7 @@ def cluster_tracks(all_tracks: list) -> dict:
         for j in range(i + 1, n):
             t1, t2 = all_tracks[i], all_tracks[j]
             if t1.overlaps(t2):
-                continue   # hard veto — can never be the same person
+                continue   # hard veto - can never be the same person
             sim, used_face = _track_similarity(t1, t2)
             if sim is None:
                 all_comparisons.append((t1, t2, None, False, None))
@@ -227,7 +227,7 @@ def cluster_tracks(all_tracks: list) -> dict:
                         f"threshold={threshold:.2f}) -> {verdict}")
 
     # Merge highest-confidence pairs first. Before each merge, re-verify no
-    # member of one cluster overlaps with any member of the other — needed
+    # member of one cluster overlaps with any member of the other - needed
     # because transitive merges (A~B, B~C) could otherwise chain two
     # tracks together that individually never overlap but whose CLUSTERS
     # would contain a same-camera time conflict.
@@ -267,7 +267,7 @@ def cluster_tracks(all_tracks: list) -> dict:
 def resolve_names_by_body(all_tracks: list, track_to_gid: dict, registered_persons: dict,
                            match_threshold: float = 0.55) -> dict:
     """Matches each global identity's representative body descriptor
-    against Prajna's registration DB (698-dim body embeddings — the
+    against Prajna's registration DB (698-dim body embeddings - the
     registration module is body-based, not face-based, so this uses body
     descriptors here for compatibility, matching cross_camera_match.py's
     existing convention). Returns {global_id: {"name":..., "similarity":...}}."""
@@ -298,7 +298,7 @@ def run_track_level_pipeline(camera_configs: list, per_camera_tracking_paths: di
                               device: str = "cuda", max_frames=None,
                               registered_persons: dict = None,
                               output_json_path: str = "outputs/cross_camera/global_identities.json"):
-    """Top-level entry point — replaces run_reid_pipeline() + cross-camera
+    """Top-level entry point - replaces run_reid_pipeline() + cross-camera
     matching with the track-level approach for every configured camera.
     Output schema matches cross_camera_match.py's existing output, so
     utils.render_global_id_video and everything downstream needs no changes."""
@@ -310,14 +310,14 @@ def run_track_level_pipeline(camera_configs: list, per_camera_tracking_paths: di
         cam_id = cfg["camera_id"]
         if cam_id not in per_camera_tracking_paths:
             continue
-        logger.info(f"— {cam_id} ({cfg['source']}) — extracting track descriptors")
+        logger.info(f"- {cam_id} ({cfg['source']}) - extracting track descriptors")
         tracks = build_track_descriptors(
             cam_id, cfg["source"], per_camera_tracking_paths[cam_id], engine, max_frames)
         per_camera_tracks[cam_id] = tracks
         all_tracks.extend(tracks.values())
 
     if not all_tracks:
-        logger.error("❌ No tracks extracted — nothing to cluster")
+        logger.error("[FAIL]  No tracks extracted - nothing to cluster")
         return {}
 
     logger.info(f"Clustering {len(all_tracks)} track(s) across {len(per_camera_tracks)} camera(s)...")
@@ -369,6 +369,6 @@ def run_track_level_pipeline(camera_configs: list, per_camera_tracking_paths: di
         json.dump(combined, f, indent=2, default=str)
 
     n_named = sum(1 for v in combined["global_identities"].values() if "name" in v)
-    logger.info(f"✅ Track-level clustering complete: {len(all_gids)} global identities "
+    logger.info(f"[OK]  Track-level clustering complete: {len(all_gids)} global identities "
                 f"({n_named} matched to a registered name) -> {output_json_path}")
     return combined

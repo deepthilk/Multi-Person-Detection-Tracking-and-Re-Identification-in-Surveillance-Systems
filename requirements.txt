@@ -15,4 +15,9 @@ PyYAML>=6.0
 tqdm>=4.62.0
 scikit-learn>=1.0.0
 gdown>=4.7.0
-face_recognition>=1.3.0
+# face_recognition requires dlib, which on Windows needs a pre-built wheel.
+# Install order: pip install dlib-bin && pip install face_recognition --no-deps
+# Then install face-recognition-models separately (handled by --no-deps install)
+# See: https://github.com/z-mahmud22/Dlib_Windows_Python3.x
+# Or:  pip install dlib-bin (preferred for Python 3.13+)
+# face_recognition>=1.3.0  # not directly pip-installable on Windows 3.13

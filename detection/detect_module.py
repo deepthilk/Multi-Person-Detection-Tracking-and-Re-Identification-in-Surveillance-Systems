@@ -23,7 +23,7 @@ class PersonDetector:
         device='cuda',
         min_area=900,
         min_height=50,
-        min_aspect=1.0,
+        min_aspect=0.5,
         max_aspect=4.5,
         min_area_ratio=0.0008,
     ):
@@ -42,7 +42,7 @@ class PersonDetector:
         
         logger.info(f"✅ Detector initialized on {self.device}")
     
-    def detect(self, frame, imgsz=960):
+    def detect(self, frame, imgsz=640):
         """
         Detect persons in frame
         
@@ -91,7 +91,7 @@ def run_detection(
     device='cuda',
     min_area=900,
     min_height=50,
-    min_aspect=1.0,
+    min_aspect=0.5,
     max_aspect=4.5,
     min_area_ratio=0.0008,
 ):

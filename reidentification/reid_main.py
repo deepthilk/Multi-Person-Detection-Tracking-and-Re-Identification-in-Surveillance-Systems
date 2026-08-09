@@ -1,39 +1,40 @@
 """
-Person Re-Identification (Re-ID) Pipeline — PRODUCTION VERSION
+Person Re-Identification (Re-ID) Pipeline - PRODUCTION VERSION
 ===============================================================
 
 WHAT THIS SOLVES
 ----------------
-1. Same person keeps the same ID across the full video — even after leaving
+1. Same person keeps the same ID across the full video - even after leaving
    and re-entering the frame with a new DeepSORT tracker ID.
 
-2. Different people get different IDs — OSNet features with strict thresholds
-   prevent false merges. Tested: inter-person scores typically 0.20-0.45,
-   match threshold 0.65, so false merges cannot happen under normal conditions.
+2. Different people get different IDs - ResNet-50 fine-tuned embeddings with
+   strict thresholds prevent false merges.
 
-3. Ghost tracks (bboxes outside the frame) are silently skipped — they never
+3. Ghost tracks (bboxes outside the frame) are silently skipped - they never
    touch the identity database or cause ID collisions.
 
-4. Re-appearance matching — dedicated appearance-only pass for long gaps
-   (frame_gap > 30) with a lower threshold (0.55) so a person returning
-   after an absence is correctly matched even if their appearance score
-   has dropped slightly due to lighting or angle changes.
+4. Re-appearance matching - dedicated appearance-only pass for long gaps
+   (frame_gap > 25) so a person returning after an absence is correctly
+   matched even if their appearance score has dropped due to lighting/angle changes.
 
-5. Sequential IDs 1…N by first appearance, no gaps, no -1 leaking into output.
+5. Cross-camera consistency - same person seen on multiple cameras (different
+   angles, different times) receives the same global identity.
+
+6. Sequential IDs 1…N by first appearance, no gaps, no -1 leaking into output.
 
 ARCHITECTURE
 ------------
-  OSNet x1_0 (512-dim Re-ID embeddings)        <- primary discriminator
-  + Zonal HSV colour (face / upper / lower)     <- clothing colour
-  + LBP texture (torso region)                  <- fabric pattern
-  + Body proportion (aspect ratio, width)       <- body shape
+  ResNet-50 + metric learning head (512-dim Re-ID embeddings)  <- primary
+  + Zonal HSV colour (face / upper / lower)                     <- clothing colour
+  + LBP texture (torso region)                                  <- fabric pattern
+  + Body proportion (aspect ratio, width)                       <- body shape
   = 698-dim L2-normalised descriptor
 
   Matching passes per frame:
     PASS 0  Hard continuity lock   (same tracker ID, recent gap)
-    PASS 1  Hungarian assignment   (global optimal, MATCH_THRESHOLD=0.65)
-    PASS 2  Fallback greedy        (FALLBACK_THRESHOLD=0.58)
-    PASS 3  Re-appearance          (appearance-only, gap>30, THRESHOLD=0.55)
+    PASS 1  Hungarian assignment   (global optimal matching)
+    PASS 2  Fallback greedy        (remaining good matches)
+    PASS 3  Re-appearance          (appearance-only for long gaps)
     PASS 4  New identity           (truly unseen person)
 
 FIXED BUGS (all retained from previous versions)
@@ -46,6 +47,9 @@ FIXED BUGS (all retained from previous versions)
   Bug 6  Off-screen ghost bboxes (y=587 on 480px frame) caused extraction crash
   Bug 7  Re-appearance after long gap rejected because motion/IOU dragged score
          below threshold even when appearance matched perfectly
+  Bug 8  short_gap_r filter used stable_ids[0] fallback for unseen trackers,
+         causing brand-new trackers to be incorrectly treated as short-gap
+         candidates for Hungarian matching
 """
 
 import cv2
@@ -71,124 +75,64 @@ from reidentification.face_cue import FaceCueExtractor  # optional face-based cu
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReIDConfig:
-    # Image resize for deep model
     RESIZE_H: int = 256
     RESIZE_W: int = 128
 
-    # OSNet thresholds (UNIFORM MODE - relax appearance, strengthen temporal)
-    # For uniforms, appearance matching is unreliable; trust motion/tracking instead
-    MATCH_THRESHOLD_OSNET:        float = 0.62   # LOWERED for uniforms — appearance unreliable
-    FALLBACK_THRESHOLD_OSNET:     float = 0.55   # LOWERED for uniforms — less strict
-    REAPPEAR_THRESHOLD_OSNET:     float = 0.50   # LOWERED for uniforms — weak appearance signals
-    REACTIVATE_THRESHOLD_OSNET:   float = 0.58   # LOWERED for uniforms
+    MATCH_THRESHOLD:        float = 0.72
+    FALLBACK_THRESHOLD:     float = 0.65
+    REAPPEAR_THRESHOLD:     float = 0.62
+    REACTIVATE_THRESHOLD:   float = 0.68
 
-    # ResNet fallback thresholds (looser)
-    MATCH_THRESHOLD_RESNET:       float = 0.52   # LOWERED from 0.55
-    FALLBACK_THRESHOLD_RESNET:    float = 0.45   # LOWERED from 0.48
-    REAPPEAR_THRESHOLD_RESNET:    float = 0.45   # LOWERED from 0.48
-    REACTIVATE_THRESHOLD_RESNET:  float = 0.52   # LOWERED from 0.55
+    W_APPEARANCE: float = 0.55
+    W_MOTION:     float = 0.30
+    W_IOU:        float = 0.15
 
-    # Scoring weights — UNIFORM MODE (motion > appearance)
-    W_APPEARANCE: float = 0.50   # HEAVILY LOWERED for uniforms — appearance identical
-    W_MOTION:     float = 0.35   # HEAVILY RAISED for uniforms — position is key differentiator
-    W_IOU:        float = 0.15   # RAISED for uniforms — spatial overlap matters most
+    REAPPEAR_GAP: int = 25
 
-    # Re-appearance: frame_gap after which motion/IOU are ignored
-    # LOWERED to allow brief appearances to be distinguished
-    REAPPEAR_GAP: int = 25   # LOWERED from 30 — quicker to re-appearance matching
+    SWITCH_MARGIN:    float = 0.35
+    SWITCH_MIN_SCORE: float = 0.92
 
-    # Switch-guard (prevent ID swap during crossings — ULTRA STRICT for uniforms)
-    SWITCH_MARGIN:    float = 0.45   # HEAVILY INCREASED for uniforms — prevent accidental swaps
-    SWITCH_MIN_SCORE: float = 0.96   # HEAVILY INCREASED for uniforms — extremely confident before swapping
+    SWITCH_MARGIN_MOTION_CROSS:    float = 0.45
+    SWITCH_MIN_SCORE_MOTION_CROSS: float = 0.95
 
-    # When a face confidently confirms the SWITCH target (and/or confidently
-    # disagrees with whatever identity is currently locked in), the strict
-    # thresholds above are relaxed to these — face evidence is fundamentally
-    # more trustworthy than body appearance for identical uniforms, so it's
-    # allowed to correct a switch the body-only guard would otherwise block.
     SWITCH_MARGIN_FACE_CONFIRMED:    float = 0.05
     SWITCH_MIN_SCORE_FACE_CONFIRMED: float = 0.55
 
-    # Continuity lock — STRENGTHENED for uniforms (hard to change ID)
-    TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
-    TRACK_LOCK_MIN_SCORE: float = 0.40 # LOWERED threshold but longer duration compensates
+    TRACK_LOCK_GAP:       int   = 300
+    TRACK_LOCK_MIN_SCORE: float = 0.60
 
-    # Gallery
     GALLERY_SIZE:        int = 15
     GALLERY_SAMPLE_RATE: int = 6
 
-    # EMA
     EMA_ALPHA: float = 0.10
     EMA_VEL:   float = 0.25
 
-    # Size gates
-    MIN_CROP_PX:     int   = 8      # min pixels after clamping
+    MIN_CROP_PX:     int   = 8
     MIN_HEIGHT:      int   = 50
     MIN_AREA_RATIO:  float = 0.0008
-    # Duplicate-detection merge (before any tracking/Re-ID even runs): when
-    # YOLO/NMS produces two overlapping boxes for one physical person, they
-    # need to be merged into one BEFORE reaching the tracker/Re-ID — an
-    # unmerged duplicate becomes two separate tracker IDs, which Re-ID will
-    # (correctly, given its inputs) treat as two different people and give
-    # two different global IDs, inflating the person count. 0.75 was too
-    # strict: two real duplicate boxes on one person are often visibly
-    # offset from each other (different crop margins from near-identical
-    # detections), not near-perfectly overlapping — observed case had two
-    # boxes clearly on one person that never crossed 0.75 IoU. Lowered to
-    # 0.5, which still requires substantial overlap (so two genuinely
-    # different people standing close together in a crossing won't get
-    # wrongly merged here) while catching realistic duplicate detections.
     DEDUP_IOU:       float = 0.50
 
-    # Temporal
-    # How long (in frames) an identity stays eligible for re-matching before
-    # being permanently forgotten. This used to be 500 frames (~17 seconds
-    # at 30fps) — nowhere near enough for "recognize the same person if they
-    # return 10+ minutes later" (an explicit requirement). At 30fps, 10
-    # minutes = 18,000 frames; set generously higher for headroom (variable
-    # fps, longer sessions). Tradeoff: identities are held in memory (and
-    # considered as match candidates) for the whole session instead of
-    # being pruned quickly — more candidates in the pool means slightly more
-    # opportunity for confusion between similar-looking people, but that's
-    # the necessary cost of the long-term recognition requirement, not a
-    # bug. Adjust to match your actual video's fps/length if needed.
-    MAX_IDENTITY_GAP:  int = 60000   # ~33 min at 30fps — long-term memory
+    MAX_IDENTITY_GAP:  int = 60000
     REACTIVATE_WINDOW: int = 45
 
-    # Crossing
     CROSSING_IOU_GATE: float = 0.30
 
-    # Motion (CRITICAL for uniforms - position tracking is our lifeline)
-    MOTION_DENOM_COEFF:  float = 1.8   # LOWERED for uniforms — motion signal stays strong longer
-    MOTION_GATE_MIN_GAP: int   = 5     # RAISED for uniforms — require 5+ frame gap before motion gate fires
+    CROSSING_MOTION_IOU_GATE: float = 0.15
 
-    # Multi-cue blend
+    MOTION_DENOM_COEFF:  float = 2.0
+    MOTION_GATE_MIN_GAP: int   = 5
+
     CUE_DEEP:       float = 0.70
     CUE_COLOR_ZONE: float = 0.20
     CUE_TEXTURE:    float = 0.06
     CUE_PROPORTION: float = 0.04
 
-    # Face cue — NOT part of the 698-dim descriptor (kept separate so the
-    # registration module's stable contract is unaffected). Applied as a
-    # heavy override on top of the body-appearance score whenever a
-    # confident face embedding is available on both sides of a comparison.
-    # Faces stay distinctive even in identical uniforms, unlike body
-    # appearance — this directly targets the uniform-crossing failure mode.
-    FACE_WEIGHT:          float = 0.65   # blend weight when a face is available
-    FACE_MIN_SIMILARITY:  float = 0.35   # below this, treat as a mismatch veto
+    FACE_WEIGHT:          float = 0.65
+    FACE_MIN_SIMILARITY:  float = 0.35
 
-    # Grace period before minting a brand-new identity — see PASS 4 comment
-    # in ReIDEngine._assign for why this exists (single-frame re-appearance
-    # failures were permanently splitting one person into two IDs).
-    # Kept short deliberately: each extra grace frame is also an extra
-    # chance for a genuinely new person to accidentally cross the (loose,
-    # uniform-tolerant) reappearance threshold and get wrongly merged into
-    # an existing identity — see REAPPEAR_NO_FACE_PENALTY below.
-    NEW_ID_GRACE_FRAMES: int = 2
+    NEW_ID_GRACE_FRAMES: int = 5
 
-    # Body-only reappearance (no face confirmation available) is penalised
-    # by this much before comparing against T_REAPPEAR — see _score().
-    REAPPEAR_NO_FACE_PENALTY: float = 0.12
+    REAPPEAR_NO_FACE_PENALTY: float = 0.10
 
 
 CFG = ReIDConfig()
@@ -242,7 +186,7 @@ def _valid_bbox(bbox, frame_w, frame_h) -> bool:
 class ResNetReIDBackbone(nn.Module):
     """
     ResNet-50 with a metric-learning projection head.
-    GlobalAvgPool → FC(2048→1024) → BN → ReLU → FC(1024→512) → L2-norm
+    GlobalAvgPool -> FC(2048->1024) -> BN -> ReLU -> FC(1024->512) -> L2-norm
     Produces 512-dim Re-ID embeddings instead of raw 2048-dim ImageNet features.
     """
     def __init__(self):
@@ -441,7 +385,7 @@ class Identity:
         self.count       = 1
         # Best face embedding seen for this identity so far (None until a
         # confident face is first observed). Kept as a single "best" vector
-        # rather than an EMA — a clear frontal face is a much stronger
+        # rather than an EMA - a clear frontal face is a much stronger
         # reference than an average blended with blurry/angled ones.
         self.face_descriptor = face_descriptor.copy() if face_descriptor is not None else None
 
@@ -469,7 +413,7 @@ class Identity:
         self.last_frame  = frame_id
         self.count      += 1
         if face_descriptor is not None:
-            # A fresh confident face detection replaces the stored one — at
+            # A fresh confident face detection replaces the stored one - at
             # minimum equally trustworthy as whatever (possibly none) we
             # had, and this keeps it current if the person's angle changes.
             self.face_descriptor = face_descriptor.copy()
@@ -487,38 +431,25 @@ class Identity:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReIDEngine:
-    def __init__(self, model_name="osnet_x1_0", device="cuda", debug_trace=False):
+    def __init__(self, model_name="resnet50_reid", device="cuda", debug_trace=False):
         self.device    = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.use_osnet = False
-        self.debug_trace = debug_trace   # see _trace() — set True to log every
-                                          # ID decision (lock/assign/switch/new)
-                                          # with the exact scores behind it,
-                                          # instead of having to infer what
-                                          # happened from watching a video
-        self.model     = self._load_model(model_name)
-        self.extractor = MultiCueExtractor(self.device, self.use_osnet)
+        self.debug_trace = debug_trace
+        self.model     = self._load_model()
+        self.extractor = MultiCueExtractor(self.device, use_osnet=False)
         self.face_extractor = FaceCueExtractor()
         if self.face_extractor.enabled:
-            logger.info("✅ Face-based Re-ID cue enabled (helps distinguish identical uniforms)")
-        # Diagnostics: how often is a face actually found? If this stays near
-        # 0%, the face cue can't be helping — worth knowing rather than
-        # guessing when tuning against real footage.
+            logger.info("[OK]  Face-based Re-ID cue enabled")
+
         self._face_attempts = 0
         self._face_hits     = 0
-        self._new_id_grace: dict = {}   # tracker_id -> consecutive PASS4-miss count
+        self._new_id_grace: dict = {}
 
-        if self.use_osnet:
-            self.T_MATCH    = CFG.MATCH_THRESHOLD_OSNET
-            self.T_FALLBACK = CFG.FALLBACK_THRESHOLD_OSNET
-            self.T_REAPPEAR = CFG.REAPPEAR_THRESHOLD_OSNET
-            self.T_REACT    = CFG.REACTIVATE_THRESHOLD_OSNET
-        else:
-            self.T_MATCH    = CFG.MATCH_THRESHOLD_RESNET
-            self.T_FALLBACK = CFG.FALLBACK_THRESHOLD_RESNET
-            self.T_REAPPEAR = CFG.REAPPEAR_THRESHOLD_RESNET
-            self.T_REACT    = CFG.REACTIVATE_THRESHOLD_RESNET
+        self.T_MATCH    = CFG.MATCH_THRESHOLD
+        self.T_FALLBACK = CFG.FALLBACK_THRESHOLD
+        self.T_REAPPEAR = CFG.REAPPEAR_THRESHOLD
+        self.T_REACT    = CFG.REACTIVATE_THRESHOLD
 
-        logger.info(f"Backbone: {'OSNet' if self.use_osnet else 'ResNet-ReID'}  "
+        logger.info(f"Backbone: ResNet-50 + Re-ID head  "
                     f"MATCH={self.T_MATCH}  REAPPEAR={self.T_REAPPEAR}")
 
         self.identity_db:        dict = {}
@@ -534,27 +465,20 @@ class ReIDEngine:
 
     # ── model ──────────────────────────────────────────────────────────────
 
-    def _load_model(self, name):
-        # Skip torchreid import (TensorFlow dependency chain causes hangs)
-        # Use ResNetReIDBackbone directly (ResNet-50 + metric learning head)
+    def _load_model(self):
         m = ResNetReIDBackbone().to(self.device)
 
-        # If a fine-tuned checkpoint exists (see reidentification/training/
-        # train_reid.py), load it. Falls back to the ImageNet-only backbone
-        # exactly as before if the file is missing/empty/unloadable, so
-        # nothing else in the pipeline (registration/embedder.py included)
-        # has to change either way.
-        weights_path = Path(__file__).resolve().parent / "weights" / "best_model.pth"
+        weights_path = Path(__file__).resolve().parent / "weights" / "best_model_cloth.pth"
         if weights_path.exists() and weights_path.stat().st_size > 0:
             try:
                 state = torch.load(weights_path, map_location=self.device)
                 m.load_state_dict(state)
-                logger.info(f"✅ Fine-tuned Re-ID weights loaded from {weights_path} (512-dim embeddings)")
+                logger.info(f"Fine-tuned Re-ID weights loaded from {weights_path} (512-dim embeddings)")
             except Exception as e:
-                logger.warning(f"⚠️  Could not load fine-tuned weights ({e}); "
+                logger.warning(f"[WARN]   Could not load fine-tuned weights ({e}); "
                                 f"using ImageNet-only backbone instead")
         else:
-            logger.info("✅ ResNet-50 + Re-ID head loaded (ImageNet weights only — "
+            logger.info("[OK]  ResNet-50 + Re-ID head loaded (ImageNet weights only - "
                         "no fine-tuned checkpoint found, 512-dim embeddings)")
 
         m.eval()
@@ -576,7 +500,7 @@ class ReIDEngine:
     def _blend_face(self, base_score: float, identity: Identity, face_feat) -> float:
         """Blend a face-similarity override into a base score, when a
         confident face embedding is available on both sides. Faces stay
-        distinctive in identical uniforms, so this is weighted heavily —
+        distinctive in identical uniforms, so this is weighted heavily -
         but it only ever activates when both identity.face_descriptor and
         the current detection's face_feat exist; otherwise it's a no-op
         and behaviour is identical to before this cue was added."""
@@ -584,7 +508,7 @@ class ReIDEngine:
         if face_sim is None:
             return base_score
         if face_sim < CFG.FACE_MIN_SIMILARITY:
-            # Confident face mismatch — veto even a strong body-appearance
+            # Confident face mismatch - veto even a strong body-appearance
             # score, since two different people can't share a face.
             return min(base_score, face_sim)
         return (1 - CFG.FACE_WEIGHT) * base_score + CFG.FACE_WEIGHT * face_sim
@@ -594,15 +518,15 @@ class ReIDEngine:
                          margin: float, min_score: float) -> bool:
         """Whether re-assigning a track from prev_identity to new_identity is
         allowed. Normally requires clearing strict margin/min_score bars
-        (see SWITCH_MARGIN/SWITCH_MIN_SCORE — deliberately hard to trigger,
+        (see SWITCH_MARGIN/SWITCH_MIN_SCORE - deliberately hard to trigger,
         to avoid accidental swaps between identically-uniformed people).
         But when a face is available and clearly says "this is NOT
         prev_identity, it IS new_identity", that's a much more trustworthy
-        signal than body appearance alone — so this relaxes the bar to
+        signal than body appearance alone - so this relaxes the bar to
         SWITCH_*_FACE_CONFIRMED instead. This is what lets a wrong
         assignment made during an occluded crossing (where no face was
         visible) get corrected a few frames later once a face becomes
-        visible again — without it, the strict guard built to prevent
+        visible again - without it, the strict guard built to prevent
         swaps also prevents legitimate corrections."""
         if cand_face_feat is not None:
             new_face_sim  = new_identity.face_similarity(cand_face_feat)
@@ -615,7 +539,7 @@ class ReIDEngine:
 
     def _trace(self, frame_id: int, msg: str):
         """Opt-in decision log (enable with debug_trace=True). Prints exactly
-        which ID decision fired and why, at the moment it happens — grep the
+        which ID decision fired and why, at the moment it happens - grep the
         output for '[TRACE fN' around a frame number you saw go wrong in the
         video (frame ≈ seconds_into_video * fps) to see the real numbers
         behind it, instead of guessing from what the video looks like."""
@@ -632,19 +556,19 @@ class ReIDEngine:
         if gap > CFG.REAPPEAR_GAP:
             face_sim = identity.face_similarity(face_feat)
             if face_sim is not None:
-                # A face is available on both sides — this is a reliable
+                # A face is available on both sides - this is a reliable
                 # signal even in identical uniforms, so use the normal
                 # (lenient) blend.
                 return self._blend_face(app, identity, face_feat)
             # No face on either side: T_REAPPEAR (0.45-0.50) was tuned loose
-            # specifically to tolerate uniform ambiguity — fine for a single
+            # specifically to tolerate uniform ambiguity - fine for a single
             # attempt, but combined with the multi-frame retry grace period
             # (see PASS 4), a genuinely NEW person got repeated chances to
             # cross that loose bar by uniform-driven coincidence, causing
             # false merges (observed: 4 real people collapsed to 3 IDs).
             # Require a distinctly higher raw appearance score here so
             # body-only reappearance is deliberately harder to trigger by
-            # chance — better to occasionally split one real person into
+            # chance - better to occasionally split one real person into
             # two IDs than to merge two different real people into one.
             return app - CFG.REAPPEAR_NO_FACE_PENALTY
 
@@ -661,10 +585,48 @@ class ReIDEngine:
     # ── crossings ──────────────────────────────────────────────────────────
 
     def _crossings(self, candidates) -> set:
+        """IOU-based crossing detection: bounding boxes overlap significantly."""
         pairs = set()
         for i in range(len(candidates)):
             for j in range(i+1, len(candidates)):
                 if _iou(candidates[i]['bbox'], candidates[j]['bbox']) >= CFG.CROSSING_IOU_GATE:
+                    pairs.add((i,j)); pairs.add((j,i))
+        return pairs
+
+    def _motion_crossings(self, candidates) -> set:
+        """Motion-based crossing detection: two people moving toward each other.
+        Uses velocity vectors from each candidate's previously assigned identity.
+        Only fires when IOU >= CROSSING_MOTION_IOU_GATE so it doesn't trigger
+        on distant people who happen to face each other."""
+        pairs = set()
+        for i in range(len(candidates)):
+            for j in range(i+1, len(candidates)):
+                iou = _iou(candidates[i]['bbox'], candidates[j]['bbox'])
+                if iou < CFG.CROSSING_MOTION_IOU_GATE:
+                    continue
+                tid_i = candidates[i]['tid']
+                tid_j = candidates[j]['tid']
+                sid_i = self.track_to_identity.get(tid_i)
+                sid_j = self.track_to_identity.get(tid_j)
+                if sid_i is None or sid_j is None:
+                    continue
+                ident_i = self.identity_db.get(sid_i)
+                ident_j = self.identity_db.get(sid_j)
+                if ident_i is None or ident_j is None:
+                    continue
+                # Get velocity vectors
+                vxi, vyi = ident_i.velocity
+                vxj, vyj = ident_j.velocity
+                # Get current centers
+                ci = _bbox_center(candidates[i]['bbox'])
+                cj = _bbox_center(candidates[j]['bbox'])
+                # Direction from i to j and j to i
+                dir_ij = cj - ci
+                dir_ji = ci - cj
+                # Check if each person's velocity points toward the other
+                vel_i_toward_j = np.dot(np.array([vxi, vyi]), dir_ij) > 0
+                vel_j_toward_i = np.dot(np.array([vxj, vyj]), dir_ji) > 0
+                if vel_i_toward_j and vel_j_toward_i:
                     pairs.add((i,j)); pairs.add((j,i))
         return pairs
 
@@ -692,7 +654,27 @@ class ReIDEngine:
         used:        set  = set()
         stable_ids        = list(self.identity_db.keys())
         cross             = self._crossings(candidates)
+        motion_cross      = self._motion_crossings(candidates)
         sid_to_col: dict  = {}
+
+        # Helper: is this a motion-confirmed crossing (both IOU and motion agree)?
+        def _is_hard_cross(i, j):
+            return (i,j) in cross and (i,j) in motion_cross
+
+        # Helper: detect swap scenario — two candidates would exchange IDs
+        def _would_swap(r, new_sid):
+            tid_r = candidates[r]['tid']
+            old_sid = self.track_to_identity.get(tid_r)
+            if old_sid is None:
+                return False
+            for other_r in range(len(candidates)):
+                if other_r == r:
+                    continue
+                other_tid = candidates[other_r]['tid']
+                other_new = assigned.get(other_r) or self.track_to_identity.get(other_tid)
+                if other_new == old_sid and self.track_to_identity.get(other_tid) == new_sid:
+                    return True
+            return False
 
         # ── Score matrix ──────────────────────────────────────────────────
         if stable_ids:
@@ -737,11 +719,13 @@ class ReIDEngine:
         if stable_ids:
             rem_r = [r for r in range(len(candidates)) if r not in locked_rows]
             rem_c = [c for c in range(len(stable_ids)) if c not in locked_cols]
-            # Only consider candidates with short frame_gap for motion-aware scoring
+            # Only consider candidates with short frame_gap for motion-aware scoring.
+            # Trackers with no previous identity are NOT short-gap candidates.
             short_gap_r = [r for r in rem_r
-                           if frame_id - self.identity_db.get(
-                               self.track_to_identity.get(candidates[r]['tid'],
-                               stable_ids[0]), Identity(0, np.zeros(10), [0,0,1,1], 0)
+                           if candidates[r]['tid'] in self.track_to_identity and
+                           frame_id - self.identity_db.get(
+                               self.track_to_identity[candidates[r]['tid']],
+                               Identity(0, np.zeros(10), [0,0,1,1], 0)
                            ).last_frame <= CFG.REAPPEAR_GAP]
             # Fall back to all rem_r if filtering leaves nothing
             use_r = short_gap_r if short_gap_r else rem_r
@@ -755,16 +739,31 @@ class ReIDEngine:
                     if s < self.T_MATCH or sid in used:
                         continue
                     is_cross = any((r,j) in cross for j in range(len(candidates)))
+                    is_hard_cross = any(_is_hard_cross(r, j) for j in range(len(candidates)))
                     prev = self.track_to_identity.get(candidates[r]['tid'])
                     if prev is not None and prev in sid_to_col and prev != sid:
+                        # Swap detection: if this would swap IDs with another
+                        # track in a crossing, block unconditionally.
+                        if _would_swap(r, sid) and is_cross:
+                            self._trace(frame_id, f"PASS1 SWAP BLOCK: tid={candidates[r]['tid']} "
+                                        f"{prev}<->{sid} crossing swap detected")
+                            continue
                         ps = float(score_matrix[r, sid_to_col[prev]])
-                        mg = CFG.SWITCH_MARGIN * (1.5 if is_cross else 1.0)
-                        ma = CFG.SWITCH_MIN_SCORE * (1.05 if is_cross else 1.0)
+                        if is_hard_cross:
+                            mg = CFG.SWITCH_MARGIN_MOTION_CROSS
+                            ma = CFG.SWITCH_MIN_SCORE_MOTION_CROSS
+                        elif is_cross:
+                            mg = CFG.SWITCH_MARGIN * 1.5
+                            ma = CFG.SWITCH_MIN_SCORE * 1.05
+                        else:
+                            mg = CFG.SWITCH_MARGIN
+                            ma = CFG.SWITCH_MIN_SCORE
                         allowed = self._switch_allowed(
                                 s, ps, candidates[r].get('face_feat'),
                                 self.identity_db[sid], self.identity_db.get(prev), mg, ma)
                         self._trace(frame_id, f"PASS1 SWITCH tid={candidates[r]['tid']} "
                                     f"{prev}->{sid}: new_s={s:.3f} prev_s={ps:.3f} "
+                                    f"is_cross={is_cross} is_hard_cross={is_hard_cross} "
                                     f"has_face={candidates[r].get('face_feat') is not None} "
                                     f"{'ALLOWED' if allowed else 'BLOCKED'}")
                         if not allowed:
@@ -777,6 +776,8 @@ class ReIDEngine:
             for i, cand in enumerate(candidates):
                 if i in assigned:
                     continue
+                is_cross = any((i,j) in cross for j in range(len(candidates)))
+                is_hard_cross = any(_is_hard_cross(i, j) for j in range(len(candidates)))
                 best_sid, best_s = None, -1.0
                 for c, sid in enumerate(stable_ids):
                     if sid in used:
@@ -788,13 +789,27 @@ class ReIDEngine:
                     continue
                 prev = self.track_to_identity.get(cand['tid'])
                 if prev is not None and prev in sid_to_col and prev != best_sid:
+                    if _would_swap(i, best_sid) and is_cross:
+                        self._trace(frame_id, f"PASS2 SWAP BLOCK: tid={cand['tid']} "
+                                    f"{prev}<->{best_sid} crossing swap detected")
+                        continue
                     ps = float(score_matrix[i, sid_to_col[prev]])
+                    if is_hard_cross:
+                        mg = CFG.SWITCH_MARGIN_MOTION_CROSS
+                        ma = CFG.SWITCH_MIN_SCORE_MOTION_CROSS
+                    elif is_cross:
+                        mg = CFG.SWITCH_MARGIN * 1.5
+                        ma = CFG.SWITCH_MIN_SCORE * 1.05
+                    else:
+                        mg = CFG.SWITCH_MARGIN
+                        ma = CFG.SWITCH_MIN_SCORE
                     allowed = self._switch_allowed(
                             best_s, ps, cand.get('face_feat'),
                             self.identity_db[best_sid], self.identity_db.get(prev),
-                            CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                            mg, ma)
                     self._trace(frame_id, f"PASS2 SWITCH tid={cand['tid']} "
                                 f"{prev}->{best_sid}: new_s={best_s:.3f} prev_s={ps:.3f} "
+                                f"is_cross={is_cross} is_hard_cross={is_hard_cross} "
                                 f"has_face={cand.get('face_feat') is not None} "
                                 f"{'ALLOWED' if allowed else 'BLOCKED'}")
                     if not allowed:
@@ -810,6 +825,8 @@ class ReIDEngine:
             for i, cand in enumerate(candidates):
                 if i in assigned:
                     continue
+                is_cross = any((i,j) in cross for j in range(len(candidates)))
+                is_hard_cross = any(_is_hard_cross(i, j) for j in range(len(candidates)))
                 best_sid, best_s = None, -1.0
                 for c, sid in enumerate(stable_ids):
                     if sid in used:
@@ -825,28 +842,42 @@ class ReIDEngine:
                     # FIX: PASS 3 used to reassign a tracker's identity purely
                     # based on crossing T_REAPPEAR, with NO check against
                     # whatever identity that tracker was already carrying
-                    # from earlier this frame or a prior frame — unlike
+                    # from earlier this frame or a prior frame - unlike
                     # PASS 1/2, which both require clearing the switch-guard
                     # before overriding an existing assignment. This let a
                     # low-confidence reappearance score silently steal a
                     # track from its correct identity, right after PASS 2's
                     # switch-guard had already (correctly) blocked the same
-                    # move — the exact swap traced at frame 252 (tid=9
+                    # move - the exact swap traced at frame 252 (tid=9
                     # blocked 3->1 by PASS2, then done anyway by PASS3).
                     prev = self.track_to_identity.get(cand['tid'])
                     if prev is not None and prev in sid_to_col and prev != best_sid:
+                        if _would_swap(i, best_sid) and is_cross:
+                            self._trace(frame_id, f"PASS3 SWAP BLOCK: tid={cand['tid']} "
+                                        f"{prev}<->{best_sid} crossing swap detected")
+                            continue
                         ps = float(score_matrix[i, sid_to_col[prev]])
+                        if is_hard_cross:
+                            mg = CFG.SWITCH_MARGIN_MOTION_CROSS
+                            ma = CFG.SWITCH_MIN_SCORE_MOTION_CROSS
+                        elif is_cross:
+                            mg = CFG.SWITCH_MARGIN * 1.5
+                            ma = CFG.SWITCH_MIN_SCORE * 1.05
+                        else:
+                            mg = CFG.SWITCH_MARGIN
+                            ma = CFG.SWITCH_MIN_SCORE
                         allowed = self._switch_allowed(
                                 best_s, ps, cand.get('face_feat'),
                                 self.identity_db[best_sid], self.identity_db.get(prev),
-                                CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                                mg, ma)
                         self._trace(frame_id, f"PASS3 SWITCH tid={cand['tid']} "
                                     f"{prev}->{best_sid}: new_s={best_s:.3f} prev_s={ps:.3f} "
+                                    f"is_cross={is_cross} is_hard_cross={is_hard_cross} "
                                     f"has_face={cand.get('face_feat') is not None} "
                                     f"{'ALLOWED' if allowed else 'BLOCKED'}")
                         if not allowed:
                             continue   # leave unassigned this frame; PASS4 grace retries later
-                    logger.debug(f"  Re-appearance: tracker {cand['tid']} → "
+                    logger.debug(f"  Re-appearance: tracker {cand['tid']} -> "
                                  f"stable_id {best_sid}  score={best_s:.3f}")
                     self._trace(frame_id, f"PASS3 reappear: tid={cand['tid']} -> sid={best_sid} "
                                 f"score={best_s:.3f} (T_REAPPEAR={self.T_REAPPEAR:.3f}) "
@@ -855,7 +886,7 @@ class ReIDEngine:
 
         # ── PASS 4: new identities ────────────────────────────────────────
         # FIX: a candidate that fails PASS 1-3 on a SINGLE frame used to get
-        # a brand-new permanent identity immediately — meaning a person
+        # a brand-new permanent identity immediately - meaning a person
         # re-entering frame had exactly one frame's chance to match their
         # old identity, with no retry. If that one frame had a bad angle,
         # no visible face, or a mediocre appearance score (common right at
@@ -865,7 +896,7 @@ class ReIDEngine:
         #
         # Grace period: hold off minting a new identity for a tracker id
         # until it has failed matching for CFG.NEW_ID_GRACE_FRAMES in a row.
-        # Only applies when other identities already exist (stable_ids) —
+        # Only applies when other identities already exist (stable_ids) -
         # the very first person(s) ever seen still get an ID immediately,
         # since there's nothing for them to be a re-appearance OF.
         for i, cand in enumerate(candidates):
@@ -894,7 +925,7 @@ class ReIDEngine:
             self.track_to_identity[cand['tid']] = sid
             self.track_last_seen[cand['tid']]   = frame_id
             self._pending.pop(cand['tid'], None)
-            self._new_id_grace.pop(cand['tid'], None)   # matched — reset grace
+            self._new_id_grace.pop(cand['tid'], None)   # matched - reset grace
 
         if self.debug_trace:
             state = {candidates[i]['tid']: sid for i, sid in assigned.items()}
@@ -969,18 +1000,78 @@ class ReIDEngine:
     def finalize_clustering(self):
         if self.face_extractor.enabled and self._face_attempts > 0:
             rate = 100.0 * self._face_hits / self._face_attempts
-            logger.info(f"📊 Face cue: detected on {self._face_hits}/{self._face_attempts} "
-                        f"person-detections ({rate:.1f}%) — "
-                        f"{'low rate, faces mostly not helping here' if rate < 15 else 'active and contributing to matches'}")
+            logger.info(f"Face cue: detected on {self._face_hits}/{self._face_attempts} "
+                        f"person-detections ({rate:.1f}%)")
         if self.track_to_identity:
             self.id_mapping = dict(self.track_to_identity)
             self.consolidated_features = {
                 sid: ident.descriptor for sid, ident in self.identity_db.items()
             }
-            logger.info(f"✅ {len(self.id_mapping)} tracker IDs → "
-                        f"{len(self.consolidated_features)} stable identities")
+            pre_count = len(self.consolidated_features)
+            merged = self._merge_similar_identities(threshold=0.99)
+            if merged:
+                self.consolidated_features = {}
+                for new_sid, members in merged.items():
+                    descs = [self.identity_db[old_sid].descriptor for old_sid in members
+                             if old_sid in self.identity_db]
+                    if descs:
+                        self.consolidated_features[new_sid] = _normalize(np.mean(descs, 0))
+                    else:
+                        self.consolidated_features[new_sid] = self.identity_db[members[0]].descriptor
+                logger.info(f"[OK]  {len(self.id_mapping)} tracker IDs -> "
+                            f"{pre_count} pre-merge -> {len(merged)} stable identities")
+            else:
+                logger.info(f"[OK]  {len(self.id_mapping)} tracker IDs -> "
+                            f"{len(self.consolidated_features)} stable identities")
         else:
             self.id_mapping = self._offline_cluster()
+
+    def _merge_similar_identities(self, threshold=0.72):
+        sids = sorted(self.consolidated_features.keys())
+        if len(sids) < 2:
+            return None
+        # Build time ranges per identity from metadata
+        id_ranges = {sid: [999999, -1] for sid in sids}
+        for sid in sids:
+            if sid in self.person_metadata:
+                meta = self.person_metadata[sid]
+                id_ranges[sid][0] = min(id_ranges[sid][0], meta['first_seen'])
+                id_ranges[sid][1] = max(id_ranges[sid][1], meta['last_seen'])
+        parent = {sid: sid for sid in sids}
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            pa, pb = find(a), find(b)
+            if pa != pb:
+                parent[pa] = pb
+        for i in range(len(sids)):
+            for j in range(i+1, len(sids)):
+                a, b = sids[i], sids[j]
+                sim = _cosine(self.consolidated_features[a], self.consolidated_features[b])
+                # Only merge if temporally disjoint (same person can't be in two places)
+                ra, rb = id_ranges[a], id_ranges[b]
+                overlap = not (ra[1] < rb[0] or rb[1] < ra[0])
+                if sim >= threshold and not overlap:
+                    union(a, b)
+        groups = {}
+        for sid in sids:
+            groups.setdefault(find(sid), []).append(sid)
+        if len(groups) == len(sids):
+            return None
+        merged = {}
+        new_id = 1
+        for root in sorted(groups.keys()):
+            members = groups[root]
+            for old_sid in members:
+                for tid, sid in list(self.id_mapping.items()):
+                    if sid == old_sid:
+                        self.id_mapping[tid] = new_id
+            merged[new_id] = members
+            new_id += 1
+        return merged
 
     def _offline_cluster(self):
         cons = {pid: _normalize(np.array(feats).mean(0))
@@ -994,7 +1085,7 @@ class ReIDEngine:
 
         for i, a in enumerate(ids):
             for b in ids[i+1:]:
-                if _cosine(cons[a], cons[b]) > 0.82:
+                if _cosine(cons[a], cons[b]) > 0.92:
                     pa, pb = find(a), find(b)
                     if pa != pb: parent[pa] = pb
 
@@ -1048,7 +1139,7 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
     frame_id = 0
 
     logger.info("=" * 60)
-    logger.info("▶  Re-ID pipeline")
+    logger.info("[>]   Re-ID pipeline")
     logger.info("=" * 60)
 
     while True:
@@ -1066,20 +1157,21 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
     cap.release()
     engine.finalize_clustering()
 
-    # Resolve any remaining None consolidated_ids
+    # Apply merged mapping from finalize_clustering
     for fid in sorted(results.keys()):
         for p in results[fid]:
-            if p.get('consolidated_id') is None:
-                tid = p.get('id')
-                if tid in engine.track_to_identity:
-                    p['consolidated_id'] = engine.track_to_identity[tid]
+            cid = p.get('consolidated_id')
+            if cid is None and p.get('id') in engine.track_to_identity:
+                cid = engine.track_to_identity[p['id']]
+            if cid is not None:
+                p['consolidated_id'] = engine.get_consolidated_id(p['id'])
 
     # Renumber 1…N by first appearance, skip -1 (ghost tracks)
     first_seen = {}
     for fid in sorted(results.keys()):
         for p in results[fid]:
             cid = p.get('consolidated_id')
-            if cid is not None and cid not in first_seen:
+            if cid is not None and cid != -1 and cid not in first_seen:
                 first_seen[cid] = fid
 
     remap = {cid: idx+1 for idx, cid in enumerate(
@@ -1091,13 +1183,35 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
             cid = p.get('consolidated_id')
             p['consolidated_id'] = remap.get(cid, -1)
 
+    # Add consolidated features to output (for cross-camera matching)
+    # Features MUST use the same remapped IDs as results["consolidated_id"]
+    remapped_features = {}
+    remapped_stable = {}
+    for orig_sid, feat in engine.consolidated_features.items():
+        new_sid = remap.get(orig_sid)
+        if new_sid is not None:
+            remapped_features[str(new_sid)] = feat.tolist()
+            remapped_stable[str(new_sid)] = {
+                "first_appearance": min(
+                    fid for fid, people in results.items()
+                    for p in people if p.get("consolidated_id") == new_sid
+                ),
+                "count": engine.identity_db[orig_sid].count if orig_sid in engine.identity_db else 0,
+            }
+
+    out_data = {
+        "frames": results,
+        "consolidated_features": remapped_features,
+        "stable_ids": remapped_stable,
+    }
+
     Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_json_path, 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump(out_data, f, indent=4)
 
     valid_ids = set(p['consolidated_id'] for fid in results.values()
                     for p in fid if p.get('consolidated_id', -1) != -1)
-    logger.info(f"\n✅ Re-ID complete | stable IDs: {sorted(valid_ids)}")
+    logger.info(f"\n[OK]  Re-ID complete | stable IDs: {sorted(valid_ids)}")
     logger.info(f"   Output: {output_json_path}")
     return engine, results
 
@@ -1150,7 +1264,7 @@ def diagnose(video_path, tracking_json_path, device="cuda", max_frames=300):
     print(f"\n{'='*55}")
     print(f"Re-ID DIAGNOSTIC  (first {frame_id} frames)")
     print(f"{'='*55}")
-    print(f"Backbone  : {'OSNet' if engine.use_osnet else 'ResNet-50 + Re-ID head'}")
+    print(f"Backbone  : ResNet-50 + Re-ID head")
     print(f"Descriptor: {MultiCueExtractor.TOTAL_DIM} dims")
     print(f"Frame size: {frame_w}x{frame_h}")
     print(f"Thresholds: MATCH={engine.T_MATCH}  "
@@ -1162,8 +1276,8 @@ def diagnose(video_path, tracking_json_path, device="cuda", max_frames=300):
     for pid in all_pids:
         ok = len(all_feats.get(pid, [])); fail = fail_count.get(pid, 0)
         total = ok + fail; pct = 100*ok/total if total else 0
-        print(f"  Tracker {pid:3d}: {ok}/{total} ({pct:.0f}%)  "
-              f"{'✅' if pct > 70 else '⚠️  failed'}")
+        flag = 'OK' if pct > 70 else 'FAIL'
+        print(f"  Tracker {pid:3d}: {ok}/{total} ({pct:.0f}%)  [{flag}]")
         for bbox in fail_bboxes.get(pid, []):
             x1,y1,x2,y2 = map(int,bbox)
             cx1=max(0,x1); cy1=max(0,y1)
@@ -1172,8 +1286,8 @@ def diagnose(video_path, tracking_json_path, device="cuda", max_frames=300):
             if cw < CFG.MIN_CROP_PX or ch < CFG.MIN_CROP_PX:
                 reason = f"off-screen/degenerate (clamped {cw}x{ch})"
             else:
-                reason = f"model error on {cw}x{ch} crop — check DEBUG log"
-            print(f"    bbox={bbox}  → {reason}")
+                reason = f"model error on {cw}x{ch} crop - check DEBUG log"
+            print(f"    bbox={bbox}  -> {reason}")
 
     if len(all_feats) >= 2:
         ids = sorted(all_feats.keys())
@@ -1184,9 +1298,9 @@ def diagnose(video_path, tracking_json_path, device="cuda", max_frames=300):
         for i in range(len(ids)):
             for j in range(i+1, len(ids)):
                 sim = _cosine(avg[ids[i]], avg[ids[j]]); inter_sims.append(sim)
-                flag = ('✅' if sim < 0.50 else
-                        '⚠️  close' if sim < 0.65 else
-                        '❌ too similar → raise MATCH_THRESHOLD')
+                flag = ('[OK]' if sim < 0.50 else
+                        '[WARN] close' if sim < 0.65 else
+                        '[FAIL] too similar -> raise MATCH_THRESHOLD')
                 print(f"  Tracker {int(ids[i])} vs {int(ids[j])}: {sim:.3f}  {flag}")
 
         print("\nIntra-person similarity (WANT > 0.70):")
@@ -1199,19 +1313,19 @@ def diagnose(video_path, tracking_json_path, device="cuda", max_frames=300):
                     for i in range(min(10, len(feats)))
                     for j in range(i+1, min(10, len(feats)))]
             intra_sims.extend(sims)
+            flag = '[OK]' if np.mean(sims) > 0.70 else '[WARN] low'
             print(f"  Tracker {int(pid):3d}: avg={np.mean(sims):.3f}  "
-                  f"min={np.min(sims):.3f}  "
-                  f"{'✅' if np.mean(sims) > 0.70 else '⚠️  low'}")
+                  f"min={np.min(sims):.3f}  {flag}")
 
         if inter_sims and intra_sims:
             max_inter = max(inter_sims); min_intra = min(intra_sims)
             ideal = (max_inter + min_intra) / 2
-            print(f"\n  💡 Suggested MATCH_THRESHOLD ≈ {ideal:.2f}")
+            print(f"\n  [INFO] Suggested MATCH_THRESHOLD ~ {ideal:.2f}")
             gap = min_intra - max_inter
-            print(f"     Discriminability gap: {gap:.3f}  "
-                  f"{'✅ good' if gap > 0.20 else '⚠️  tight — consider better lighting/resolution'}")
+            note = '[OK] good' if gap > 0.20 else '[WARN] tight'
+            print(f"     Discriminability gap: {gap:.3f}  {note}")
     else:
-        print(f"\n  ℹ️  Only {len(all_feats)} tracker(s) with valid features.")
+        print(f"\n  [INFO] Only {len(all_feats)} tracker(s) with valid features.")
         if len(all_feats) == 1:
             pid = list(all_feats.keys())[0]
             feats = all_feats[pid]
@@ -1219,10 +1333,10 @@ def diagnose(video_path, tracking_json_path, device="cuda", max_frames=300):
                 sims = [_cosine(feats[i], feats[j])
                         for i in range(min(10, len(feats)))
                         for j in range(i+1, min(10, len(feats)))]
+                flag = '[OK]' if np.mean(sims) > 0.70 else '[WARN]'
                 print(f"  Intra-person consistency (Tracker {pid}): "
-                      f"avg={np.mean(sims):.3f}  min={np.min(sims):.3f}  "
-                      f"{'✅' if np.mean(sims) > 0.70 else '⚠️'}")
-                print(f"  This person will keep the same ID across the video ✅")
+                      f"avg={np.mean(sims):.3f}  min={np.min(sims):.3f}  {flag}")
+                print(f"  This person will keep the same ID across the video [OK]")
 
     print(f"{'='*55}\n")
 
@@ -1243,10 +1357,10 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if not Path(video).exists():
-        print(f"❌ Video not found: {video}")
+        print(f"[FAIL] Video not found: {video}")
         sys.exit(1)
     if not Path(tracking_json).exists():
-        print(f"❌ Tracking JSON not found: {tracking_json}")
+        print(f"[FAIL] Tracking JSON not found: {tracking_json}")
         print("   Run: python main.py --step 2")
         sys.exit(1)
 

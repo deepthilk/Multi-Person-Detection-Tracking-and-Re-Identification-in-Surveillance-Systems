@@ -16,7 +16,8 @@ from registration.identity_db import IdentityDatabase
 logger = logging.getLogger(__name__)
 
 
-def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -> dict:
+def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
+                    person_id: str = None, flag: str = "normal", details: str = "") -> dict:
     """
     Register a known person from one or more images.
 
@@ -33,6 +34,9 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
         image_paths: list of file paths to photos of this person.
         db: optional existing IdentityDatabase instance (mainly for tests /
             batch registration so the JSON file isn't reloaded every call).
+        person_id: optional official / badge / case ID.
+        flag: watch-list status (one of identity_db.FLAGS, default "normal").
+        details: free-text notes / description.
 
     Returns:
         The stored record for this person (dict), or raises ValueError if
@@ -56,8 +60,14 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
 
     stored_paths = _copy_images(name, image_paths)
 
-    db = db or IdentityDatabase()
-    db.add_person(name, embeddings, image_paths=stored_paths)
+    # NOTE: use an explicit None check here — `db or IdentityDatabase()` would
+    # discard a valid-but-empty database, since an empty IdentityDatabase
+    # instance is falsy (implements __len__), which silently broke bulk
+    # registration on a fresh DB ("0 person(s) in the database").
+    if db is None:
+        db = IdentityDatabase()
+    db.add_person(name, embeddings, image_paths=stored_paths,
+                  person_id=person_id, flag=flag, details=details)
 
     logger.info(
         f"✅ '{name}' registered: {len(embeddings)}/{len(image_paths)} images used"

@@ -10,12 +10,12 @@ meaningless.
 
 So instead of inventing a second, incompatible embedding model, this module
 imports and reuses Deepthi's existing `ReIDEngine` from
-`reidentification/reid_main.py` — it is only ever CALLED, never edited.
+`reidentification/reid_main.py` - it is only ever CALLED, never edited.
 This mirrors exactly how Lekha's `multicamera` module imports
 `PersonDetector` / `PersonTracker` without touching them.
 
 If Deepthi later swaps the backbone (e.g. real OSNet instead of the
-ResNet-50 fallback), nothing here needs to change — `extract_feature()`
+ResNet-50 fallback), nothing here needs to change - `extract_feature()`
 still returns whatever the current descriptor is.
 """
 

@@ -12,11 +12,13 @@ CHANGE FROM ORIGINAL:
     Setting max_age=5 expires ghost tracks quickly so they never drift
     far outside the frame boundaries.
 
-  n_init:             3   →  2
-    Reason: Faster track confirmation means fewer missed detections at the
-    start of a person's appearance. With n_init=2, a track is confirmed
-    after 2 consecutive detections instead of 3, reducing the chance that
-    a person's first frames are lost to the Re-ID gallery.
+  n_init:             3   →  1
+    Reason: n_init=1 initialises a track from a single detection, which is
+    essential for people who only appear briefly (e.g. 1 frame at the edge
+    of the frame) that n_init=2 would silently discard. Without this,
+    those people never receive a DeepSORT tracker ID at all, never reach
+    the Re-ID engine, and are completely invisible in the output — causing
+    false negatives in cross-camera matching.
 
   max_cosine_distance: 0.2 →  0.3
     Reason: Slightly looser appearance matching inside DeepSORT lets it
@@ -39,10 +41,10 @@ class PersonTracker:
 
     def __init__(
         self,
-        max_age: int            = 5,    # CHANGED from 30 — prevents off-screen ghost bboxes
-        n_init: int             = 2,    # CHANGED from 3  — faster track confirmation
+        max_age: int            = 30,   # Keep IDs alive through crossings/occlusions
+        n_init: int             = 1,    # Single-detection track confirmation
         max_iou_distance: float = 0.7,
-        max_cosine_distance: float = 0.3,  # CHANGED from 0.2 — better occlusion handling
+        max_cosine_distance: float = 0.3,  # Re-ID switch guard prevents crossing swaps
     ):
         self.tracker = DeepSort(
             max_age             = max_age,

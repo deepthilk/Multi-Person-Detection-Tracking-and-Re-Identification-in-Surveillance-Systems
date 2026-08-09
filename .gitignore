@@ -16,4 +16,7 @@ models/
 venv/
 reidentification/dataset/
 *.pth
+reidentification/weights/
 reidentification/model/model.py
+demo/
+demo_outputs/

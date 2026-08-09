@@ -62,9 +62,12 @@ def draw_tracks(frame, tracks):
         
         color = colors[track_id]
         
-        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame_copy, f"ID {track_id}", (x1, y1 - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 3)
+        (tw, th), _ = cv2.getTextSize(f"ID {track_id}", cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        tx, ty = x1, max(y1 - 8, th + 4)
+        cv2.rectangle(frame_copy, (tx, ty - th - 4), (tx + tw + 4, ty + 2), (0, 0, 0), -1)
+        cv2.putText(frame_copy, f"ID {track_id}", (tx + 2, ty - 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     
     return frame_copy
 
@@ -77,7 +80,8 @@ def draw_reid_matches(frame, reid_data):
     deduped = []
     best_by_id = {}
     for person in reid_data:
-        person_id = person.get('consolidated_id', person['id'])
+        tid = person['id']
+        cid = person.get('consolidated_id', tid)
         bbox = person['bbox']
         matches = person.get('matches', [])
         score = float(matches[0]['similarity']) if matches else 0.0
@@ -85,16 +89,17 @@ def draw_reid_matches(frame, reid_data):
         area = max(0, x2 - x1) * max(0, y2 - y1)
 
         candidate = {
-            'person_id': person_id,
+            'tid': tid,
+            'cid': cid,
             'bbox': bbox,
             'matches': matches,
             'score': score,
             'area': area,
         }
 
-        prev = best_by_id.get(person_id)
+        prev = best_by_id.get(cid)
         if prev is None or (score, area) > (prev['score'], prev['area']):
-            best_by_id[person_id] = candidate
+            best_by_id[cid] = candidate
 
     # Remove near-duplicate boxes (50% IoU threshold) and keep the stronger one.
     for candidate in sorted(best_by_id.values(), key=lambda x: (x['score'], x['area']), reverse=True):
@@ -107,20 +112,24 @@ def draw_reid_matches(frame, reid_data):
             deduped.append(candidate)
 
     for person in deduped:
-        person_id = person['person_id']
+        tid = person['tid']
+        cid = person['cid']
         x1, y1, x2, y2 = person['bbox']
         matches = person.get('matches', [])
         
-        color = (0, 255, 255)  # Cyan
-        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
+        color = (0, 255, 255)
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 3)
         
-        label = f"ID {person_id}"
+        label = f"ID {cid}"
         if matches:
             best_match = matches[0]
             label += f" ({best_match['similarity']:.2f})"
         
-        cv2.putText(frame_copy, label, (x1, y1 - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        tx, ty = x1, max(y1 - 8, th + 4)
+        cv2.rectangle(frame_copy, (tx, ty - th - 4), (tx + tw + 4, ty + 2), (0, 0, 0), -1)
+        cv2.putText(frame_copy, label, (tx + 2, ty - 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     
     return frame_copy
 
@@ -174,6 +183,9 @@ def visualize_results(video_path, detections_json, tracking_json,
     detections = load_json(detections_json) if detections_json else {}
     tracks = load_json(tracking_json) if tracking_json else {}
     reid_res = load_json(reid_json) if reid_json else {}
+    # Handle new format: {"frames": {...}, "consolidated_features": ...}
+    if "frames" in reid_res:
+        reid_res = reid_res["frames"]
     
     frame_id = 0
     
@@ -218,6 +230,8 @@ def visualize_results(video_path, detections_json, tracking_json,
 def render_reid_video(video_path, reid_json, output_video_path):
     """Render a Re-ID overlay video without opening a display window."""
     reid_res = load_json(reid_json) if reid_json else {}
+    if "frames" in reid_res:
+        reid_res = reid_res["frames"]
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -230,19 +244,12 @@ def render_reid_video(video_path, reid_json, output_video_path):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    out = None
-    for codec in ("mp4v", "avc1", "H264"):
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        writer = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        if writer.isOpened():
-            out = writer
-            logger.info(f"Using video codec: {codec}")
-            break
-
+    final_path = _browser_playable_path(output_video_path)
+    out, final_path = _open_video_writer(final_path, fps, (width, height))
     if out is None:
         cap.release()
-        logger.error("Failed to initialize VideoWriter with available codecs")
-        return False
+        logger.error("Failed to initialize VideoWriter for browser playback")
+        return None
 
     frame_id = 0
     while True:
@@ -257,9 +264,10 @@ def render_reid_video(video_path, reid_json, output_video_path):
 
     cap.release()
     out.release()
-    _reencode_for_browser(output_video_path)
-    logger.info(f"✅ Rendered Re-ID video: {output_video_path}")
-    return True
+    if Path(final_path).suffix.lower() == ".mp4":
+        _reencode_for_browser(final_path)
+    logger.info(f"✅ Rendered Re-ID video: {final_path}")
+    return final_path
 
 
 def _find_ffmpeg():
@@ -280,6 +288,43 @@ def _find_ffmpeg():
         return str(candidate)
 
     return None
+
+
+def _browser_playable_path(output_video_path):
+    """Choose the file format a web browser will actually play.
+
+    When ffmpeg is unavailable, OpenCV can only write mp4v (MPEG-4 Part 2),
+    which Chrome/Firefox/Edge all refuse to play. In that case return a .webm
+    sibling path so the renderer writes a browser-native VP8 file instead.
+    """
+    if _find_ffmpeg():
+        return str(output_video_path)
+    return str(Path(output_video_path).with_suffix(".webm"))
+
+
+def _open_video_writer(output_video_path, fps, size):
+    """Open a VideoWriter that produces a browser-playable file.
+
+    - .webm target: VP8, which every browser plays natively (OpenCV can encode
+      VP8 without any external encoder).
+    - .mp4 target: H.264 (avc1) then mp4v; the caller re-encodes the file to
+      H.264 with ffmpeg afterwards, so the intermediate encode quality does not
+      matter.
+
+    Returns (writer, final_path) or (None, None).
+    """
+    width, height = size
+    if Path(output_video_path).suffix.lower() == ".webm":
+        writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*"VP80"), float(fps), (width, height))
+        if writer.isOpened():
+            return writer, output_video_path
+        logger.warning("VP8 webm writer failed - falling back to mp4")
+        output_video_path = str(Path(output_video_path).with_suffix(".mp4"))
+    for codec in ("avc1", "mp4v"):
+        writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*codec), float(fps), (width, height))
+        if writer.isOpened():
+            return writer, output_video_path
+    return None, None
 
 
 def _reencode_for_browser(output_video_path):
@@ -318,6 +363,8 @@ def generate_summary_report(detections_json, tracking_json, reid_json=None):
     detections = load_json(detections_json)
     tracks = load_json(tracking_json)
     reid_res = load_json(reid_json) if reid_json else {}
+    if "frames" in reid_res:
+        reid_res = reid_res["frames"]
     
     # Count statistics
     total_frames = len(detections)
@@ -339,26 +386,29 @@ def generate_summary_report(detections_json, tracking_json, reid_json=None):
     return report
 
 
-if __name__ == "__main__":
-    print("Utils module for multi-person tracking and Re-ID system")
 def draw_global_matches(frame, cam_frame_people):
+    """Draw boxes ONLY for wanted (registered) people - i.e. entries that have
+    a real `name`. Anyone without a name (not registered) is not drawn at all,
+    matching the wanted-person gating of the pipeline."""
     frame_copy = frame.copy()
     seen_ids = set()
     for person in cam_frame_people:
+        if not person.get('name'):
+            continue  # not a registered/wanted person -> no box, no label
         gid = person.get('global_id')
         if gid is None or gid in seen_ids:
-            continue  # only skip exact duplicate detections of the SAME id
+            continue
         seen_ids.add(gid)
         x1, y1, x2, y2 = person['bbox']
-        if person.get('name'):
-            color = (0, 200, 0)
-            label = f"{person['name']} ({person['name_similarity']:.2f})"
-        else:
-            color = (0, 255, 255)
-            label = f"Global ID {gid}"
-        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame_copy, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        color = (0, 200, 0)
+        sim = person.get('name_similarity')
+        label = f"{person['name']} ({sim:.2f})" if sim is not None else person['name']
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 3)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        tx, ty = x1, max(y1 - 8, th + 4)
+        cv2.rectangle(frame_copy, (tx, ty - th - 4), (tx + tw + 4, ty + 2), (0, 0, 0), -1)
+        cv2.putText(frame_copy, label, (tx + 2, ty - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return frame_copy
 
 
@@ -368,28 +418,63 @@ def render_global_id_video(video_path, combined_json_path, camera_id, output_vid
     combined output — e.g. outputs/cross_camera/global_identities.json."""
     combined = load_json(combined_json_path)
     cam_results = combined.get(camera_id, {})
+    total_detections = sum(len(v) for v in cam_results.values())
+    no_detections = total_detections == 0
+    if no_detections:
+        logger.warning(f"{camera_id}: no persons detected (no registered/wanted faces in this video)")
+
+    def _overlay_no_person(frame):
+        """Full-frame 'Person not detected' overlay when the camera saw nobody."""
+        if not no_detections:
+            return frame
+        scale = max(0.9, frame.shape[0] / 600.0)
+        text = "Person not detected"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+        cx = (frame.shape[1] - tw) // 2
+        cy = frame.shape[0] // 2
+        pad = 12
+        cv2.rectangle(
+            frame,
+            (cx - pad, cy - th - pad),
+            (cx + tw + pad, cy + baseline + pad),
+            (0, 0, 0), -1,
+        )
+        cv2.putText(frame, text, (cx, cy), font, scale, (0, 0, 255), thickness, cv2.LINE_AA)
+        return frame
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error(f"Failed to open video: {video_path}")
         return False
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or not np.isfinite(fps) or fps <= 0:
+        fps = 30  # image-sequence backends often report fps=-1 or 0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Image-sequence backends can also report wrong dimensions; trust the
+    # actual first frame instead (this also advances the reader to frame 2).
+    ok0, first = cap.read()
+    if ok0 and first is not None:
+        height, width = first.shape[:2]
 
-    out = None
-    for codec in ("mp4v", "avc1", "H264"):
-        writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*codec), fps, (width, height))
-        if writer.isOpened():
-            out = writer
-            break
+    final_path = _browser_playable_path(output_video_path)
+    out, final_path = _open_video_writer(final_path, fps, (width, height))
     if out is None:
         cap.release()
-        logger.error("Failed to initialize VideoWriter with available codecs")
-        return False
+        logger.error("Failed to initialize VideoWriter for browser playback")
+        return None
 
     frame_id = 0
+    if ok0 and first is not None:
+        frame = first
+        frame_id = 1
+        frame_people = cam_results.get(str(frame_id), [])
+        frame = draw_global_matches(frame, frame_people)
+        frame = _overlay_no_person(frame)
+        out.write(frame)
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -397,10 +482,12 @@ def render_global_id_video(video_path, combined_json_path, camera_id, output_vid
         frame_id += 1
         frame_people = cam_results.get(str(frame_id), [])
         frame = draw_global_matches(frame, frame_people)
+        frame = _overlay_no_person(frame)
         out.write(frame)
 
     cap.release()
     out.release()
-    _reencode_for_browser(output_video_path)
-    logger.info(f"✅ Global-ID video saved -> {output_video_path}")
-    return True
+    if Path(final_path).suffix.lower() == ".mp4":
+        _reencode_for_browser(final_path)
+    logger.info(f"✅ Global-ID video saved -> {final_path}")
+    return final_path

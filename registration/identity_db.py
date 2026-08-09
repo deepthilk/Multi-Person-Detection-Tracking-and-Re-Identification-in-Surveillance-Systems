@@ -9,7 +9,7 @@ Stores, for every registered known person:
   - metadata (when registered, how many images, source image paths)
 
 Persisted as plain JSON so it's easy to inspect, back up, and diff in git
-review — no binary formats, no database server required for a student
+review - no binary formats, no database server required for a student
 project of this size.
 
 This file owns `outputs/registration/identity_db.json` exclusively.
@@ -27,6 +27,11 @@ import numpy as np
 from registration.db_config import DB_SETTINGS, SEARCH_SETTINGS
 
 logger = logging.getLogger(__name__)
+
+# Alert / watch-list flags a registered person can carry. "normal" is the
+# default; everything else shows up on the dashboard's Alerts panel whenever
+# that person is recognised on a camera.
+FLAGS = ("normal", "criminal", "missing", "person_of_interest")
 
 
 def _cosine(a, b) -> float:
@@ -64,7 +69,8 @@ class IdentityDatabase:
 
     # ── writes ───────────────────────────────────────────────────────────
 
-    def add_person(self, name: str, embeddings: list, image_paths: list = None):
+    def add_person(self, name: str, embeddings: list, image_paths: list = None,
+                   person_id: str = None, flag: str = "normal", details: str = ""):
         """
         Add or update a person.
 
@@ -72,9 +78,12 @@ class IdentityDatabase:
             name: unique display name, used as the lookup key.
             embeddings: list of 1-D numpy arrays / lists (one per image).
             image_paths: original source paths, stored as metadata only.
+            person_id: optional official / badge / case ID shown on the dashboard.
+            flag: watch-list status, one of registration.identity_db.FLAGS.
+            details: free-text notes (description, case notes, etc.).
         """
         if not embeddings:
-            raise ValueError(f"No usable embeddings for '{name}' — nothing to store")
+            raise ValueError(f"No usable embeddings for '{name}' - nothing to store")
 
         vectors = [np.asarray(e, dtype=np.float32).tolist() for e in embeddings]
         average = np.mean(np.array(vectors, dtype=np.float32), axis=0).tolist()
@@ -88,10 +97,18 @@ class IdentityDatabase:
             num_images = existing["metadata"]["num_images"] + len(embeddings)
             all_paths = existing["metadata"].get("image_paths", []) + (image_paths or [])
             registered_at = existing["metadata"]["registered_at"]
+            # keep previously-set profile fields unless the caller supplied new ones
+            meta = existing["metadata"]
+            person_id = person_id if person_id is not None else meta.get("person_id")
+            flag = flag if flag is not None else meta.get("flag", "normal")
+            details = details if details is not None else meta.get("details", "")
         else:
             num_images = len(embeddings)
             all_paths = image_paths or []
             registered_at = datetime.now().isoformat()
+
+        if flag not in FLAGS:
+            raise ValueError(f"Invalid flag '{flag}' - expected one of {FLAGS}")
 
         self._data[name] = {
             "embeddings": vectors,
@@ -101,10 +118,38 @@ class IdentityDatabase:
                 "last_updated": datetime.now().isoformat(),
                 "num_images": num_images,
                 "image_paths": all_paths,
+                "person_id": person_id,
+                "flag": flag,
+                "details": details or "",
             },
         }
         self.save()
-        logger.info(f"✅ Registered '{name}' with {num_images} total image(s)")
+        logger.info(f"[OK]  Registered '{name}' with {num_images} total image(s)")
+
+    def update_metadata(self, name: str, **fields) -> dict:
+        """
+        Update profile fields (person_id / flag / details / notes) for an
+        existing person without touching embeddings. Accepts any subset of:
+        person_id, flag, details. Returns the updated record.
+
+        Raises KeyError if the person is not registered.
+        """
+        record = self._data.get(name)
+        if record is None:
+            raise KeyError(f"'{name}' is not in the identity database")
+
+        meta = record.setdefault("metadata", {})
+        for key, value in fields.items():
+            if key not in ("person_id", "flag", "details"):
+                raise ValueError(f"Unsupported metadata field '{key}'")
+            if key == "flag" and value is not None and value not in FLAGS:
+                raise ValueError(f"Invalid flag '{value}' - expected one of {FLAGS}")
+            if value is not None:
+                meta[key] = value
+        meta["last_updated"] = datetime.now().isoformat()
+        self.save()
+        logger.info(f"[OK]  Updated metadata for '{name}': { {k: fields[k] for k in fields if fields[k] is not None} }")
+        return record
 
     def delete_person(self, name: str) -> bool:
         if name in self._data:
@@ -163,7 +208,7 @@ class IdentityDatabase:
 
         This is the single hand-off point described in the team plan
         ("Provide the database to the Re-ID module"). Deepthi's
-        integration code only needs to call this — it never reads
+        integration code only needs to call this - it never reads
         identity_db.json directly.
         """
         return {
