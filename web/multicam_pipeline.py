@@ -162,7 +162,7 @@ def run_camera_reid(
           ]
         }
     """
-    from reidentification.reid_main import ReIDEngine
+    from reidentification.reid_main import ReIDEngine, _cosine
     from reidentification.face_cue import FaceCueExtractor, get_cached_face_extractor
 
     engine = ReIDEngine(device=device)
@@ -290,11 +290,12 @@ def run_camera_reid(
             except Exception:
                 logger.exception("Name match failed for stable id %s — leaving unresolved", sid)
 
-    # ── Deduplication: if two identities got the same name, re-resolve ────
-    # One person can't be in two places at once. If body-only matching
-    # assigned the same registered name to multiple tracks, keep the best
-    # similarity as the "true" match and re-search the rest against
-    # remaining registered people.
+    # ── Deduplication: if two identities got the same name, decide ────────
+    # With a weak body model, the engine over-splits one person into multiple
+    # stable IDs. Face naming correctly gives them ALL the same name. We must
+    # NOT re-resolve those — they're the same person, just over-split. Only
+    # re-resolve when body similarity between the duplicates is LOW (meaning
+    # two genuinely different people coincidentally got the same face name).
     if name_by_original_sid and identity_db is not None:
         name_groups = {}  # name -> [(sid, sim), ...]
         for sid, (name, sim) in name_by_original_sid.items():
@@ -303,33 +304,43 @@ def run_camera_reid(
         claimed_names = set()
         for name, entries in name_groups.items():
             entries.sort(key=lambda x: x[1], reverse=True)  # best first
-            # Keep the best match for this name
             claimed_names.add(name)
-            # Re-resolve duplicates
+            # Keep ALL entries with this name — they're over-split same person.
+            # Only re-resolve if body similarity between duplicates is very low
+            # (meaning genuinely different people who got the same face name).
+            best_feat = engine.consolidated_features.get(entries[0][0])
             for sid, sim in entries[1:]:
-                body_feat = engine.consolidated_features.get(sid)
-                if body_feat is None:
+                dup_feat = engine.consolidated_features.get(sid)
+                if dup_feat is None:
                     del name_by_original_sid[sid]
                     continue
-                matches = identity_db.match(
-                    body_feat, query_face_embedding=None, top_k=5
-                )
-                new_name = None
-                new_sim = 0.0
-                for m_name, m_sim in matches:
-                    if m_name not in claimed_names:
-                        new_name = m_name
-                        new_sim = m_sim
-                        claimed_names.add(m_name)
-                        break
-                if new_name:
-                    name_by_original_sid[sid] = (new_name, new_sim)
-                    logger.info("Dedup: sid=%s renamed %s -> %s (sim %.3f -> %.3f)",
-                                sid, name, new_name, sim, new_sim)
+                # Check if body similarity is low → different people, re-resolve
+                body_sim = _cosine(best_feat, dup_feat) if best_feat is not None else 0.0
+                if body_sim < 0.70:
+                    # Genuinely different people — re-resolve against remaining names
+                    matches = identity_db.match(
+                        dup_feat, query_face_embedding=None, top_k=5
+                    )
+                    new_name = None
+                    new_sim = 0.0
+                    for m_name, m_sim in matches:
+                        if m_name not in claimed_names:
+                            new_name = m_name
+                            new_sim = m_sim
+                            claimed_names.add(m_name)
+                            break
+                    if new_name:
+                        name_by_original_sid[sid] = (new_name, new_sim)
+                        logger.info("Dedup: sid=%s renamed %s -> %s (body_sim=%.3f, sim %.3f -> %.3f)",
+                                    sid, name, new_name, body_sim, sim, new_sim)
+                    else:
+                        del name_by_original_sid[sid]
+                        logger.info("Dedup: sid=%s removed %s (no other match, body_sim=%.3f) -> Unknown",
+                                    sid, name, body_sim)
                 else:
-                    del name_by_original_sid[sid]
-                    logger.info("Dedup: sid=%s removed %s (no other match) -> Unknown",
-                                sid, name)
+                    # Same person over-split by body model — keep same name
+                    logger.info("Dedup: sid=%s kept as %s (over-split, body_sim=%.3f)",
+                                sid, name, body_sim)
 
     # Evidence frames: for each MATCHED identity, keep the top-5 frames whose
     # per-frame face similarity to the matched person's average face is the

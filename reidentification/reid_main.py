@@ -187,7 +187,7 @@ class ReIDConfig:
     # chance for a genuinely new person to accidentally cross the (loose,
     # uniform-tolerant) reappearance threshold and get wrongly merged into
     # an existing identity — see REAPPEAR_NO_FACE_PENALTY below.
-    NEW_ID_GRACE_FRAMES: int = 2
+    NEW_ID_GRACE_FRAMES: int = 2   # 2 frames grace - give PASS3 time to re-match
 
     # Body-only reappearance (no face confirmation available) is penalised
     # by this much before comparing against T_REAPPEAR — see _score().
@@ -794,6 +794,37 @@ class ReIDEngine:
                 locked_rows.add(row); locked_cols.add(sid_to_col[sid])
                 self._trace(frame_id, f"PASS0 lock: tid={candidates[row]['tid']} -> sid={sid} score={s:.3f}")
 
+        # -- PASS 0b: face-lock for new trackers --
+        # When a brand-new tracker enters with a face, check if it matches
+        # any established identity's face. If yes, assign directly.
+        # PRIMARY fix for identity persistence across re-entries.
+        if stable_ids:
+            from reidentification.face_cue import FaceCueExtractor
+            for i, cand in enumerate(candidates):
+                if i in assigned:
+                    continue
+                if self.track_to_identity.get(cand['tid']) is not None:
+                    continue
+                cand_face = cand.get('face_feat')
+                if cand_face is None:
+                    continue
+                best_sid, best_s = None, -1.0
+                for sid in stable_ids:
+                    if sid in used:
+                        continue
+                    ident = self.identity_db[sid]
+                    exist_face = ident.face_descriptor
+                    if exist_face is None:
+                        continue
+                    fsim = FaceCueExtractor.similarity(exist_face, cand_face)
+                    if fsim is not None and fsim > best_s:
+                        best_s = fsim
+                        best_sid = sid
+                if best_sid is not None and best_s >= 0.25:
+                    self._trace(frame_id, f"PASS0b FACE-LOCK: tid={cand['tid']} -> sid={best_sid} face_sim={best_s:.3f}")
+                    assigned[i] = best_sid; used.add(best_sid)
+
+
         # ── PASS 1: Hungarian (short-gap candidates) ──────────────────────
         if stable_ids:
             rem_r = [r for r in range(len(candidates)) if r not in locked_rows]
@@ -868,6 +899,41 @@ class ReIDEngine:
         # Uses appearance-only score (already computed in _score for long gaps)
         # with a lower threshold (T_REAPPEAR=0.55 vs T_MATCH=0.65).
         if stable_ids:
+            face_confirm_pass = 0.30  # ArcFace same-person starts at ~0.36 (blurry/angled faces)
+            from reidentification.face_cue import FaceCueExtractor
+            for i, cand in enumerate(candidates):
+                if i in assigned:
+                    continue
+                cand_face = cand.get('face_feat')
+                if cand_face is None:
+                    continue
+                best_face_sid, best_face_s = None, -1.0
+                for c, sid in enumerate(stable_ids):
+                    if sid in used:
+                        continue
+                    ident = self.identity_db[sid]
+                    if frame_id - ident.last_frame <= CFG.REAPPEAR_GAP:
+                        continue
+                    ident_face = ident.face_descriptor
+                    if ident_face is None:
+                        continue
+                    fsim = FaceCueExtractor.similarity(ident_face, cand_face)
+                    if fsim is not None and fsim > best_face_s:
+                        best_face_s = fsim
+                        best_face_sid = sid
+                if best_face_sid is not None and best_face_s >= face_confirm_pass:
+                    prev = self.track_to_identity.get(cand['tid'])
+                    if prev is not None and prev in sid_to_col and prev != best_face_sid:
+                        ps = float(score_matrix[i, sid_to_col[prev]])
+                        allowed = self._switch_allowed(
+                                best_face_s, ps, cand_face,
+                                self.identity_db[best_face_sid], self.identity_db.get(prev),
+                                CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
+                        if not allowed:
+                            continue
+                    self._trace(frame_id, f"PASS3-FACE reappear: tid={cand['tid']} -> sid={best_face_sid} face_sim={best_face_s:.3f}")
+                    assigned[i] = best_face_sid; used.add(best_face_sid)
+
             for i, cand in enumerate(candidates):
                 if i in assigned:
                     continue
@@ -946,6 +1012,36 @@ class ReIDEngine:
             self._new_id_grace.pop(tid, None)
             self._trace(frame_id, f"PASS4 NEW IDENTITY: tid={tid} -> sid={sid} "
                         f"(had_stable_ids={bool(stable_ids)}, has_face={cand.get('face_feat') is not None})")
+
+        # -- PASS 4b: face recovery for newly minted IDs --
+        # If PASS4 just created a new identity, check if its face matches
+        # any EXISTING identity. Catches re-entries that PASS3 missed.
+        from reidentification.face_cue import FaceCueExtractor
+        for i, cand in enumerate(candidates):
+            if i not in assigned:
+                continue
+            sid = assigned[i]
+            ident = self.identity_db.get(sid)
+            if ident is None or ident.count > 1:
+                continue
+            cand_face = cand.get('face_feat')
+            if cand_face is None:
+                continue
+            for exist_sid, exist_ident in self.identity_db.items():
+                if exist_sid == sid or exist_sid in used:
+                    continue
+                exist_face = exist_ident.face_descriptor
+                if exist_face is None:
+                    continue
+                fsim = FaceCueExtractor.similarity(exist_face, cand_face)
+                if fsim is not None and fsim >= 0.25:
+                    del self.identity_db[sid]
+                    assigned[i] = exist_sid
+                    used.discard(sid)
+                    used.add(exist_sid)
+                    self._trace(frame_id, f"PASS4b FACE RECOVER: tid={cand['tid']} new_sid={sid} -> existing_sid={exist_sid} face_sim={fsim:.3f}")
+                    break
+
 
         # ── Update ────────────────────────────────────────────────────────
         for i, sid in assigned.items():
