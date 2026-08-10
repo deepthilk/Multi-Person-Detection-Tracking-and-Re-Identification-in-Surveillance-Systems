@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import logging
 import shutil
 import sys
@@ -20,9 +21,10 @@ from tracking.track_module import run_tracking
 from reidentification.reid_main import run_reid_pipeline
 from registration.identity_db import IdentityDatabase
 from registration.register_person import register_person
-from utils import render_reid_video
+from utils import render_reid_video, extract_track_thumbnail
 
 from multicam_pipeline import run_camera_reid
+from cross_camera import unify_session_files
 
 logger = logging.getLogger("web.server")
 
@@ -88,6 +90,16 @@ def _ensure_artifact(path: Path, label: str):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 app.mount("/reg-photos", StaticFiles(directory=REG_IMAGES_DIR), name="reg-photos")
+
+
+@app.middleware("http")
+async def no_cache_static(request, call_next):
+    """Browsers otherwise serve stale app.js/styles.css (e.g. the old blinking
+    box rendering) and stale re-rendered videos/thumbnails after corrections."""
+    response = await call_next(request)
+    if request.url.path.startswith(("/static/", "/outputs/", "/reg-photos/")):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/")
@@ -226,11 +238,15 @@ def start_session(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     labels: List[str] = Form(...),
+    stride: int = Form(3),
+    det_stride: int = Form(1),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="No camera videos uploaded")
     if len(labels) != len(files):
         raise HTTPException(status_code=400, detail="Every camera upload needs a label")
+    stride = min(max(int(stride), 1), 10)
+    det_stride = min(max(int(det_stride), 1), 10)
 
     session_id = uuid.uuid4().hex[:10]
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -246,6 +262,7 @@ def start_session(
         cameras[camera_id] = {
             "camera_id": camera_id,
             "label": label or camera_id,
+            "input_path": str(input_path),
             "status": "queued",
             "percent": 0,
             "message": "Queued",
@@ -254,6 +271,7 @@ def start_session(
             "fps": None,
             "frame_drop_rate": None,
             "reid_json_path": None,
+            "stride": stride,
         }
 
         background_tasks.add_task(
@@ -262,9 +280,14 @@ def start_session(
             camera_id,
             input_path,
             device,
+            stride,
+            det_stride,
         )
 
     SESSIONS[session_id] = {"cameras": cameras}
+    # Runs AFTER every camera job (FastAPI BackgroundTasks are sequential),
+    # unifying identities that appear on more than one camera.
+    background_tasks.add_task(_unify_session, session_id)
     return JSONResponse({"session_id": session_id, "cameras": list(cameras.keys())})
 
 
@@ -295,15 +318,17 @@ def session_results(session_id: str):
             sighting = {
                 "camera_id": cam["camera_id"],
                 "camera_label": cam["label"],
+                "track_id": person["track_id"],
                 "first_seen_sec": person["first_seen_sec"],
                 "last_seen_sec": person["last_seen_sec"],
+                "thumb_url": person.get("thumb_url"),
             }
             if person.get("name"):
                 entry = matched_by_name.setdefault(
                     person["name"], {"name": person["name"], "similarity": person["similarity"], "sightings": []}
                 )
                 entry["sightings"].append(sighting)
-                entry["similarity"] = max(entry["similarity"], person["similarity"])
+                entry["similarity"] = max(entry["similarity"] or 0, person["similarity"] or 0)
             else:
                 unmatched.append(
                     {
@@ -320,10 +345,178 @@ def session_results(session_id: str):
         "unknown": len(unmatched),
         "all_cameras_done": all(c["status"] in ("completed", "error") for c in cams.values()),
     }
-    return JSONResponse({"summary": summary, "matched": matched, "unmatched": unmatched})
+    cameras = [
+        {
+            "camera_id": c["camera_id"],
+            "label": c["label"],
+            "output_url": c.get("output_url"),
+            "people": [
+                {
+                    "track_id": p["track_id"],
+                    "name": p.get("name"),
+                    "similarity": p.get("similarity"),
+                    "face_sim": p.get("face_sim"),
+                }
+                for p in c.get("people", [])
+            ],
+        }
+        for c in cams.values()
+    ]
+    return JSONResponse({"summary": summary, "matched": matched, "unmatched": unmatched, "cameras": cameras})
 
 
-def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: str):
+def _rewrite_tracks(reid_path: Path, corrected: dict):
+    """Write corrected names/evidence back into a camera's reid.json
+    __tracks__ section so re-rendered videos and future reads use them."""
+    if not reid_path.exists():
+        return
+    with open(reid_path, encoding="utf-8") as f:
+        data = json.load(f)
+    tracks = data.get("__tracks__", {})
+    for tid, c in corrected.items():
+        if tid in tracks:
+            tracks[tid]["name"] = c.get("name")
+            tracks[tid]["similarity"] = c.get("similarity")
+            tracks[tid]["face_sim"] = c.get("face_sim")
+            tracks[tid]["cues"] = c.get("cues", [])
+            tracks[tid]["manual"] = bool(c.get("manual")) or tracks[tid].get("manual", False)
+    with open(reid_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _re_render(cam: dict):
+    """Re-render a camera's annotated video from its (possibly corrected)
+    reid.json, so on-screen labels reflect the latest names."""
+    reid_path = Path(cam["reid_json_path"])
+    out = reid_path.with_name(reid_path.name.replace("_reid.json", "_reid.mp4"))
+    try:
+        render_reid_video(cam["input_path"], str(reid_path), str(out))
+    except Exception:
+        logger.exception("Re-render failed for %s", cam["camera_id"])
+
+
+def _unify_session(session_id: str):
+    """After every camera finishes, unify identities across cameras using the
+    face galleries persisted in each reid.json, then re-render with the
+    resolved names."""
+    session = SESSIONS.get(session_id)
+    if not session:
+        return
+    cams = session["cameras"]
+    completed = {
+        cid: cam
+        for cid, cam in cams.items()
+        if cam.get("status") == "completed" and cam.get("reid_json_path")
+    }
+    if not completed:
+        return
+    reid_paths = {cid: Path(cam["reid_json_path"]) for cid, cam in completed.items()}
+    try:
+        corrected = unify_session_files(reid_paths)
+    except Exception:
+        logger.exception("Cross-camera unify failed for session %s", session_id)
+        return
+
+    changes = 0
+    for cid, cam in completed.items():
+        corr = corrected.get(cid, {})
+        for p in cam.get("people", []):
+            c = corr.get(str(p.get("track_id")))
+            if not c:
+                continue
+            if c["name"] != p.get("name"):
+                changes += 1
+                _log("info", f"{cam['label']}: cross-camera → track {p['track_id']} = '{c['name']}'")
+            p["name"] = c["name"]
+            p["similarity"] = c["similarity"]
+            p["face_sim"] = c["face_sim"]
+            p["cues"] = c.get("cues", [])
+            p["global_id"] = c["global_id"]
+        _rewrite_tracks(Path(cam["reid_json_path"]), corr)
+        _re_render(cam)
+
+    if changes:
+        _log("info", f"Cross-camera unification: {changes} name change(s) across {len(completed)} camera(s)")
+    else:
+        _log("info", "Cross-camera unification: all cameras already agree")
+
+
+@app.post("/api/session/{session_id}/correct")
+def correct_track(session_id: str, camera_id: str = Form(...), track_id: int = Form(...),
+                  name: str = Form("")):
+    """Manual correction: assign a track a name (registered person or a brand
+    new one) or clear it back to 'unknown'. Persists the track's face +
+    appearance evidence into the identity DB so FUTURE videos of that person
+    resolve automatically too, then re-propagates cross-camera and re-renders.
+    """
+    session = SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    cam = session["cameras"].get(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if not cam.get("reid_json_path"):
+        raise HTTPException(status_code=409, detail="This camera hasn't finished processing yet")
+
+    reid_path = Path(cam["reid_json_path"])
+    with open(reid_path, encoding="utf-8") as f:
+        data = json.load(f)
+    track = (data.get("__tracks__") or {}).get(str(track_id))
+    if track is None:
+        raise HTTPException(status_code=404, detail=f"Track {track_id} not found for {camera_id}")
+
+    name = name.strip()
+    faces = track.get("faces") or []
+    mean = track.get("mean_feature")
+
+    if name and not mean:
+        raise HTTPException(status_code=422, detail="This track has no appearance descriptor — can't register it")
+
+    sim = face_sim = None
+    cues = []
+    if name:
+        db = _get_db()
+        # Evidence measured against the EXISTING gallery (before this track's
+        # own faces join it, which would trivially self-match at ~1.0).
+        pre = db.match_multimodal(mean, [list(f) for f in faces], top_k=1)
+        match = next((m for m in pre if m["name"] == name), None)
+        if match:
+            sim, face_sim, cues = match["score"], match["face_sim"], match["cues"]
+        # Persist the track's evidence ONLY where it corroborates the person's
+        # existing gallery. A corrected track may be a false merge or a
+        # mis-named track, and blindly appending every face used to poison the
+        # DB with other people's faces (then self-confirming at ~1.0 later).
+        db.add_person_corroborated(name, [mean], face_embeddings=faces)
+
+    for p in cam.get("people", []):
+        if p.get("track_id") == track_id:
+            p["name"] = name or None
+            p["similarity"] = sim
+            p["face_sim"] = face_sim
+            p["cues"] = cues
+            p["manual"] = bool(name)
+            break
+
+    track["name"] = name or None
+    track["similarity"] = sim
+    track["face_sim"] = face_sim
+    track["cues"] = cues
+    track["manual"] = bool(name)
+    with open(reid_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    _re_render(cam)
+    _log("info", f"{cam['label']}: manual correction → track {track_id} = "
+                 f"{name!r} ({'face=' + str(round(face_sim, 3)) if face_sim else 'manual'})")
+
+    # Propagate the corrected name to the same person on other cameras.
+    if len(session["cameras"]) > 1:
+        _unify_session(session_id)
+
+    return JSONResponse({"ok": True, "people": cam.get("people", [])})
+
+
+def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: str, stride: int = 3, det_stride: int = 2):
     cam = SESSIONS[session_id]["cameras"][camera_id]
     detections_path = OUTPUT_DIR / f"{session_id}_{camera_id}_detections.json"
     tracking_path = OUTPUT_DIR / f"{session_id}_{camera_id}_tracking.json"
@@ -343,6 +536,7 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             min_height=50,
             min_area_ratio=0.001,
             device=device,
+            stride=det_stride,
         )
         _ensure_artifact(detections_path, "Detection output")
         _record_latency("detection", time.time() - t0, camera_id)
@@ -364,6 +558,7 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             str(reid_path),
             device=device,
             identity_db=db,
+            stride=stride,
         )
         _ensure_artifact(reid_path, "Re-ID output")
         _record_latency("reid", time.time() - t2, camera_id)
@@ -372,6 +567,13 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
         cam["fps"] = summary["fps"]
         cam["frame_drop_rate"] = summary["frame_drop_rate"]
         cam["reid_json_path"] = str(reid_path)
+
+        # One screenshot per track, taken from the video itself (largest box),
+        # so the Results tab shows WHO each row is talking about.
+        for p in cam["people"]:
+            thumb_path = OUTPUT_DIR / f"{session_id}_{camera_id}_t{p['track_id']}.jpg"
+            if extract_track_thumbnail(str(input_path), str(reid_path), p["track_id"], thumb_path):
+                p["thumb_url"] = f"/outputs/{thumb_path.name}"
 
         if summary["frame_drop_rate"] > 0.02:
             _log(
@@ -534,6 +736,7 @@ def _run_pipeline_job(job_id, input_path, detections_path, tracking_path, reid_p
             min_height=50,
             min_area_ratio=0.001,
             device=device,
+            stride=1,
         )
         _ensure_artifact(detections_path, "Detection output")
 

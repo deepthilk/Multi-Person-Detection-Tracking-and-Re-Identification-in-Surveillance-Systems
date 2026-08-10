@@ -35,6 +35,12 @@ from reidentification.reid_main import ReIDEngine
 
 logger = logging.getLogger(__name__)
 
+# An appearance-only match is reported only when the identity's top
+# appearance pick beats its runner-up by at least this much. Under identical
+# uniforms a face-less identity scores 0.6-0.8 against EVERYONE — there is
+# no way to tell who it is, so a narrow spread must not count as a hit.
+APPEARANCE_ONLY_MARGIN = 0.08
+
 
 def search_registered_in_video(
     video_path,
@@ -46,6 +52,7 @@ def search_registered_in_video(
     sample_every=6,
     max_faces_per_track=30,
     face_upsample=3,
+    stride=1,
 ):
     """
     Args:
@@ -57,12 +64,14 @@ def search_registered_in_video(
         render_video_path: optional path to write an overlay video — every
             detected identity is boxed and labelled with the name of the
             registered person it matched (or "Unknown n" when no match).
-        sample_every: extract gallery faces from every Nth frame per tracker
-            (the engine already pays this face-detection cost internally, so
-            sampling keeps the extra overhead small).
+        sample_every: accepted for backward compatibility but ignored — every
+            processed frame contributes a gallery face (stride thins the cost).
         max_faces_per_track: cap on gallery faces collected per tracker.
         face_upsample: accepted for backward compatibility but ignored —
             the InsightFace detector sizes input via det_size.
+        stride: process only every Nth frame. Same person appears across many
+            consecutive frames, so identity results barely change while runtime
+            drops ~stride× — the main CPU-only speed knob.
 
     Returns:
         {
@@ -85,15 +94,17 @@ def search_registered_in_video(
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
     tid_faces = {}       # tracker id -> list of 512-dim face vectors
-    tid_face_count = {}  # tracker id -> frames seen (for sampling)
     frame_people = {}    # frame_id -> [(bbox, tid)] for overlay rendering
 
     frame_id = 0
+    stride = max(1, int(stride))
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame_id += 1
+        if (frame_id - 1) % stride != 0:
+            continue
         tracks = tracking_data.get(str(frame_id), [])
         frame_results = engine.process_frame(frame, tracks, frame_id)
 
@@ -104,13 +115,13 @@ def search_registered_in_video(
             if tid is None or p.get("feature_dim", 0) == 0:
                 continue
             frame_people.setdefault(frame_id, []).append((p["bbox"], tid))
-            tid_face_count.setdefault(tid, 0)
+            # Keep a face from EVERY processed frame (stride already thins the
+            # cost), capped by max_faces_per_track. Modulo-thinning on top of
+            # stride is what previously starved borderline matches: a real
+            # same-person face at 0.53 (vs 0.45 threshold) was sampled out and
+            # the person came back "not found" even though she was in the video.
             if len(tid_faces.get(tid, [])) >= max_faces_per_track:
                 continue
-            if tid_face_count[tid] % sample_every != 0:
-                tid_face_count[tid] += 1
-                continue
-            tid_face_count[tid] += 1
             face = gallery_face_extractor.extract(frame, p["bbox"])
             if face is not None:
                 tid_faces.setdefault(tid, []).append(face)
@@ -152,19 +163,36 @@ def search_registered_in_video(
             f"-> {[m['name'] for m in matches[:3]]}"
         )
 
-    # Aggregate per registered person across all identities.
+    # Aggregate per registered person across all identities. Prefer
+    # FACE-CONFIRMED evidence: a blurry-looking identity can match everyone by
+    # body appearance alone (identical uniforms), and those noisy appearance
+    # scores often outrank the genuine face-confirmed hit. So:
+    #   1. any face-confirmed match beats every appearance-only match;
+    #   2. an appearance-only match is only accepted when it is the CLEAR
+    #      winner for its identity (top-ranked and beating the runner-up by a
+    #      margin) — a face-less identity that matches several people at
+    #      similar appearance similarity cannot identify anyone.
     best_by_person = {}
+    per_ident_matches = {i["sid"]: i["matches"] for i in identities}
     for sid, ident in zip([i["sid"] for i in identities], identities):
         for m in ident["matches"]:
+            face_confirmed = "face" in m["cues"] and m["face_sim"] is not None
             cur = best_by_person.get(m["name"])
-            if cur is None or m["score"] > cur["score"]:
-                best_by_person[m["name"]] = {
-                    "score": m["score"],
-                    "appearance_sim": m["appearance_sim"],
-                    "face_sim": m["face_sim"],
-                    "cues": m["cues"],
-                    "sid": sid,
-                }
+            cur_face = cur and "face" in cur["cues"] and cur["face_sim"] is not None
+            if face_confirmed and not cur_face:
+                best_by_person[m["name"]] = {**m, "sid": sid}
+            elif face_confirmed and cur_face:
+                if m["score"] > cur["score"]:
+                    best_by_person[m["name"]] = {**m, "sid": sid}
+            elif not face_confirmed and not cur_face:
+                # appearance-only: only the identity's clear top pick counts
+                top = per_ident_matches[sid][0] if per_ident_matches[sid] else None
+                if top and top["name"] == m["name"]:
+                    runner = per_ident_matches[sid][1] if len(per_ident_matches[sid]) > 1 else None
+                    margin = top["score"] - (runner["score"] if runner else 0.0)
+                    if margin >= APPEARANCE_ONLY_MARGIN:
+                        if cur is None or m["score"] > cur["score"]:
+                            best_by_person[m["name"]] = {**m, "sid": sid}
 
     persons = []
     for name in identity_db.list_persons():
@@ -188,6 +216,7 @@ def search_registered_in_video(
         "video": str(video_path),
         "fps": fps,
         "frames": frame_id,
+        "stride": stride,
         "match_threshold": threshold,
         "identities": identities,
         "registered_persons": persons,
@@ -308,6 +337,9 @@ if __name__ == "__main__":
     parser.add_argument("--render", default=None,
                         help="Where to write the overlay video (box + name per person)")
     parser.add_argument("--device", default="cpu", choices=["cuda", "cpu"])
+    parser.add_argument("--stride", type=int, default=1,
+                        help="Process every Nth frame (default 1 = all frames). "
+                             "Higher = faster, slightly coarser.")
     args = parser.parse_args()
 
     db = IdentityDatabase()
@@ -319,5 +351,6 @@ if __name__ == "__main__":
     report = search_registered_in_video(
         args.video, args.tracking, db, device=args.device,
         output_json_path=args.output, render_video_path=args.render,
+        stride=args.stride,
     )
     _print_report(report)

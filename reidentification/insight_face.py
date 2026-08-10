@@ -141,3 +141,20 @@ class InsightFaceExtractor:
         if na < 1e-8 or nb < 1e-8:
             return 0.0
         return float(np.clip(np.dot(a, b) / (na * nb), 0.0, 1.0))
+
+
+_shared_extractor = None
+
+
+def get_shared_extractor():
+    """Process-wide singleton InsightFaceExtractor.
+
+    Loading the buffalo_s ONNX models costs several seconds per instance, and
+    a single video job otherwise creates TWO extractors (the Re-ID loop plus
+    the face-verification pass). Sharing one instance across the process loads
+    the models once and removes that fixed cost from every job.
+    """
+    global _shared_extractor
+    if _shared_extractor is None:
+        _shared_extractor = InsightFaceExtractor()
+    return _shared_extractor

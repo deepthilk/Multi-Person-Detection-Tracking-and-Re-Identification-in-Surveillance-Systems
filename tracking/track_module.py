@@ -87,7 +87,7 @@ class PersonTracker:
         return confirmed
 
 
-def run_tracking(video_path: str, detections_path: str, output_path: str) -> dict:
+def run_tracking(video_path: str, detections_path: str, output_path: str, n_init: int = None, max_age: int = None) -> dict:
     """
     Run person tracking on video using pre-computed detections.
 
@@ -95,15 +95,24 @@ def run_tracking(video_path: str, detections_path: str, output_path: str) -> dic
         video_path:      Input video path
         detections_path: Path to detections JSON
         output_path:     Output JSON path
-
-    Returns:
-        Dictionary of frame_id -> list of track dicts
+        n_init:          DeepSORT confirmation hits. When detection is strided
+                         (detections only every Nth frame), n_init MUST be 1:
+                         an unconfirmed track is deleted on its first missed
+                         frame, so n_init=2 can never confirm a track that
+                         only sees detections every other frame.
+        max_age:         DeepSORT max age (prediction frames before a confirmed
+                         track is deleted).
     """
     logger.info(f"Loading detections from {detections_path}")
     with open(detections_path, 'r') as f:
         all_detections = json.load(f)
 
-    tracker = PersonTracker()
+    tracker_kwargs = {}
+    if n_init is not None:
+        tracker_kwargs["n_init"] = n_init
+    if max_age is not None:
+        tracker_kwargs["max_age"] = max_age
+    tracker = PersonTracker(**tracker_kwargs)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -112,6 +121,7 @@ def run_tracking(video_path: str, detections_path: str, output_path: str) -> dic
 
     frame_id         = 0
     tracking_results = {}
+    last_detections  = []
 
     logger.info("Processing video with tracking...")
 
@@ -121,7 +131,19 @@ def run_tracking(video_path: str, detections_path: str, output_path: str) -> dic
             break
 
         frame_id   += 1
-        detections  = all_detections.get(str(frame_id), [])
+        detections  = all_detections.get(str(frame_id))
+        if detections is None:
+            # Detection runs on every Nth frame (detection stride). DeepSORT
+            # DELETES an unconfirmed track on its first frame without a match,
+            # so a detection that only arrives every other frame would never be
+            # confirmed. Re-feed the previous detection frame's boxes on the
+            # gap frame: DeepSORT sees a match every frame (real or carried),
+            # confirms tracks normally, and the Kalman filter absorbs the
+            # one-frame-stale box. An empty detection list is a REAL "nobody
+            # here" (not a gap) and resets the carry, so ghosts still expire.
+            detections = last_detections
+        else:
+            last_detections = detections
         tracks      = tracker.update(frame, detections)
         tracking_results[frame_id] = tracks
 

@@ -1,0 +1,2 @@
+python run_all_videos.py --videos v3 --device cpu
+python -m reidentification.video_search --video "input/v3.mp4" --tracking "outputs/runs/v3/tracking.json" --output "outputs/runs/v3/search.json" --render "outputs/runs/v3/search_overlay.mp4"

@@ -118,6 +118,70 @@ class IdentityDatabase:
             f"({len(face_vectors)} face(s))"
         )
 
+    def add_person_corroborated(self, name: str, embeddings: list,
+                                face_embeddings: list = None):
+        """
+        Like add_person, but only persists evidence that CORROBORATES an
+        existing person's gallery.
+
+        This is what the manual-correction flow must use instead of a plain
+        add_person: a corrected track can be a false merge (one stable id
+        holding two different people) or a mis-named track, and blindly
+        appending every one of its faces + its appearance average to the named
+        person contaminates the gallery. Future videos then "confirm" that
+        person using faces that were actually someone else's — a self-fulfilling
+        ~1.0 match that poisons the DB (seen in the wild: a 152-face "prajna"
+        gallery that was mostly appended junk).
+
+        Rules:
+          - Person not in the DB -> brand-new registration, store everything
+            (nothing to corroborate against).
+          - Person already registered -> keep only the track's faces that agree
+            with the existing face gallery (>= face_confirmed_threshold), and
+            only the appearance embedding that agrees with the person's average
+            (>= match_threshold). If nothing agrees, the DB is left unchanged.
+        """
+        if not embeddings:
+            raise ValueError(f"No usable embeddings for '{name}' — nothing to store")
+
+        existing = self._data.get(name)
+        if existing is None:
+            return self.add_person(name, embeddings, face_embeddings=face_embeddings)
+
+        s = SEARCH_SETTINGS
+        from reidentification.insight_face import InsightFaceExtractor
+
+        gallery_faces = [np.asarray(g, dtype=np.float32)
+                         for g in (existing.get("face_embeddings") or [])]
+        keep_faces = []
+        if gallery_faces:
+            for f in (face_embeddings or []):
+                fv = np.asarray(f, dtype=np.float32)
+                if max(InsightFaceExtractor.similarity(fv, g) for g in gallery_faces) \
+                        >= s["face_confirmed_threshold"]:
+                    keep_faces.append(f)
+        else:
+            keep_faces = list(face_embeddings or [])
+
+        keep_appearance = [
+            e for e in embeddings
+            if _cosine(e, existing["average_embedding"]) >= s["match_threshold"]
+        ]
+
+        # The appearance descriptor is the anchor signal — a track whose body
+        # does not match the person at all must not get its faces appended even
+        # if a stray face crosses the face threshold (that is exactly the
+        # gallery-contamination path this method exists to prevent). Guard on
+        # keep_appearance alone so add_person never sees an empty embedding
+        # list (which would raise "No usable embeddings").
+        if not keep_appearance:
+            logger.info(
+                "Correction '%s' appearance does not corroborate the existing gallery — DB unchanged",
+                name,
+            )
+            return None
+        return self.add_person(name, keep_appearance, face_embeddings=keep_faces)
+
     def delete_person(self, name: str) -> bool:
         if name in self._data:
             del self._data[name]

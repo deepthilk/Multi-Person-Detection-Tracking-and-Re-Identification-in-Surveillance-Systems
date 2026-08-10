@@ -69,15 +69,86 @@ def draw_tracks(frame, tracks):
     return frame_copy
 
 
-def draw_reid_matches(frame, reid_data):
-    """Draw Re-ID matching information on frame"""
+def fill_track_gaps(reid_res, max_gap=15):
+    """Return a copy of reid_res with every frame from the first to the last
+    present, and short per-track gaps filled by linear box interpolation.
+
+    The reid step samples frames (stride > 1), so the output JSON only carries
+    boxes on every Nth frame. Rendering those directly makes boxes appear and
+    disappear ("blink") between samples. Filling each track's gaps with
+    interpolated boxes keeps a box continuously visible that glides toward the
+    person's next position instead of vanishing.
+
+    Non-numeric metadata keys (__tracks__, __verify_faces__) are preserved.
+    """
+    if not isinstance(reid_res, dict) or not reid_res:
+        return reid_res
+
+    numeric = {
+        int(f): v
+        for f, v in reid_res.items()
+        if (isinstance(f, int) or (isinstance(f, str) and f.lstrip('-').isdigit()))
+    }
+    if not numeric:
+        return reid_res
+
+    lo, hi = min(numeric), max(numeric)
+    filled = {str(f): [] for f in range(lo, hi + 1)}
+
+    timeline = {}
+    for fid, people in numeric.items():
+        if not isinstance(people, list):
+            continue
+        for p in people:
+            if not isinstance(p, dict):
+                continue
+            tid = p.get('consolidated_id')
+            if tid is None or tid == -1:
+                continue
+            bbox = p.get('bbox')
+            if not bbox or len(bbox) != 4:
+                continue
+            timeline.setdefault(tid, {})[fid] = tuple(float(v) for v in bbox)
+
+    for tid, tl in timeline.items():
+        fids = sorted(tl)
+        for i, fid in enumerate(fids):
+            filled[str(fid)].append({"consolidated_id": tid, "bbox": list(tl[fid])})
+            if i + 1 >= len(fids):
+                continue
+            nxt = fids[i + 1]
+            gap = nxt - fid - 1
+            if gap <= 0 or gap > max_gap:
+                continue
+            b0 = tl[fid]
+            b1 = tl[nxt]
+            for k in range(1, gap + 1):
+                t = k / (gap + 1)
+                ib = [a + (b - a) * t for a, b in zip(b0, b1)]
+                filled[str(fid + k)].append({"consolidated_id": tid, "bbox": ib})
+
+    for key, value in reid_res.items():
+        if not (isinstance(key, int) or (isinstance(key, str) and key.lstrip('-').isdigit())):
+            filled[key] = value
+
+    return filled
+
+
+def draw_reid_matches(frame, reid_data, name_map=None):
+    """Draw Re-ID matching information on frame.
+
+    Style: solid BLACK box, BLACK label placard. Text is RED for a resolved
+    (known) person and GREEN for an unknown person.
+    """
     frame_copy = frame.copy()
 
     # De-duplicate per frame to avoid stacked labels/boxes for the same person.
     deduped = []
     best_by_id = {}
     for person in reid_data:
-        person_id = person.get('consolidated_id', person['id'])
+        person_id = person.get('consolidated_id') or person.get('id')
+        if person_id is None:
+            continue
         bbox = person['bbox']
         matches = person.get('matches', [])
         score = float(matches[0]['similarity']) if matches else 0.0
@@ -108,20 +179,26 @@ def draw_reid_matches(frame, reid_data):
 
     for person in deduped:
         person_id = person['person_id']
-        x1, y1, x2, y2 = person['bbox']
-        matches = person.get('matches', [])
-        
-        color = (0, 255, 255)  # Cyan
-        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, 2)
-        
-        label = f"ID {person_id}"
-        if matches:
-            best_match = matches[0]
-            label += f" ({best_match['similarity']:.2f})"
-        
-        cv2.putText(frame_copy, label, (x1, y1 - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    
+        x1, y1, x2, y2 = [int(v) for v in person['bbox']]
+
+        # Black box: RED text = known person, GREEN text = unknown. A thin
+        # white outline keeps the black box visible on dark clothing/scenes.
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (255, 255, 255), 1)
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 0, 0), 3)
+
+        name = name_map.get(str(person_id)) if name_map is not None else None
+        label = name if name else f"ID {person_id}"
+        color = (0, 0, 255) if name else (0, 255, 0)  # red / green
+
+        # BLACK label placard with colored text
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        lx1, ly1 = x1, max(0, y1 - th - 10)
+        lx2, ly2 = x1 + tw + 8, y1 - 4
+        cv2.rectangle(frame_copy, (lx1, ly1), (lx2, ly2), (0, 0, 0), -1)
+        cv2.rectangle(frame_copy, (lx1, ly1), (lx2, ly2), (255, 255, 255), 1)
+        cv2.putText(frame_copy, label, (lx1 + 4, ly1 + th + 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
     return frame_copy
 
 
@@ -218,6 +295,21 @@ def visualize_results(video_path, detections_json, tracking_json,
 def render_reid_video(video_path, reid_json, output_video_path):
     """Render a Re-ID overlay video without opening a display window."""
     reid_res = load_json(reid_json) if reid_json else {}
+    # Fill per-track gaps so boxes stay continuously visible (no blinking on
+    # the stride-sampled reid frames), moving smoothly toward the next sample.
+    reid_res = fill_track_gaps(reid_res)
+
+    # Resolved-name map (final_id -> name), populated by the web pipeline's
+    # "__tracks__" section and refreshed by cross-camera / manual corrections
+    # before re-render. Falls back to no names (old ID-style labels).
+    name_map = {}
+    tracks = reid_res.get("__tracks__") if isinstance(reid_res, dict) else None
+    if isinstance(tracks, dict):
+        name_map = {
+            tid: t.get("name")
+            for tid, t in tracks.items()
+            if t.get("name")
+        }
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -252,13 +344,70 @@ def render_reid_video(video_path, reid_json, output_video_path):
 
         frame_id += 1
         frame_reid = reid_res.get(str(frame_id), [])
-        frame = draw_reid_matches(frame, frame_reid)
+        frame = draw_reid_matches(frame, frame_reid, name_map)
         out.write(frame)
 
     cap.release()
     out.release()
     _reencode_for_browser(output_video_path)
     logger.info(f"✅ Rendered Re-ID video: {output_video_path}")
+    return True
+
+
+def extract_track_thumbnail(video_path, reid_json_path, track_id, output_path, max_size=96):
+    """Save a representative crop of a track as a JPEG thumbnail, for showing
+    'who is this person' in the results UI. Picks the frame where the track's
+    bounding box is LARGEST (best/clearest view), crops it with a little
+    padding and downscales to fit max_size. Returns True on success."""
+    reid_res = load_json(reid_json_path) if reid_json_path else {}
+    best = None  # (area, frame_id, bbox)
+    for fid_str, frame_people in reid_res.items():
+        if not isinstance(frame_people, list):
+            continue
+        try:
+            fid = int(fid_str)
+        except (TypeError, ValueError):
+            continue
+        for p in frame_people:
+            if not isinstance(p, dict) or p.get('consolidated_id') != track_id:
+                continue
+            bbox = p.get('bbox')
+            if not bbox or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            if best is None or area > best[0]:
+                best = (area, fid, (x1, y1, x2, y2))
+    if best is None:
+        return False
+
+    _, fid, (x1, y1, x2, y2) = best
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return False
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, fid - 1))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return False
+
+    h, w = frame.shape[:2]
+    pad = max(8, int(min(x2 - x1, y2 - y1) * 0.12))
+    x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+    x2 = min(w, x2 + pad); y2 = min(h, y2 + pad)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return False
+
+    crop = frame[y1:y2, x1:x2]
+    ch, cw = crop.shape[:2]
+    scale = min(1.0, max_size / max(ch, cw))
+    if scale < 1.0:
+        crop = cv2.resize(
+            crop, (max(1, int(cw * scale)), max(1, int(ch * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return True
 
 
@@ -404,3 +553,4 @@ def render_global_id_video(video_path, combined_json_path, camera_id, output_vid
     _reencode_for_browser(output_video_path)
     logger.info(f"✅ Global-ID video saved -> {output_video_path}")
     return True
+

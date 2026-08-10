@@ -469,6 +469,7 @@ input[type="search"] {
   background: linear-gradient(135deg, var(--warm), var(--cool));
   color: #051017; font-weight: 700; display: flex; align-items: center; justify-content: center;
   font-family: "Cormorant Garamond", serif; font-size: 1.2rem; flex-shrink: 0;
+  object-fit: cover; aspect-ratio: 1/1;
 }
 .person-name { font-weight: 600; font-size: 1rem; }
 .person-meta { font-size: 0.76rem; color: var(--ink-soft); }
@@ -906,3 +907,41 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, var(--warm), #f
 .lightbox-nav.prev { left: 10px; }
 .lightbox-nav.next { right: 10px; }
 .lightbox-foot { margin-top: 0.6rem; text-align: center; }
+
+/* web console additions: camera outputs + manual corrections */
+.camera-outputs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+}
+.camera-output {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.camera-output-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .65rem .9rem;
+}
+.camera-output video {
+  display: block;
+  width: 100%;
+  max-height: 380px;
+  background: #000;
+}
+.correction-input {
+  min-width: 0;
+  flex: 1;
+  padding: .45rem .7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: .9rem;
+}
+.correction-input:focus { outline: none; border-color: var(--cool); box-shadow: var(--glow-warm); }

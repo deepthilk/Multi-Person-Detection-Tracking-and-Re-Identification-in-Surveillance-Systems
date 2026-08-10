@@ -39,14 +39,17 @@ class PersonDetector:
         self.min_area_ratio = min_area_ratio
         self.dedup_cover_ratio = dedup_cover_ratio
         self.edge_margin = edge_margin
-        
+
+        # NOTE: OpenVINO was trialled (models/yolov8s_openvino_model/) but on
+        # this laptop's low-power CPU it ran ~10-20x SLOWER than the torch
+        # runtime (6.5s/frame vs 340ms), so torch remains the default backend.
         logger.info(f"Loading YOLOv8 model from {model_path}")
         self.model = YOLO(model_path)
         self.model.to(self.device)
         
         logger.info(f"✅ Detector initialized on {self.device}")
     
-    def detect(self, frame, imgsz=960):
+    def detect(self, frame, imgsz=640):
         """
         Detect persons in frame
         
@@ -138,7 +141,7 @@ def run_detection(
     video_path,
     output_path,
     conf_threshold=0.35,
-    imgsz=960,
+    imgsz=640,
     device='cuda',
     min_area=900,
     min_height=50,
@@ -147,10 +150,11 @@ def run_detection(
     min_area_ratio=0.0008,
     dedup_cover_ratio=0.9,
     edge_margin=2,
+    stride=1,
 ):
     """
     Run person detection on entire video
-    
+
     Args:
         video_path: Input video path
         output_path: Output JSON path
@@ -161,7 +165,12 @@ def run_detection(
         dedup_cover_ratio: Suppress a detection when it is at least this
             fraction covered by a larger detection (removes duplicate boxes)
         edge_margin: Drop detections touching this many frame borders
-    
+        stride: Detect only every Nth frame. Defaults to 1 (every frame):
+            strided detection saves YOLO cost but the gap-frame carry-forward
+            of stale boxes degrades downstream face extraction, so accuracy
+            is prioritized. imgsz=640 is the speed knob (2.3x fewer pixels
+            than 960 with ~equal detection quality on this footage).
+
     Returns:
         Dictionary of frame_id -> detections
     """
@@ -176,26 +185,31 @@ def run_detection(
         dedup_cover_ratio=dedup_cover_ratio,
         edge_margin=edge_margin,
     )
-    
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error(f"Failed to open video: {video_path}")
         return None
-    
+
     frame_id = 0
     all_detections = {}
-    
+    step = max(1, int(stride))
+
     logger.info(f"Processing video: {video_path}")
-    
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
+
         frame_id += 1
+        if (frame_id - 1) % step != 0:
+            # No detection this frame; tracking module treats the missing
+            # frame as no detections and predicts confirmed tracks forward.
+            continue
         detections = detector.detect(frame, imgsz=imgsz)
         all_detections[frame_id] = detections
-        
+
         if frame_id % 50 == 0:
             logger.info(f"Frame {frame_id}: {len(detections)} detections")
     

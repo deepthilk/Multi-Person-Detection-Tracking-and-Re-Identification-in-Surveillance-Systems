@@ -205,24 +205,44 @@ class ReIDConfig:
     # two trackers assigned to the same identity whose faces never agree
     # above this similarity are treated as different people (e.g. a brand-new
     # tracker claimed by PASS3 reappearance on body appearance alone).
-    # Threshold is on the dlib/face_recognition similarity scale (same person
-    # typically > 0.40, different people well below). Union uses the MAX
-    # pairwise similarity so a few noisy face detections never over-split.
-    FACE_SAME_TRACK_SPLIT: float = 0.40
+    # Thresholds are on the InsightFace ArcFace scale (same person ≥ ~0.54,
+    # different people ≤ ~0.28, measured on this project's footage). Union
+    # uses the MAX pairwise similarity so a few noisy face detections never
+    # over-split.
+    FACE_SAME_TRACK_SPLIT: float = 0.45
     # Below this face similarity two trackers are treated as CONFIRMED
     # different people and are split apart even if their body appearance is
-    # nearly identical (dlib sim: 0.25 ↔ distance 0.675, above the ~0.6
-    # same-person cutoff). Guards the body-only _merge_non_cooccurring path
+    # nearly identical. Guards the body-only _merge_non_cooccurring path
     # from merging two lookalike people whose faces clearly differ.
-    FACE_SAME_TRACK_VETO:   float = 0.25
+    FACE_SAME_TRACK_VETO:   float = 0.30
+
+    # Ambiguous face evidence (FACE_SAME_TRACK_VETO ≤ sim < FACE_SAME_TRACK_SPLIT)
+    # sits in the no-man's land between confirmed-different and confirmed-same.
+    # It must NOT be overridden by a merely-good body-appearance match —
+    # body appearance is exactly the cue that cannot separate lookalikes
+    # (lekha↔deeps track-average app≈0.74–0.80 while their faces clearly
+    # differ at 0.14). Only a SAME-PERSON-LEVEL appearance (≥ this bar,
+    # observed genuine reappearances here are ≥ 0.84) overrides an ambiguous
+    # face. Without this, web-run v3 glued lekha's tracker onto deeps' group
+    # via a 0.295 ambiguous face + 0.777 appearance.
+    AMBIGUOUS_FACE_APPEARANCE_SAME: float = 0.85
+
+    # Uniform / identical-clothing detection. When almost every tracker pair
+    # inside a group already scores ≥ this on track-average appearance, the
+    # appearance cue carries NO identity information (in video4 the four
+    # members all share appearance sims of 0.85–0.99 while their faces sit at
+    # 0.16–0.45). In that saturated state the group splits/merges on FACE
+    # evidence only — appearance no longer overrides an ambiguous face or
+    # fills in for missing faces (over-splitting is harmless: the search
+    # layer re-aggregates every registered person across all identities).
+    APPEARANCE_SATURATED: float = 0.82
 
     # Appearance fallback for trackers with NO face evidence: a merged
-    # tracker must show VERY strong track-average appearance (≥ 0.65, the
-    # same MIN_APPEARANCE_NEW_TRACKER bar PASS 1/2/3/4 apply to brand-new
-    # trackers) to be kept on an existing identity. A single noisy frame can
-    # cross T_REAPPEAR (v3: tid=6 → sid=1 at 0.740 single-frame) while the
-    # accumulated track-average says otherwise (tid6↔sid1 = 0.632) — split.
-    APPEARANCE_SPLIT_THRESHOLD: float = 0.65
+    # tracker must show VERY strong track-average appearance to be kept on an
+    # existing identity. Raised from 0.65 because lookalike bodies in this
+    # footage sit at 0.70–0.80 (lekha↔deeps) and would otherwise be merged on
+    # appearance alone; genuine same-person reappearances measure ≥ 0.84.
+    APPEARANCE_SPLIT_THRESHOLD: float = 0.75
 
     # Max face embeddings cached per tracker (recent samples only — enough to
     # build a reliable same/different-person signal without unbounded memory).
@@ -535,9 +555,7 @@ class ReIDEngine:
                                           # happened from watching a video
         self.model     = self._load_model(model_name)
         self.extractor = MultiCueExtractor(self.device, self.use_osnet)
-        self.face_extractor = FaceCueExtractor()
-        if self.face_extractor.enabled:
-            logger.info("✅ Face-based Re-ID cue enabled (helps distinguish identical uniforms)")
+        self.face_extractor = self._build_face_extractor()
         # Diagnostics: how often is a face actually found? If this stays near
         # 0%, the face cue can't be helping — worth knowing rather than
         # guessing when tuning against real footage.
@@ -574,6 +592,27 @@ class ReIDEngine:
         self.tracker_faces:      dict = {}   # tid -> list of face embeddings (capped)
         self.id_mapping:         dict = {}
         self.consolidated_features: dict = {}
+
+    def _build_face_extractor(self):
+        """Face cue for the tracker face galleries / split veto. Prefer
+        InsightFace (512-dim ArcFace) — the SAME face space registration and
+        video-search use — because its detector proved far more reliable on
+        real footage than dlib: when the dlib cue came up empty on merged
+        trackers, the split fell back to body-appearance alone and lookalikes
+        (lekha↔deeps app≈0.80) stayed wrongly merged. Falls back to the
+        dlib-based FaceCueExtractor when insightface is unavailable."""
+        try:
+            from reidentification.insight_face import InsightFaceExtractor
+            ex = InsightFaceExtractor()
+            if ex.enabled:
+                logger.info("✅ Face-based Re-ID cue: InsightFace ArcFace (512-dim)")
+                return ex
+        except Exception:
+            pass
+        fe = FaceCueExtractor()
+        if fe.enabled:
+            logger.info("✅ Face-based Re-ID cue: dlib face_recognition (128-dim)")
+        return fe
 
     # ── model ──────────────────────────────────────────────────────────────
 
@@ -1217,7 +1256,7 @@ class ReIDEngine:
                 return None
             return _normalize(np.mean(np.asarray(feats, dtype=np.float32), axis=0))
 
-        def _same_person(ta, tb, means):
+        def _same_person(ta, tb, means, app_saturated=False):
             fs = _face_sim(ta, tb)
             ma, mb = means.get(ta), means.get(tb)
             asim = float(_cosine(ma, mb)) if (ma is not None and mb is not None) else None
@@ -1226,7 +1265,31 @@ class ReIDEngine:
                     return True
                 if fs < CFG.FACE_SAME_TRACK_VETO:
                     return False
+                if app_saturated:
+                    # Everyone already looks alike (uniforms) — appearance
+                    # cannot separate an ambiguous face, so split.
+                    return False
+                # Ambiguous face: require same-person-level appearance before
+                # merging (see AMBIGUOUS_FACE_APPEARANCE_SAME).
+                return asim is not None and asim >= CFG.AMBIGUOUS_FACE_APPEARANCE_SAME
+            if app_saturated:
+                return False
             return asim is not None and asim >= CFG.APPEARANCE_SPLIT_THRESHOLD
+
+        def _appearance_saturated(tids, means):
+            """True when appearance is non-informative for this group: the
+            large majority of tracker pairs already look alike (uniforms)."""
+            app_pairs = 0
+            sat_pairs = 0
+            for i, ta in enumerate(tids):
+                for tb in tids[i + 1:]:
+                    ma, mb = means.get(ta), means.get(tb)
+                    if ma is None or mb is None:
+                        continue
+                    app_pairs += 1
+                    if float(_cosine(ma, mb)) >= CFG.APPEARANCE_SATURATED:
+                        sat_pairs += 1
+            return app_pairs >= 2 and sat_pairs / app_pairs >= 0.6
 
         split_count = 0
         for sid, tids in sorted(sid_tids.items()):
@@ -1237,6 +1300,10 @@ class ReIDEngine:
                         if means.get(t) is not None or self.tracker_faces.get(t)]
             if len(evidence) < 2:
                 continue
+            app_saturated = _appearance_saturated(tids, means)
+            if app_saturated:
+                logger.info(f"👥 sid={sid}: appearance saturated "
+                            f"(uniforms/identical clothing) -> face-only grouping")
             parent = {t: t for t in evidence}
             def find(x):
                 while parent[x] != x:
@@ -1245,7 +1312,7 @@ class ReIDEngine:
                 return x
             for i, ta in enumerate(evidence):
                 for tb in evidence[i+1:]:
-                    if _same_person(ta, tb, means):
+                    if _same_person(ta, tb, means, app_saturated):
                         ra, rb = find(ta), find(tb)
                         if ra != rb:
                             parent[ra] = rb
@@ -1555,7 +1622,7 @@ class ReIDEngine:
 #  Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="cuda", debug_trace=False):
+def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="cuda", debug_trace=False, stride=1):
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
 
@@ -1567,9 +1634,10 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
     cap = cv2.VideoCapture(video_path)
     results  = {}
     frame_id = 0
+    stride = max(1, int(stride))
 
     logger.info("=" * 60)
-    logger.info("▶  Re-ID pipeline")
+    logger.info("▶  Re-ID pipeline" + (f"  (stride={stride})" if stride > 1 else ""))
     logger.info("=" * 60)
 
     while True:
@@ -1577,6 +1645,11 @@ def run_reid_pipeline(video_path, tracking_json_path, output_json_path, device="
         if not ret:
             break
         frame_id += 1
+        # stride > 1: process every Nth frame — same person appears across many
+        # consecutive frames, so identity assignment is barely affected while
+        # runtime drops ~stride× (biggest win on CPU-only machines).
+        if (frame_id - 1) % stride != 0:
+            continue
         tracks = tracking_data.get(str(frame_id), [])
         results[frame_id] = engine.process_frame(frame, tracks, frame_id)
         if frame_id % 30 == 0:

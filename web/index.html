@@ -42,7 +42,7 @@
               <span class="tab-num">04</span> Results
             </button>
             <button class="tab-btn" data-tab="telemetry" role="tab" aria-selected="false">
-              <span class="tab-num">05</span> Telemetry
+              <span class="tab-num">05</span> Logs
             </button>
           </nav>
           <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch between dark and light mode" title="Switch theme">
@@ -66,6 +66,15 @@
               <button type="button" id="camMinus" class="stepper-btn" aria-label="Fewer cameras">−</button>
               <input id="cameraCount" type="number" min="1" max="12" value="2" inputmode="numeric" />
               <button type="button" id="camPlus" class="stepper-btn" aria-label="More cameras">+</button>
+            </div>
+          </div>
+
+          <div class="camera-count-row">
+            <label for="frameStride">Frame stride <span class="hint">(1 = every frame, 3 = 3× faster)</span></label>
+            <div class="stepper">
+              <button type="button" id="strideMinus" class="stepper-btn" aria-label="Lower stride">−</button>
+              <input id="frameStride" type="number" min="1" max="10" value="3" inputmode="numeric" />
+              <button type="button" id="stridePlus" class="stepper-btn" aria-label="Higher stride">+</button>
             </div>
           </div>
 
@@ -161,7 +170,6 @@
             </div>
             <div class="preview-controls">
               <select id="previewCameraSelect" aria-label="Camera to preview"></select>
-              <button id="previewPauseToggle" class="btn ghost small" type="button">⏸ Pause</button>
             </div>
           </div>
           <div class="overlay-stage">
@@ -196,10 +204,22 @@
         </section>
 
         <section class="panel reveal delay-2">
+          <div class="panel-head">
+            <h2>Camera Outputs</h2>
+            <p>Annotated videos with names on each box (names update after cross-camera resolution or a manual correction).</p>
+          </div>
+          <div id="cameraOutputs" class="camera-outputs"></div>
+          <div id="cameraOutputsEmpty" class="empty-state" hidden>
+            <p>No outputs yet.</p>
+            <span>Run processing first — the annotated video appears here once a camera finishes.</span>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-2">
           <div class="panel-head split">
             <div>
               <h2>Matched Identities</h2>
-              <p>Registered people recognised across the footage.</p>
+              <p>Registered people recognised across the footage. Use ✎ Rename to correct a wrong label — the fix is learned for future videos.</p>
             </div>
             <div class="search-box">
               <input id="resultsSearch" type="search" placeholder="Search matched people…" />
@@ -215,7 +235,7 @@
         <section class="panel reveal delay-2">
           <div class="panel-head">
             <h2>Unknown / Unmatched</h2>
-            <p>People seen on camera who aren't in the identity database.</p>
+            <p>People seen on camera who aren't in the identity database. Assign a name to teach the system.</p>
           </div>
           <div id="unmatchedList" class="results-list"></div>
           <div id="unmatchedEmpty" class="empty-state" hidden>
@@ -224,61 +244,13 @@
           </div>
         </section>
       </main>
-      <!-- ══════════════════ VIEW: TELEMETRY ══════════════════ -->
+      <!-- ══════════════════ VIEW: SYSTEM LOG ══════════════════ -->
       <main class="view" id="view-telemetry">
         <section class="panel reveal">
           <div class="panel-head split">
             <div>
-              <h2>System Health</h2>
-              <p>Inference hardware and stream integrity, sampled live.</p>
-            </div>
-            <span class="badge ok" id="telemetryLiveBadge"><span class="pulse-dot working"></span> LIVE</span>
-          </div>
-
-          <div class="telemetry-grid">
-            <div class="telemetry-card">
-              <div class="telemetry-card-head">
-                <span class="telemetry-label">GPU VRAM</span>
-                <span class="telemetry-value" id="vramValue">— / —</span>
-              </div>
-              <div class="gauge-track"><div class="gauge-fill" id="vramGauge"></div></div>
-              <span class="telemetry-sub" id="vramSub">device: —</span>
-            </div>
-
-            <div class="telemetry-card">
-              <div class="telemetry-card-head">
-                <span class="telemetry-label">GPU Utilization</span>
-                <span class="telemetry-value" id="gpuUtilValue">0%</span>
-              </div>
-              <div class="gauge-track"><div class="gauge-fill cool" id="gpuUtilGauge"></div></div>
-              <span class="telemetry-sub" id="gpuUtilSub">osnet_x1_0 backbone</span>
-            </div>
-
-            <div class="telemetry-card">
-              <div class="telemetry-card-head">
-                <span class="telemetry-label">Stream Drop Rate</span>
-                <span class="telemetry-value" id="dropRateValue">0.0%</span>
-              </div>
-              <div class="gauge-track"><div class="gauge-fill warn" id="dropRateGauge"></div></div>
-              <span class="telemetry-sub" id="dropRateSub">frames dropped / received</span>
-            </div>
-
-            <div class="telemetry-card wide">
-              <div class="telemetry-card-head">
-                <span class="telemetry-label">Inference Latency</span>
-                <span class="telemetry-value" id="latencyValue">0 ms</span>
-              </div>
-              <canvas id="latencyChart" class="latency-chart" height="72"></canvas>
-              <span class="telemetry-sub">rolling p50 · detection + Re-ID pass, per frame</span>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel reveal delay-2">
-          <div class="panel-head split">
-            <div>
               <h2>System Log</h2>
-              <p>Pipeline events, telemetry warnings, and Re-ID match alerts.</p>
+              <p>Pipeline events, detection/tracking stages, and Re-ID match alerts.</p>
             </div>
             <button id="logClearBtn" class="btn ghost small" type="button">Clear log</button>
           </div>

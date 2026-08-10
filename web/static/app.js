@@ -46,8 +46,6 @@ function goToTab(name) {
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   if (name === "people") loadPersons();
   if (name === "results" && currentSessionId) loadResults();
-  if (name === "telemetry") startTelemetry();
-  else stopTelemetry();
   if (name === "process" && activePreviewCamId) {
     // panel just became visible — canvas had 0 size while hidden, so resize before resuming
     requestAnimationFrame(resumePreviewPlayback);
@@ -67,6 +65,20 @@ let sessionCameraLabels = {};
 
 const cameraCountInput = $("#cameraCount");
 const cameraSlots = $("#cameraSlots");
+const frameStrideInput = $("#frameStride");
+
+function clampStride() {
+  frameStrideInput.value = Math.max(1, Math.min(10, parseInt(frameStrideInput.value || "3", 10)));
+}
+frameStrideInput.addEventListener("change", clampStride);
+$("#strideMinus").addEventListener("click", () => {
+  frameStrideInput.value = Math.max(1, parseInt(frameStrideInput.value || "3", 10) - 1);
+  clampStride();
+});
+$("#stridePlus").addEventListener("click", () => {
+  frameStrideInput.value = Math.min(10, parseInt(frameStrideInput.value || "3", 10) + 1);
+  clampStride();
+});
 
 function renderCameraSlots() {
   const n = Math.max(1, Math.min(12, parseInt(cameraCountInput.value || "1", 10)));
@@ -139,6 +151,7 @@ $("#startProcessingBtn").addEventListener("click", async () => {
   const form = new FormData();
   files.forEach((f) => form.append("files", f));
   labels.forEach((l) => form.append("labels", l));
+  form.append("stride", frameStrideInput.value || "3");
 
   $("#startProcessingBtn").disabled = true;
   $("#uploadHint").textContent = "Uploading and starting the pipeline…";
@@ -251,6 +264,13 @@ function initials(name) {
     .slice(0, 2)
     .map((p) => p[0].toUpperCase())
     .join("");
+}
+
+// Person avatar: the track thumbnail when we have one, otherwise initials/?
+function avatarHtml(hasThumb, fallbackText) {
+  const thumb = hasThumb && (hasThumb.thumb_url || hasThumb.sightings?.[0]?.thumb_url);
+  if (thumb) return `<img class="person-avatar" src="${thumb}" alt="" loading="lazy" />`;
+  return `<div class="person-avatar">${fallbackText}</div>`;
 }
 
 function personCard(p) {
@@ -520,6 +540,68 @@ function sightingChips(sightings) {
     .join("");
 }
 
+// ── correction helpers: persist a name onto a track, learn it in the DB ──
+
+async function assignTrackName(cameraId, trackId, name) {
+  const body = new FormData();
+  body.append("camera_id", cameraId);
+  body.append("track_id", String(trackId));
+  body.append("name", name || "");
+  const resp = await fetch(`/api/session/${currentSessionId}/correct`, { method: "POST", body });
+  if (!resp.ok) {
+    let detail = resp.statusText;
+    try {
+      detail = (await resp.json()).detail;
+    } catch (e) {
+      /* keep statusText */
+    }
+    throw new Error(detail);
+  }
+  return resp.json();
+}
+
+// After a name correction the backend re-renders and updates names, but the
+// browser's in-memory overlay cache still holds the OLD per-frame data — drop
+// it and refetch so the live box label shows the corrected name immediately.
+async function refreshOverlayAfterCorrection() {
+  for (const camId of Object.keys(realTrackCache)) delete realTrackCache[camId];
+  if (activePreviewCamId) await maybeFetchRealTracks(activePreviewCamId);
+}
+
+async function renamePerson(oldName, newName, sightings) {
+  // a person has at most one track per camera — correct each camera once
+  const perCam = {};
+  sightings.forEach((s) => {
+    if (!(s.camera_id in perCam)) perCam[s.camera_id] = s;
+  });
+  for (const s of Object.values(perCam)) {
+    await assignTrackName(s.camera_id, s.track_id, newName);
+  }
+}
+
+function renderCameraOutputs(cameras) {
+  const box = $("#cameraOutputs");
+  if (!box) return;
+  const empty = $("#cameraOutputsEmpty");
+  box.innerHTML = "";
+  const withVideo = cameras.filter((c) => c.output_url);
+  empty.hidden = withVideo.length > 0;
+  withVideo.forEach((c) => {
+    const item = document.createElement("div");
+    item.className = "camera-output";
+    item.innerHTML = `
+      <div class="camera-output-head">
+        <strong>${escapeHtml(c.label)}</strong>
+        <span class="result-sub">${c.people
+          .map((p) => escapeHtml(p.name || `unknown #${p.track_id}`))
+          .join(" · ")}</span>
+      </div>
+      <video controls preload="metadata" src="${c.output_url}"></video>
+    `;
+    box.appendChild(item);
+  });
+}
+
 function renderMatched(matched) {
   const list = $("#matchedList");
   const empty = $("#matchedEmpty");
@@ -531,14 +613,43 @@ function renderMatched(matched) {
     row.className = "result-row";
     row.innerHTML = `
       <div class="result-left">
-        <div class="person-avatar">${initials(m.name)}</div>
+        ${avatarHtml(m, initials(m.name))}
         <div>
           <div class="result-name">${escapeHtml(m.name)}</div>
           <div class="result-sub">Seen on ${cams.length} camera${cams.length === 1 ? "" : "s"} · match confidence ${(m.similarity * 100).toFixed(0)}%</div>
           <div>${sightingChips(m.sightings)}</div>
         </div>
       </div>
+      <button class="btn ghost small" type="button">✎ Rename</button>
     `;
+    const btn = row.querySelector("button");
+    btn.addEventListener("click", () => {
+      row.innerHTML = `
+        <div class="result-left" style="align-items:flex-start;flex:1;">
+          <div style="width:100%;">
+            <div class="result-name">Rename “${escapeHtml(m.name)}”</div>
+            <div class="result-sub">Applies to ${m.sightings.length} sighting(s). A new name auto-registers this person for future videos; blank clears to unknown.</div>
+            <input class="correction-input" value="${escapeHtml(m.name)}" autocomplete="off" />
+            <div style="margin-top:.6rem;display:flex;gap:.5rem;">
+              <button class="btn primary small" data-role="save" type="button">Save</button>
+              <button class="btn ghost small" data-role="cancel" type="button">Cancel</button>
+            </div>
+          </div>
+        </div>
+      `;
+      row.querySelector('[data-role="save"]').addEventListener("click", async () => {
+        const newName = row.querySelector(".correction-input").value.trim();
+        try {
+          await renamePerson(m.name, newName, m.sightings);
+          toast(newName ? `Renamed to “${newName}” and learned for future videos` : "Cleared name");
+          await refreshOverlayAfterCorrection();
+          loadResults();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
+      row.querySelector('[data-role="cancel"]').addEventListener("click", loadResults);
+    });
     list.appendChild(row);
   });
 }
@@ -553,13 +664,34 @@ function renderUnmatched(unmatched) {
     row.className = "result-row unmatched";
     row.innerHTML = `
       <div class="result-left">
-        <div class="person-avatar" style="background:linear-gradient(135deg,#5a6b80,#2c3646);color:#eaf0f7;">?</div>
-        <div>
+        ${avatarHtml(u, "?")}
+        <div style="flex:1;">
           <div class="result-name">Unknown person · ${escapeHtml(u.track_id)}</div>
           <div class="result-sub">${sightingChips([u])}</div>
+          <div style="margin-top:.6rem;display:flex;gap:.5rem;">
+            <input class="correction-input" placeholder="Assign name… (new names auto-register)" autocomplete="off" />
+            <button class="btn primary small" type="button">Save</button>
+          </div>
         </div>
       </div>
     `;
+    const saveBtn = row.querySelector("button");
+    const input = row.querySelector(".correction-input");
+    const doSave = async () => {
+      const name = input.value.trim();
+      try {
+        await assignTrackName(u.camera_id, u.track_id, name);
+        toast(name ? `${u.track_id} assigned to “${name}”` : "Cleared to unknown");
+        await refreshOverlayAfterCorrection();
+        loadResults();
+      } catch (err) {
+        toast(err.message, true);
+      }
+    };
+    saveBtn.addEventListener("click", doSave);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") doSave();
+    });
     list.appendChild(row);
   });
 }
@@ -579,6 +711,7 @@ async function loadResults() {
     lastMatched = data.matched;
     renderMatched(lastMatched);
     renderUnmatched(data.unmatched);
+    renderCameraOutputs(data.cameras || []);
     logEvent(
       "info",
       `Results ready: ${data.summary.matched} matched, ${data.summary.unknown} unknown across ${data.summary.camera_count} camera(s)`
@@ -651,112 +784,6 @@ $("#logClearBtn").addEventListener("click", () => {
 });
 
 /* ══════════════════════════════════════════════════════════════════════
-   05b — HARDWARE TELEMETRY (GPU VRAM / utilization / drop rate / latency)
-   Self-contained mock feed — swap `sampleTelemetry()` for a real metrics
-   endpoint (e.g. GET /api/telemetry) when the backend exposes one.
-   ══════════════════════════════════════════════════════════════════════ */
-
-const TELEMETRY_TOTAL_VRAM_GB = 12;
-const latencyHistory = [];
-const LATENCY_POINTS = 48;
-let telemetryTimer = null;
-let telemetryStarted = false;
-
-function sampleTelemetry() {
-  const gpuActive = document.querySelectorAll(".camera-status-row .badge.warn").length > 0;
-  const baseVram = gpuActive ? 6.4 : 2.1;
-  const vramUsed = clamp(baseVram + (Math.random() - 0.5) * 1.4, 0.6, TELEMETRY_TOTAL_VRAM_GB - 0.2);
-  const gpuUtil = clamp((gpuActive ? 62 : 8) + (Math.random() - 0.5) * 30, 2, 99);
-  const dropRate = clamp(gpuActive ? Math.random() * 2.2 : Math.random() * 0.4, 0, 8);
-  const latency = clamp((gpuActive ? 38 : 14) + (Math.random() - 0.5) * 16, 6, 120);
-  return { vramUsed, gpuUtil, dropRate, latency };
-}
-
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
-}
-
-function updateTelemetryDom({ vramUsed, gpuUtil, dropRate, latency }) {
-  $("#vramValue").textContent = `${vramUsed.toFixed(1)} / ${TELEMETRY_TOTAL_VRAM_GB} GB`;
-  $("#vramGauge").style.width = `${(vramUsed / TELEMETRY_TOTAL_VRAM_GB) * 100}%`;
-  $("#vramSub").textContent = `device: ${navigator.gpu ? "WebGPU-capable" : "cuda / cpu fallback"}`;
-
-  $("#gpuUtilValue").textContent = `${gpuUtil.toFixed(0)}%`;
-  $("#gpuUtilGauge").style.width = `${gpuUtil}%`;
-
-  $("#dropRateValue").textContent = `${dropRate.toFixed(1)}%`;
-  $("#dropRateGauge").style.width = `${Math.min(100, dropRate * 10)}%`;
-
-  $("#latencyValue").textContent = `${latency.toFixed(0)} ms`;
-
-  latencyHistory.push(latency);
-  if (latencyHistory.length > LATENCY_POINTS) latencyHistory.shift();
-  drawLatencyChart();
-
-  if (dropRate > 5) logEvent("warn", `Elevated stream drop rate: ${dropRate.toFixed(1)}%`);
-}
-
-function drawLatencyChart() {
-  const canvas = $("#latencyChart");
-  if (!canvas || latencyHistory.length < 2) return;
-  const dpr = window.devicePixelRatio || 1;
-  const cssWidth = canvas.clientWidth || 600;
-  const cssHeight = 72;
-  if (canvas.width !== cssWidth * dpr || canvas.height !== cssHeight * dpr) {
-    canvas.width = cssWidth * dpr;
-    canvas.height = cssHeight * dpr;
-  }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssWidth, cssHeight);
-
-  const max = Math.max(60, ...latencyHistory);
-  const stepX = cssWidth / (LATENCY_POINTS - 1);
-  const styles = getComputedStyle(document.documentElement);
-  const lineColor = styles.getPropertyValue("--cool").trim() || "#4ee3d1";
-
-  ctx.beginPath();
-  latencyHistory.forEach((v, i) => {
-    const x = i * stepX;
-    const y = cssHeight - (v / max) * (cssHeight - 8) - 4;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = lineColor;
-  ctx.lineJoin = "round";
-  ctx.stroke();
-
-  // filled area under the line for a glanceable "load" feel
-  ctx.lineTo((latencyHistory.length - 1) * stepX, cssHeight);
-  ctx.lineTo(0, cssHeight);
-  ctx.closePath();
-  const grad = ctx.createLinearGradient(0, 0, 0, cssHeight);
-  grad.addColorStop(0, lineColor + "55");
-  grad.addColorStop(1, lineColor + "00");
-  ctx.fillStyle = grad;
-  ctx.fill();
-}
-
-function telemetryTick() {
-  updateTelemetryDom(sampleTelemetry());
-}
-
-function startTelemetry() {
-  if (telemetryTimer) return;
-  telemetryTick();
-  telemetryTimer = setInterval(telemetryTick, 1400);
-  if (!telemetryStarted) {
-    telemetryStarted = true;
-    logEvent("info", "Telemetry stream connected");
-  }
-}
-function stopTelemetry() {
-  clearInterval(telemetryTimer);
-  telemetryTimer = null;
-}
-
-/* ══════════════════════════════════════════════════════════════════════
    05c — LIVE DETECTION PREVIEW (real video + canvas overlay)
    The uploaded camera clip plays in a <video> element; a transparent
    <canvas> sits on top of it and is redrawn every animation frame.
@@ -772,22 +799,13 @@ function stopTelemetry() {
      3. videoBoxToCanvas() scales a video-space box into that rectangle and
         clamps it so it can never extend past the real video content into
         the letterbox bars.
-   Until a camera's real tracks are ready, mock tracks fill in (also in
-   video-pixel space) so the preview isn't empty — the mode badge in the
-   corner of the stage tells you which one you're looking at.
+   Until a camera's real tracks are ready, the preview shows the plain video
+   (no fake boxes) — the badge tells you whether real detections are loaded.
    ══════════════════════════════════════════════════════════════════════ */
-
-const MOCK_SUBJECTS = [
-  { track_id: 101, name: "Subject_Alpha" },
-  { track_id: 104, name: "Subject_Beta" },
-  { track_id: 118, name: null },
-  { track_id: 122, name: "Subject_Ophelia" },
-];
 
 const sessionVideoUrls = {}; // camera_id -> object URL, set when a session starts
 const realTrackCache = {}; // camera_id -> { fps, frames: [{t, boxes}], fetching }
 let overlayRaf = null;
-let overlayMockTracks = [];
 let overlayAlertTimer = null;
 let overlayResizeObserver = null;
 let activePreviewCamId = null;
@@ -821,34 +839,19 @@ function loadPreviewCamera(camId) {
     stage.classList.add("has-video");
     resizeOverlayCanvas();
     video.play().catch(() => {
-      /* autoplay can be blocked before user interaction — Pause button still works */
+      /* autoplay can be blocked before user interaction */
     });
   };
 
-  seedMockTracks(video);
   updateOverlayModeBadge();
   // if this camera already finished processing (e.g. switching back to it),
   // real detections may already be cached or fetchable
   if (!realTrackCache[camId]) maybeFetchRealTracks(camId);
-
-  $("#previewPauseToggle").textContent = "⏸ Pause";
 }
 
 $("#previewCameraSelect").addEventListener("change", (e) => {
   loadPreviewCamera(e.target.value);
   logEvent("info", `Preview switched to ${sessionCameraLabels[e.target.value] || e.target.value}`);
-});
-
-$("#previewPauseToggle").addEventListener("click", () => {
-  const video = $("#previewVideo");
-  if (video.paused) {
-    video.play();
-    if (!overlayRaf) startOverlay();
-    $("#previewPauseToggle").textContent = "⏸ Pause";
-  } else {
-    video.pause();
-    $("#previewPauseToggle").textContent = "▶ Resume";
-  }
 });
 
 function resizeOverlayCanvas() {
@@ -877,7 +880,12 @@ async function maybeFetchRealTracks(camId) {
   try {
     const resp = await fetch(`/api/session/${currentSessionId}/camera/${camId}/tracks`);
     if (resp.status === 409) {
-      delete realTrackCache[camId]; // not ready — try again once status flips to completed
+      // not ready yet — poll again while the session is still active; the
+      // retry chain self-terminates once the camera completes and returns 200
+      delete realTrackCache[camId];
+      setTimeout(() => {
+        if (currentSessionId) maybeFetchRealTracks(camId);
+      }, 3000);
       return;
     }
     if (!resp.ok) throw new Error("Could not load detections for this camera");
@@ -898,45 +906,8 @@ function updateOverlayModeBadge() {
   if (!badge) return;
   const cache = realTrackCache[activePreviewCamId];
   const isLive = cache && !cache.fetching && cache.frames.length > 0;
-  badge.textContent = isLive ? "● LIVE DETECTIONS" : "◌ DEMO OVERLAY (sample data)";
+  badge.textContent = isLive ? "● LIVE DETECTIONS" : "AWAITING PROCESSING";
   badge.classList.toggle("live", !!isLive);
-}
-
-// ── mock fallback tracks, expressed in video-pixel space like real ones ──
-
-function seedMockTracks(video) {
-  const vw = video.videoWidth || 1280;
-  const vh = video.videoHeight || 720;
-  overlayMockTracks = MOCK_SUBJECTS.map((s, i) => ({
-    ...s,
-    _vw: vw,
-    _vh: vh,
-    cx: (0.12 + i * (0.7 / MOCK_SUBJECTS.length) + Math.random() * 0.04) * vw,
-    cy: (0.35 + Math.random() * 0.3) * vh,
-    vx: (Math.random() - 0.5) * vw * 0.0035,
-    vy: (Math.random() - 0.5) * vh * 0.002,
-    boxW: (0.1 + Math.random() * 0.05) * vw,
-    boxH: (0.45 + Math.random() * 0.15) * vh,
-    similarity: s.name ? 0.9 + Math.random() * 0.099 : null,
-  }));
-}
-
-function stepMockTracks() {
-  overlayMockTracks.forEach((t) => {
-    t.cx += t.vx;
-    t.cy += t.vy;
-    if (t.cx - t.boxW / 2 < 0 || t.cx + t.boxW / 2 > t._vw) t.vx *= -1;
-    if (t.cy - t.boxH / 2 < 0 || t.cy + t.boxH / 2 > t._vh) t.vy *= -1;
-  });
-  return overlayMockTracks.map((t) => ({
-    track_id: t.track_id,
-    name: t.name,
-    similarity: t.similarity,
-    x1: t.cx - t.boxW / 2,
-    y1: t.cy - t.boxH / 2,
-    x2: t.cx + t.boxW / 2,
-    y2: t.cy + t.boxH / 2,
-  }));
 }
 
 // binary search for the sampled frame nearest video.currentTime
@@ -956,22 +927,20 @@ function findNearestFrame(frames, t, tolerance = 0.35) {
 
 function getActiveBoxes(video) {
   const cache = realTrackCache[activePreviewCamId];
-  if (cache && !cache.fetching && cache.frames.length > 0) {
-    const frame = findNearestFrame(cache.frames, video.currentTime);
-    if (!frame) return [];
-    return frame.boxes
-      .filter((b) => Array.isArray(b.bbox) && b.bbox.length === 4)
-      .map((b) => ({
-        track_id: b.track_id,
-        name: b.name,
-        similarity: b.similarity,
-        x1: b.bbox[0],
-        y1: b.bbox[1],
-        x2: b.bbox[2],
-        y2: b.bbox[3],
-      }));
-  }
-  return stepMockTracks();
+  if (!cache || cache.fetching || cache.frames.length === 0) return [];
+  const frame = findNearestFrame(cache.frames, video.currentTime);
+  if (!frame) return [];
+  return frame.boxes
+    .filter((b) => Array.isArray(b.bbox) && b.bbox.length === 4)
+    .map((b) => ({
+      track_id: b.track_id,
+      name: b.name,
+      similarity: b.similarity,
+      x1: b.bbox[0],
+      y1: b.bbox[1],
+      x2: b.bbox[2],
+      y2: b.bbox[3],
+    }));
 }
 
 // ── coordinate transform: video-intrinsic pixels -> canvas display pixels,
@@ -1019,66 +988,56 @@ function videoBoxToCanvas(box, rect) {
   return { x: px1, y: py1, w: Math.max(0, px2 - px1), h: Math.max(0, py2 - py1) };
 }
 
-// ── rendering: RED = database match (alert / target), GREEN = unidentified ──
+// ── rendering: solid BLACK box with a BLACK label placard. RED text = known
+//    person (name / ID), GREEN text = unknown. No blink pulse — a box stays
+//    steadily visible so identities can be read at a glance.
 
-function drawBoundingBox(ctx, px, isMatch, pulse) {
-  const color = isMatch ? "#ff3b5c" : "#3ddc7a";
+const BOX_COLOR = "#000000"; // black box (both known & unknown)
+const TEXT_KNOWN_COLOR = "#ff0000"; // red — known person
+const TEXT_UNKNOWN_COLOR = "#00ff00"; // green — unknown person
+
+function drawBoundingBox(ctx, px, isMatch) {
   ctx.save();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = isMatch ? 2 + pulse * 1.4 : 2;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = isMatch ? 10 + pulse * 10 : 6;
+  // thin light outline underneath so the black box pops on dark backgrounds
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+  ctx.lineWidth = 2;
   ctx.strokeRect(px.x, px.y, px.w, px.h);
-
-  // corner ticks for a tactical-HUD feel
-  const c = 10;
-  ctx.lineWidth = 3;
-  ctx.shadowBlur = 0;
-  [
-    [px.x, px.y, c, 0, 0, c],
-    [px.x + px.w, px.y, -c, 0, 0, c],
-    [px.x, px.y + px.h, c, 0, 0, -c],
-    [px.x + px.w, px.y + px.h, -c, 0, 0, -c],
-  ].forEach(([x, y, dx1, dy1, dx2, dy2]) => {
-    ctx.beginPath();
-    ctx.moveTo(x + dx1, y + dy1);
-    ctx.lineTo(x, y);
-    ctx.lineTo(x + dx2, y + dy2);
-    ctx.stroke();
-  });
+  ctx.strokeStyle = BOX_COLOR;
+  ctx.lineWidth = 4;
+  ctx.strokeRect(px.x, px.y, px.w, px.h);
   ctx.restore();
 }
 
-function drawPlacard(ctx, px, box, isMatch, pulse, rect) {
+function drawPlacard(ctx, px, box, isMatch, rect) {
+  const textColor = isMatch ? TEXT_KNOWN_COLOR : TEXT_UNKNOWN_COLOR;
   const label = isMatch
-    ? `⚠ TARGET — ${box.name} · ID ${box.track_id}${
+    ? `${box.name} · ID ${box.track_id}${
         box.similarity != null ? ` [Match: ${(box.similarity * 100).toFixed(1)}%]` : ""
       }`
     : `ID ${box.track_id} — Unidentified`;
-  const color = isMatch ? "#ff3b5c" : "#3ddc7a";
 
   ctx.save();
-  ctx.font = "700 12px 'JetBrains Mono', monospace";
+  ctx.font = "700 13px 'JetBrains Mono', monospace";
   const paddingX = 8;
   const textWidth = ctx.measureText(label).width;
   const boxW = textWidth + paddingX * 2;
-  const boxH = 20;
+  const boxH = 22;
   // keep the placard within the actual video content area, same rule as the box itself
   const maxX = rect.offsetX + rect.drawW - boxW - 2;
   const bx = Math.max(rect.offsetX + 2, Math.min(px.x, maxX));
   const by = Math.max(rect.offsetY + 2, px.y - boxH - 4);
 
-  ctx.globalAlpha = isMatch ? 0.75 + pulse * 0.25 : 0.82;
-  ctx.fillStyle = isMatch ? "rgba(255, 20, 60, 0.92)" : "rgba(10, 16, 24, 0.85)";
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1;
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = BOX_COLOR; // black label background
+  ctx.strokeStyle = textColor;
+  ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.roundRect ? ctx.roundRect(bx, by, boxW, boxH, 5) : ctx.rect(bx, by, boxW, boxH);
   ctx.fill();
   ctx.stroke();
 
   ctx.globalAlpha = 1;
-  ctx.fillStyle = isMatch ? "#fff" : "#eaf0f7";
+  ctx.fillStyle = textColor;
   ctx.textBaseline = "middle";
   ctx.fillText(label, bx + paddingX, by + boxH / 2 + 1);
   ctx.restore();
@@ -1096,15 +1055,14 @@ function renderOverlayFrame(ctx, canvas, video) {
   const rect = getContainRect(vw, vh, cw, ch);
   if (!rect) return;
 
-  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 220);
   const boxes = getActiveBoxes(video);
 
   boxes.forEach((b) => {
     const px = videoBoxToCanvas(b, rect);
     if (px.w <= 0 || px.h <= 0) return; // fully clamped out of the visible frame
     const isMatch = !!b.name;
-    drawBoundingBox(ctx, px, isMatch, pulse);
-    drawPlacard(ctx, px, b, isMatch, pulse, rect);
+    drawBoundingBox(ctx, px, isMatch);
+    drawPlacard(ctx, px, b, isMatch, rect);
   });
 }
 
