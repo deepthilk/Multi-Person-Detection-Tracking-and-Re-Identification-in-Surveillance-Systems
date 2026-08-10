@@ -211,6 +211,7 @@ $("#personPhotos").addEventListener("change", (e) => {
 $("#registerForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = $("#personName").value.trim();
+  const status = $("#personStatus").value;
   const hint = $("#registerHint");
 
   if (!name) return toast("Enter a name first", true);
@@ -218,6 +219,7 @@ $("#registerForm").addEventListener("submit", async (e) => {
 
   const form = new FormData();
   form.append("name", name);
+  form.append("status", status);
   pendingPhotos.forEach((f) => form.append("files", f));
 
   const btn = $("#registerBtn");
@@ -231,11 +233,12 @@ $("#registerForm").addEventListener("submit", async (e) => {
       const detail = await resp.json().catch(() => ({}));
       throw new Error(detail.detail || "Registration failed");
     }
-    toast(`${name} registered`);
-    logEvent("info", `Registered "${name}" with ${pendingPhotos.length} photo(s)`);
+    toast(`${name} registered (${status})`);
+    logEvent("info", `Registered "${name}" with ${pendingPhotos.length} photo(s) [${status}]`);
     btn.classList.add("success-pulse");
     setTimeout(() => btn.classList.remove("success-pulse"), 700);
     $("#personName").value = "";
+    $("#personStatus").value = "normal";
     pendingPhotos = [];
     refreshRegisterPreview();
     loadPersons();
@@ -261,6 +264,9 @@ function personCard(p) {
   el.className = "person-card";
   const when = p.registered_at ? new Date(p.registered_at).toLocaleDateString() : "—";
   const photos = p.photos || [];
+  const status = p.status || "normal";
+  const statusLabels = { normal: "Normal", criminal: "Criminal", missing: "Missing", wanted: "Wanted" };
+  const statusClass = `status-${status}`;
   const thumbsHtml = photos
     .slice(0, 5)
     .map(
@@ -276,7 +282,7 @@ function personCard(p) {
     <div class="person-card-head">
       <div class="person-avatar">${initials(p.name)}</div>
       <div>
-        <div class="person-name">${escapeHtml(p.name)}</div>
+        <div class="person-name">${escapeHtml(p.name)} <span class="status-badge ${statusClass}">${statusLabels[status] || status}</span></div>
         <div class="person-meta">${p.num_images} photo${p.num_images === 1 ? "" : "s"} · added ${when}</div>
       </div>
     </div>
@@ -1087,6 +1093,7 @@ function getActiveBoxes(video) {
       .map((b) => ({
         track_id: b.track_id,
         name: b.name,
+        status: b.status || "normal",
         similarity: b.similarity,
         x1: b.bbox[0],
         y1: b.bbox[1],
@@ -1144,13 +1151,23 @@ function videoBoxToCanvas(box, rect) {
 
 // ── rendering: RED = database match (alert / target), GREEN = unidentified ──
 
-function drawBoundingBox(ctx, px, isMatch, pulse) {
-  const color = isMatch ? "#ff3b5c" : "#3ddc7a";
+const STATUS_COLORS = {
+  criminal: "#dc2626",
+  missing:  "#ea580c",
+  wanted:   "#ca8a04",
+  normal:   "#3ddc7a",
+};
+
+function drawBoundingBox(ctx, px, isMatch, pulse, status) {
+  const color = isMatch ? (STATUS_COLORS[status] || "#ff3b5c") : "#6b7280";
+  const shouldFlash = isMatch && (status === "criminal" || status === "missing");
+  const flashAlpha = shouldFlash ? 0.5 + 0.5 * Math.sin(performance.now() / 150) : 1;
   ctx.save();
   ctx.strokeStyle = color;
   ctx.lineWidth = isMatch ? 2 + pulse * 1.4 : 2;
   ctx.shadowColor = color;
   ctx.shadowBlur = isMatch ? 10 + pulse * 10 : 6;
+  ctx.globalAlpha = shouldFlash ? flashAlpha : 1;
   ctx.strokeRect(px.x, px.y, px.w, px.h);
 
   // corner ticks for a tactical-HUD feel
@@ -1173,12 +1190,14 @@ function drawBoundingBox(ctx, px, isMatch, pulse) {
 }
 
 function drawPlacard(ctx, px, box, isMatch, pulse, rect) {
+  const statusLabels = { criminal: "CRIMINAL", missing: "MISSING", wanted: "WANTED", normal: "" };
+  const statusPrefix = isMatch && statusLabels[box.status] ? `⚠ ${statusLabels[box.status]} — ` : "";
   const label = isMatch
-    ? `⚠ TARGET — ${box.name} · ID ${box.track_id}${
+    ? `${statusPrefix}${box.name} · ID ${box.track_id}${
         box.similarity != null ? ` [Match: ${(box.similarity * 100).toFixed(1)}%]` : ""
       }`
     : `ID ${box.track_id} — Unidentified`;
-  const color = isMatch ? "#ff3b5c" : "#3ddc7a";
+  const color = isMatch ? (STATUS_COLORS[box.status] || "#ff3b5c") : "#6b7280";
 
   ctx.save();
   ctx.font = "700 12px 'JetBrains Mono', monospace";
@@ -1191,8 +1210,9 @@ function drawPlacard(ctx, px, box, isMatch, pulse, rect) {
   const bx = Math.max(rect.offsetX + 2, Math.min(px.x, maxX));
   const by = Math.max(rect.offsetY + 2, px.y - boxH - 4);
 
+  const bgColor = isMatch ? color : "rgba(10, 16, 24, 0.85)";
   ctx.globalAlpha = isMatch ? 0.75 + pulse * 0.25 : 0.82;
-  ctx.fillStyle = isMatch ? "rgba(255, 20, 60, 0.92)" : "rgba(10, 16, 24, 0.85)";
+  ctx.fillStyle = isMatch ? bgColor : "rgba(10, 16, 24, 0.85)";
   ctx.strokeStyle = color;
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -1201,7 +1221,7 @@ function drawPlacard(ctx, px, box, isMatch, pulse, rect) {
   ctx.stroke();
 
   ctx.globalAlpha = 1;
-  ctx.fillStyle = isMatch ? "#fff" : "#eaf0f7";
+  ctx.fillStyle = "#fff";
   ctx.textBaseline = "middle";
   ctx.fillText(label, bx + paddingX, by + boxH / 2 + 1);
   ctx.restore();
@@ -1226,7 +1246,7 @@ function renderOverlayFrame(ctx, canvas, video) {
     const px = videoBoxToCanvas(b, rect);
     if (px.w <= 0 || px.h <= 0) return; // fully clamped out of the visible frame
     const isMatch = !!b.name;
-    drawBoundingBox(ctx, px, isMatch, pulse);
+    drawBoundingBox(ctx, px, isMatch, pulse, b.status);
     drawPlacard(ctx, px, b, isMatch, pulse, rect);
   });
 }
@@ -1380,9 +1400,74 @@ async function restoreSession() {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+   alerts
+   ══════════════════════════════════════════════════════════════════════ */
+
+const ALERT_COLORS = {
+  critical: { bg: "#dc2626", text: "#fff", label: "CRIMINAL" },
+  high:     { bg: "#ea580c", text: "#fff", label: "MISSING" },
+  medium:   { bg: "#ca8a04", text: "#000", label: "WANTED" },
+  low:      { bg: "#16a34a", text: "#fff", label: "NORMAL" },
+};
+
+async function loadAlerts() {
+  const list = $("#alertsList");
+  const empty = $("#alertsEmpty");
+  try {
+    const resp = await fetch("/api/alerts");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const alerts = data.alerts || data;
+    list.innerHTML = "";
+    if (!Array.isArray(alerts) || alerts.length === 0) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    alerts.sort((a, b) => {
+      const order = { critical: 0, high: 1, medium: 2, low: 3 };
+      return (order[a.alert_level] || 4) - (order[b.alert_level] || 4);
+    });
+    alerts.forEach((a) => {
+      const person = a.person || {};
+      const level = a.alert_level || "low";
+      const cfg = ALERT_COLORS[level] || ALERT_COLORS.low;
+      const photo = (person.photos && person.photos[0]) || "";
+      const sim = a.similarity != null ? (a.similarity * 100).toFixed(1) + "%" : "—";
+      const card = document.createElement("div");
+      card.className = "alert-card";
+      card.style.borderLeft = `4px solid ${cfg.bg}`;
+      card.innerHTML = `
+        <div class="alert-header">
+          <span class="status-badge status-${person.status || 'normal'}" style="background:${cfg.bg};color:${cfg.text}">${cfg.label}</span>
+          <span class="alert-time">${a.timestamp || ""}</span>
+        </div>
+        <div class="alert-body">
+          ${photo ? `<img class="alert-photo" src="${photo}" alt="" />` : ""}
+          <div class="alert-info">
+            <div class="alert-name">${escapeHtml(person.name || a.name || "Unknown")}</div>
+            <div class="alert-detail">Match: ${sim} · Camera: ${a.camera_label || a.camera || "—"}</div>
+          </div>
+        </div>
+      `;
+      list.appendChild(card);
+    });
+  } catch (err) {
+    logEvent("warn", `Could not load alerts: ${err.message}`);
+  }
+}
+
+$("#clearAlertsBtn")?.addEventListener("click", async () => {
+  await fetch("/api/alerts", { method: "DELETE" });
+  loadAlerts();
+  toast("Alerts cleared");
+});
+
+/* ══════════════════════════════════════════════════════════════════════
    init
    ══════════════════════════════════════════════════════════════════════ */
 
 loadPersons();
+loadAlerts();
 restoreSession();
 logEvent("info", "Console initialized — awaiting camera input");

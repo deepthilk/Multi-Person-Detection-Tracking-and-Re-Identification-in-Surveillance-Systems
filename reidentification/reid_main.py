@@ -82,11 +82,22 @@ class ReIDConfig:
     REAPPEAR_THRESHOLD_OSNET:     float = 0.50   # LOWERED for uniforms — weak appearance signals
     REACTIVATE_THRESHOLD_OSNET:   float = 0.58   # LOWERED for uniforms
 
-    # ResNet fallback thresholds (looser)
-    MATCH_THRESHOLD_RESNET:       float = 0.52   # LOWERED from 0.55
-    FALLBACK_THRESHOLD_RESNET:    float = 0.45   # LOWERED from 0.48
-    REAPPEAR_THRESHOLD_RESNET:    float = 0.45   # LOWERED from 0.48
-    REACTIVATE_THRESHOLD_RESNET:  float = 0.52   # LOWERED from 0.55
+    # ResNet fallback thresholds — tuned for weak body model (Celeb-reID).
+    # T_MATCH must be low enough that the SAME person across frames can match
+    # (same-person score ≈ 0.60-0.70 due to weak model + motion/IOU blend).
+    # Different people also score similarly on body, but face veto
+    # (face_sim < 0.30 → score forced to 0.0) blocks false merges.
+    MATCH_THRESHOLD_RESNET:       float = 0.65   # allows same-person re-match
+    FALLBACK_THRESHOLD_RESNET:    float = 0.60   # greedy fallback
+    REAPPEAR_THRESHOLD_RESNET:    float = 0.60   # re-appearance after long gap
+    REACTIVATE_THRESHOLD_RESNET:  float = 0.65   # reactivation
+
+    # Face-confirmed thresholds — used when ArcFace similarity >= face_confirm.
+    # When face says "same person", we trust it and use a much lower bar.
+    # This lets the engine re-identify returning people even when the weak
+    # body model alone can't reach the conservative T_MATCH/T_REAPPEAR.
+    MATCH_THRESHOLD_FACE_CONFIRMED:    float = 0.55  # face overrides strict body bar
+    REAPPEAR_THRESHOLD_FACE_CONFIRMED: float = 0.50  # face overrides strict reappear bar
 
     # Scoring weights — UNIFORM MODE (motion > appearance)
     W_APPEARANCE: float = 0.50   # HEAVILY LOWERED for uniforms — appearance identical
@@ -111,7 +122,7 @@ class ReIDConfig:
 
     # Continuity lock — STRENGTHENED for uniforms (hard to change ID)
     TRACK_LOCK_GAP:       int   = 150  # GREATLY INCREASED for uniforms — remember ID longer
-    TRACK_LOCK_MIN_SCORE: float = 0.40 # LOWERED threshold but longer duration compensates
+    TRACK_LOCK_MIN_SCORE: float = 0.55 # continuity lock — same person should reach this
 
     # Gallery — larger + more frequent updates reduce identity drift by
     # keeping a more diverse set of appearance snapshots per person.
@@ -126,7 +137,7 @@ class ReIDConfig:
 
     # Size gates
     MIN_CROP_PX:     int   = 8      # min pixels after clamping
-    MIN_HEIGHT:      int   = 30     # lowered from 50 — keep small/far people
+    MIN_HEIGHT:      int   = 40     # raised from 30 — prevent partial/head-only detections creating wrong IDs
     MIN_AREA_RATIO:  float = 0.0008
     # Duplicate-detection merge (before any tracking/Re-ID even runs): when
     # YOLO/NMS produces two overlapping boxes for one physical person, they
@@ -141,7 +152,7 @@ class ReIDConfig:
     # 0.5, which still requires substantial overlap (so two genuinely
     # different people standing close together in a crossing won't get
     # wrongly merged here) while catching realistic duplicate detections.
-    DEDUP_IOU:       float = 0.50
+    DEDUP_IOU:       float = 0.35
 
     # Temporal
     # How long (in frames) an identity stays eligible for re-matching before
@@ -187,7 +198,7 @@ class ReIDConfig:
     # chance for a genuinely new person to accidentally cross the (loose,
     # uniform-tolerant) reappearance threshold and get wrongly merged into
     # an existing identity — see REAPPEAR_NO_FACE_PENALTY below.
-    NEW_ID_GRACE_FRAMES: int = 2   # 2 frames grace - give PASS3 time to re-match
+    NEW_ID_GRACE_FRAMES: int = 1   # LOWERED from 2 — create new IDs faster when body model is weak
 
     # Body-only reappearance (no face confirmation available) is penalised
     # by this much before comparing against T_REAPPEAR — see _score().
@@ -590,6 +601,8 @@ class ReIDEngine:
         self._face_attempts = 0
         self._face_hits     = 0
         self._new_id_grace: dict = {}   # tracker_id -> consecutive PASS4-miss count
+        self._face_last_extract: dict = {}  # tracker_id -> frame_id of last face extraction
+        self._face_cache: dict = {}         # tracker_id -> (embedding, score, face_bbox) or None
 
         if self.use_osnet:
             self.T_MATCH    = CFG.MATCH_THRESHOLD_OSNET
@@ -794,37 +807,6 @@ class ReIDEngine:
                 locked_rows.add(row); locked_cols.add(sid_to_col[sid])
                 self._trace(frame_id, f"PASS0 lock: tid={candidates[row]['tid']} -> sid={sid} score={s:.3f}")
 
-        # -- PASS 0b: face-lock for new trackers --
-        # When a brand-new tracker enters with a face, check if it matches
-        # any established identity's face. If yes, assign directly.
-        # PRIMARY fix for identity persistence across re-entries.
-        if stable_ids:
-            from reidentification.face_cue import FaceCueExtractor
-            for i, cand in enumerate(candidates):
-                if i in assigned:
-                    continue
-                if self.track_to_identity.get(cand['tid']) is not None:
-                    continue
-                cand_face = cand.get('face_feat')
-                if cand_face is None:
-                    continue
-                best_sid, best_s = None, -1.0
-                for sid in stable_ids:
-                    if sid in used:
-                        continue
-                    ident = self.identity_db[sid]
-                    exist_face = ident.face_descriptor
-                    if exist_face is None:
-                        continue
-                    fsim = FaceCueExtractor.similarity(exist_face, cand_face)
-                    if fsim is not None and fsim > best_s:
-                        best_s = fsim
-                        best_sid = sid
-                if best_sid is not None and best_s >= 0.25:
-                    self._trace(frame_id, f"PASS0b FACE-LOCK: tid={cand['tid']} -> sid={best_sid} face_sim={best_s:.3f}")
-                    assigned[i] = best_sid; used.add(best_sid)
-
-
         # ── PASS 1: Hungarian (short-gap candidates) ──────────────────────
         if stable_ids:
             rem_r = [r for r in range(len(candidates)) if r not in locked_rows]
@@ -844,7 +826,13 @@ class ReIDEngine:
                 for r_rel, c_rel in zip(rr, rc):
                     r   = use_r[r_rel]; c = rem_c[c_rel]
                     sid = stable_ids[c]; s = float(score_matrix[r, c])
-                    if s < self.T_MATCH or sid in used:
+                    # Face-confirmed: when face says "same person", use lower bar
+                    cand_face = candidates[r].get('face_feat')
+                    ident = self.identity_db.get(sid)
+                    f_sim = ident.face_similarity(cand_face) if cand_face is not None and ident is not None else None
+                    face_ok = f_sim is not None and f_sim >= CFG.FACE_MIN_SIMILARITY
+                    eff_match = CFG.MATCH_THRESHOLD_FACE_CONFIRMED if face_ok else self.T_MATCH
+                    if s < eff_match or sid in used:
                         continue
                     is_cross = any((r,j) in cross for j in range(len(candidates)))
                     prev = self.track_to_identity.get(candidates[r]['tid'])
@@ -876,7 +864,15 @@ class ReIDEngine:
                     s = float(score_matrix[i, c])
                     if s > best_s:
                         best_s, best_sid = s, sid
-                if best_sid is None or best_s < self.T_FALLBACK:
+                if best_sid is None:
+                    continue
+                # Face-confirmed: when face says "same person", use lower bar
+                cand_face = cand.get('face_feat')
+                ident2 = self.identity_db.get(best_sid)
+                f_sim2 = ident2.face_similarity(cand_face) if cand_face is not None and ident2 is not None else None
+                face_ok2 = f_sim2 is not None and f_sim2 >= CFG.FACE_MIN_SIMILARITY
+                eff_fallback = CFG.MATCH_THRESHOLD_FACE_CONFIRMED if face_ok2 else self.T_FALLBACK
+                if best_s < eff_fallback:
                     continue
                 prev = self.track_to_identity.get(cand['tid'])
                 if prev is not None and prev in sid_to_col and prev != best_sid:
@@ -899,41 +895,6 @@ class ReIDEngine:
         # Uses appearance-only score (already computed in _score for long gaps)
         # with a lower threshold (T_REAPPEAR=0.55 vs T_MATCH=0.65).
         if stable_ids:
-            face_confirm_pass = 0.30  # ArcFace same-person starts at ~0.36 (blurry/angled faces)
-            from reidentification.face_cue import FaceCueExtractor
-            for i, cand in enumerate(candidates):
-                if i in assigned:
-                    continue
-                cand_face = cand.get('face_feat')
-                if cand_face is None:
-                    continue
-                best_face_sid, best_face_s = None, -1.0
-                for c, sid in enumerate(stable_ids):
-                    if sid in used:
-                        continue
-                    ident = self.identity_db[sid]
-                    if frame_id - ident.last_frame <= CFG.REAPPEAR_GAP:
-                        continue
-                    ident_face = ident.face_descriptor
-                    if ident_face is None:
-                        continue
-                    fsim = FaceCueExtractor.similarity(ident_face, cand_face)
-                    if fsim is not None and fsim > best_face_s:
-                        best_face_s = fsim
-                        best_face_sid = sid
-                if best_face_sid is not None and best_face_s >= face_confirm_pass:
-                    prev = self.track_to_identity.get(cand['tid'])
-                    if prev is not None and prev in sid_to_col and prev != best_face_sid:
-                        ps = float(score_matrix[i, sid_to_col[prev]])
-                        allowed = self._switch_allowed(
-                                best_face_s, ps, cand_face,
-                                self.identity_db[best_face_sid], self.identity_db.get(prev),
-                                CFG.SWITCH_MARGIN, CFG.SWITCH_MIN_SCORE)
-                        if not allowed:
-                            continue
-                    self._trace(frame_id, f"PASS3-FACE reappear: tid={cand['tid']} -> sid={best_face_sid} face_sim={best_face_s:.3f}")
-                    assigned[i] = best_face_sid; used.add(best_face_sid)
-
             for i, cand in enumerate(candidates):
                 if i in assigned:
                     continue
@@ -948,7 +909,15 @@ class ReIDEngine:
                     s = float(score_matrix[i, c])
                     if s > best_s:
                         best_s, best_sid = s, sid
-                if best_sid is not None and best_s >= self.T_REAPPEAR:
+                if best_sid is not None:
+                    # Face-confirmed: when face says "same person", use lower bar
+                    cand_face3 = cand.get('face_feat')
+                    ident3 = self.identity_db.get(best_sid)
+                    f_sim3 = ident3.face_similarity(cand_face3) if cand_face3 is not None and ident3 is not None else None
+                    face_ok3 = f_sim3 is not None and f_sim3 >= CFG.FACE_MIN_SIMILARITY
+                    eff_reappear = CFG.REAPPEAR_THRESHOLD_FACE_CONFIRMED if face_ok3 else self.T_REAPPEAR
+                    if best_s < eff_reappear:
+                        continue
                     # FIX: PASS 3 used to reassign a tracker's identity purely
                     # based on crossing T_REAPPEAR, with NO check against
                     # whatever identity that tracker was already carrying
@@ -1013,36 +982,6 @@ class ReIDEngine:
             self._trace(frame_id, f"PASS4 NEW IDENTITY: tid={tid} -> sid={sid} "
                         f"(had_stable_ids={bool(stable_ids)}, has_face={cand.get('face_feat') is not None})")
 
-        # -- PASS 4b: face recovery for newly minted IDs --
-        # If PASS4 just created a new identity, check if its face matches
-        # any EXISTING identity. Catches re-entries that PASS3 missed.
-        from reidentification.face_cue import FaceCueExtractor
-        for i, cand in enumerate(candidates):
-            if i not in assigned:
-                continue
-            sid = assigned[i]
-            ident = self.identity_db.get(sid)
-            if ident is None or ident.count > 1:
-                continue
-            cand_face = cand.get('face_feat')
-            if cand_face is None:
-                continue
-            for exist_sid, exist_ident in self.identity_db.items():
-                if exist_sid == sid or exist_sid in used:
-                    continue
-                exist_face = exist_ident.face_descriptor
-                if exist_face is None:
-                    continue
-                fsim = FaceCueExtractor.similarity(exist_face, cand_face)
-                if fsim is not None and fsim >= 0.25:
-                    del self.identity_db[sid]
-                    assigned[i] = exist_sid
-                    used.discard(sid)
-                    used.add(exist_sid)
-                    self._trace(frame_id, f"PASS4b FACE RECOVER: tid={cand['tid']} new_sid={sid} -> existing_sid={exist_sid} face_sim={fsim:.3f}")
-                    break
-
-
         # ── Update ────────────────────────────────────────────────────────
         for i, sid in assigned.items():
             cand = candidates[i]
@@ -1075,6 +1014,19 @@ class ReIDEngine:
         min_area  = int(frame_h * frame_w * CFG.MIN_AREA_RATIO)
         results   = []
         candidates = []
+
+        # ── Clear stale track→identity mappings ──────────────────────────
+        # When DeepSort reuses a track ID for a new person (after max_age
+        # expiry), the old mapping persists and incorrectly locks the new
+        # person to the old identity.  Clear mappings for tracks that
+        # haven't appeared for >60 frames.
+        stale_tids = [tid for tid, last_fid in self.track_last_seen.items()
+                      if frame_id - last_fid > 60]
+        for tid in stale_tids:
+            self.track_to_identity.pop(tid, None)
+            self.track_last_seen.pop(tid, None)
+            self._face_last_extract.pop(tid, None)
+            self._face_cache.pop(tid, None)
 
         # ── Phase 1: filter tracks and collect valid bboxes ──────────────
         valid_tracks = []  # (pid, bbox) for tracks passing size/off-screen gates
@@ -1148,10 +1100,28 @@ class ReIDEngine:
                 ]))
 
                 self._store(pid, feat, frame_id)
-                face_feat = self.face_extractor.extract(frame, bbox)
-                self._face_attempts += 1
-                if face_feat is not None:
-                    self._face_hits += 1
+
+                # Gate face extraction: only re-extract when track is new
+                # (first 3 frames) or when face hit is stale (>30 frames).
+                # This avoids running YuNet+ArcFace on every detection every frame.
+                last_extract_fid = self._face_last_extract.get(pid)
+                needs_face = (
+                    last_extract_fid is None           # never extracted yet
+                    or (frame_id - last_extract_fid) > 30  # stale (>1 sec)
+                )
+                if needs_face:
+                    full_result = self.face_extractor.extract_with_box(frame, bbox)
+                    face_feat = full_result[0] if full_result is not None else None
+                    self._face_attempts += 1
+                    if face_feat is not None:
+                        self._face_hits += 1
+                    self._face_cache[pid] = full_result
+                    self._face_last_extract[pid] = frame_id
+                else:
+                    # Reuse cached face result
+                    cached = self._face_cache.get(pid)
+                    face_feat = cached[0] if cached is not None else None
+
                 candidates.append({'tid': pid, 'bbox': bbox, 'feat': feat, 'face_feat': face_feat})
                 self._pending.pop(pid, None)
 

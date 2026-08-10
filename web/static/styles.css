@@ -299,6 +299,7 @@ h1 {
 
 .field input[type="text"],
 .field input[type="search"],
+.field select,
 input[type="text"],
 input[type="search"] {
   font-family: inherit;
@@ -309,10 +310,10 @@ input[type="search"] {
   border-radius: 12px;
   padding: 0.72rem 0.9rem;
 }
-.field input, input[type="text"], input[type="search"], input[type="number"] {
+.field input, .field select, input[type="text"], input[type="search"], input[type="number"] {
   transition: box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
 }
-.field input:focus, input:focus {
+.field input:focus, .field select:focus, input:focus {
   outline: none;
   border-color: var(--warm);
   box-shadow: var(--focus-ring);
@@ -962,3 +963,76 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, var(--warm), #f
 .lightbox-nav.prev { left: 10px; }
 .lightbox-nav.next { right: 10px; }
 .lightbox-foot { margin-top: 0.6rem; text-align: center; }
+
+/* ══════════════════ STATUS BADGES ══════════════════ */
+
+.status-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  vertical-align: middle;
+  margin-left: 6px;
+}
+.status-normal   { background: #16a34a; color: #fff; }
+.status-criminal { background: #dc2626; color: #fff; }
+.status-missing  { background: #ea580c; color: #fff; }
+.status-wanted   { background: #ca8a04; color: #000; }
+
+/* ══════════════════ ALERTS PANEL ══════════════════ */
+
+.alerts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.alert-card {
+  background: var(--surface);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  transition: transform 0.15s;
+}
+.alert-card:hover { transform: translateX(3px); }
+.alert-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+.alert-time {
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+.alert-body {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+.alert-photo {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--line);
+}
+.alert-info { flex: 1; }
+.alert-name { font-weight: 600; font-size: 0.95rem; }
+.alert-detail { font-size: 0.8rem; color: var(--ink-soft); }
+
+/* ══════════════════ STATUS DROPDOWN ══════════════════ */
+
+#personStatus {
+  padding: 0.45rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.9rem;
+  width: 100%;
+}
+#personStatus:focus { border-color: var(--line-warm); outline: none; }

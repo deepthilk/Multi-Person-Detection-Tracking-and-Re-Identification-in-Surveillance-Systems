@@ -65,7 +65,8 @@ class IdentityDatabase:
 
     # ── writes ───────────────────────────────────────────────────────────
 
-    def add_person(self, name: str, embeddings: list, image_paths: list = None, face_embeddings: list = None):
+    def add_person(self, name: str, embeddings: list, image_paths: list = None,
+                    face_embeddings: list = None, status: str = "normal"):
         """
         Add or update a person.
 
@@ -74,6 +75,7 @@ class IdentityDatabase:
             embeddings: list of 1-D numpy arrays / lists (one per image).
             image_paths: original source paths, stored as metadata only.
             face_embeddings: optional list of face embedding vectors.
+            status: person status — "normal", "criminal", "missing", or "wanted".
         """
         name = name.strip()
         if not embeddings:
@@ -107,12 +109,16 @@ class IdentityDatabase:
             num_images = existing["metadata"]["num_images"] + len(embeddings)
             all_paths = existing["metadata"].get("image_paths", []) + (image_paths or [])
             registered_at = existing["metadata"]["registered_at"]
+            # Preserve existing status if not explicitly overridden
+            if status == "normal" and existing.get("status") != "normal":
+                status = existing.get("status", "normal")
         else:
             num_images = len(embeddings)
             all_paths = image_paths or []
             registered_at = datetime.now().isoformat()
 
         self._data[name] = {
+            "status": status,
             "embeddings": vectors,
             "average_embedding": average,
             "face_embeddings": face_vectors,
@@ -170,6 +176,13 @@ class IdentityDatabase:
         return [
             (name, record) for name, record in self._data.items()
             if q in name.lower()
+        ]
+
+    def get_persons_by_status(self, status: str) -> list:
+        """Return list of (name, record) pairs for persons with given status."""
+        return [
+            (name, record) for name, record in self._data.items()
+            if record.get("status", "normal") == status
         ]
 
     def match(self, query_embedding, query_face_embedding=None, top_k: int = None, threshold: float = None) -> list:
@@ -263,7 +276,7 @@ class IdentityDatabase:
     def export_for_reid(self) -> dict:
         """
         Hand the whole database to the Re-ID module in a simple,
-        ready-to-use form: {name: np.ndarray(698,)}.
+        ready-to-use form: {name: {embedding, face, status}}.
 
         This is the single hand-off point described in the team plan
         ("Provide the database to the Re-ID module"). Deepthi's
@@ -277,6 +290,7 @@ class IdentityDatabase:
                     np.asarray(record["average_face_descriptor"], dtype=np.float32)
                     if record.get("average_face_descriptor") is not None else None
                 ),
+                "status": record.get("status", "normal"),
             }
             for name, record in self._data.items()
         }

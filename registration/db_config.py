@@ -70,7 +70,7 @@ SEARCH_SETTINGS = {
     #     body-appearance score.
     # Between the two the match falls back to the body score against
     # `match_threshold`.
-    "face_match_threshold": 0.45,
+    "face_match_threshold": 0.40,
     "face_veto_threshold": 0.25,
 }
 

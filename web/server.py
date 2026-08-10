@@ -145,6 +145,7 @@ def _person_summary(name: str, record: dict) -> dict:
     image_paths = meta.get("image_paths", [])
     return {
         "name": name,
+        "status": record.get("status", "normal"),
         "num_images": meta.get("num_images", 0),
         "registered_at": meta.get("registered_at"),
         "last_updated": meta.get("last_updated"),
@@ -168,12 +169,15 @@ def search_persons(q: str = ""):
 
 
 @app.post("/api/persons")
-def add_person(name: str = Form(...), files: List[UploadFile] = File(...)):
+def add_person(name: str = Form(...), status: str = Form("normal"),
+               files: List[UploadFile] = File(...)):
     name = name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
     if not files:
         raise HTTPException(status_code=400, detail="At least one photo is required")
+    if status not in ("normal", "criminal", "missing", "wanted"):
+        raise HTTPException(status_code=400, detail="Status must be normal, criminal, missing, or wanted")
 
     db = _get_db()
     if name in db.list_persons():
@@ -181,7 +185,7 @@ def add_person(name: str = Form(...), files: List[UploadFile] = File(...)):
 
     saved_paths = _save_uploads(name, files)
     try:
-        record = register_person(name, saved_paths, db=db)
+        record = register_person(name, saved_paths, db=db, status=status)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return JSONResponse(_person_summary(name, record), status_code=201)
@@ -223,6 +227,19 @@ def rename_person(name: str, new_name: str = Form(...)):
         del db._data[name]
     db.save()
     return JSONResponse(_person_summary(new_name, record))
+
+
+@app.put("/api/persons/{name}/status")
+def update_person_status(name: str, status: str = Form(...)):
+    if status not in ("normal", "criminal", "missing", "wanted"):
+        raise HTTPException(status_code=400, detail="Status must be normal, criminal, missing, or wanted")
+    db = _get_db()
+    record = db.get_person(name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"'{name}' is not registered")
+    record["status"] = status
+    db.save()
+    return JSONResponse(_person_summary(name, record))
 
 
 @app.delete("/api/persons/{name}")
@@ -606,8 +623,6 @@ def delete_all_sessions():
 
 def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: str):
     cam = SESSIONS[session_id]["cameras"][camera_id]
-    detections_path = OUTPUT_DIR / f"{session_id}_{camera_id}_detections.json"
-    tracking_path = OUTPUT_DIR / f"{session_id}_{camera_id}_tracking.json"
     reid_path = OUTPUT_DIR / f"{session_id}_{camera_id}_reid.json"
     label = cam.get("label", camera_id)
 
@@ -615,41 +630,18 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
 
     try:
         t0 = time.time()
-        cam.update({"status": "running", "percent": 10, "message": "Detecting people"})
-        run_detection(
-            str(input_path),
-            str(detections_path),
-            conf_threshold=0.6,
-            weak_conf_threshold=0.4,
-            min_height=50,
-            min_area_ratio=0.001,
-            imgsz=640,
-            device=device,
-        )
-        _ensure_artifact(detections_path, "Detection output")
-        _record_latency("detection", time.time() - t0, camera_id)
-        _log("info", f"{label}: detection complete ({time.time() - t0:.1f}s)", camera_id)
-
-        t1 = time.time()
-        cam.update({"percent": 35, "message": "Tracking across frames"})
-        run_tracking(str(input_path), str(detections_path), str(tracking_path))
-        _ensure_artifact(tracking_path, "Tracking output")
-        _record_latency("tracking", time.time() - t1, camera_id)
-        _log("info", f"{label}: tracking complete ({time.time() - t1:.1f}s)", camera_id)
-
-        t2 = time.time()
-        cam.update({"percent": 60, "message": "Matching against known people"})
+        cam.update({"status": "running", "percent": 10, "message": "Processing video"})
+        from web.multicam_pipeline import run_single_pass_pipeline
         db = _get_db()
-        summary = run_camera_reid(
+        summary = run_single_pass_pipeline(
             str(input_path),
-            str(tracking_path),
             str(reid_path),
             device=device,
             identity_db=db,
             progress_callback=lambda pct, msg: cam.update({"percent": pct, "message": msg}),
         )
         _ensure_artifact(reid_path, "Re-ID output")
-        _record_latency("reid", time.time() - t2, camera_id)
+        _record_latency("pipeline", time.time() - t0, camera_id)
 
         cam["people"] = summary["people"]
         cam["fps"] = summary["fps"]
@@ -676,16 +668,6 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             else:
                 _log("info", f"{label}: track {p['track_id']} has no identity match — unknown", camera_id)
 
-        # Render pass skipped (speed): it costs an extra full decode + ffmpeg
-        # re-encode while adding nothing to identification, which is what this
-        # system is judged on. Re-enable (and adjust percent jump below) if an
-        # annotated preview is needed again.
-        # cam.update({"percent": 90, "message": "Rendering annotated video"})
-        # t3 = time.time()
-        # if render_reid_video(str(input_path), str(reid_path), str(output_video_path)):
-        #     cam["output_url"] = f"/outputs/{output_video_path.name}"
-        # _record_latency("render", time.time() - t3, camera_id)
-
         cam.update({"percent": 100, "message": "Done"})
         cam.update({"status": "completed", "percent": 100, "message": "Done"})
         _log("info", f"{label}: pipeline complete ({time.time() - t0:.1f}s total)", camera_id)
@@ -696,11 +678,6 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
         cam.update({"status": "error", "percent": cam.get("percent", 0), "message": str(exc)})
         _log("critical", f"{label}: pipeline failed — {exc}", camera_id)
         _write_manifest(session_id, camera_id, cam)
-    finally:
-        # detection/tracking jsons are pure intermediates — the UI only reads
-        # reid.json / reid.mp4 / top-frame jpgs, so drop them to curb clutter.
-        _discard(detections_path)
-        _discard(tracking_path)
 
 
 @app.get("/api/session/{session_id}/camera/{camera_id}/tracks")

@@ -93,6 +93,16 @@
             </div>
 
             <div class="field">
+              <label for="personStatus">Status</label>
+              <select id="personStatus">
+                <option value="normal">Normal</option>
+                <option value="criminal">Criminal</option>
+                <option value="missing">Missing</option>
+                <option value="wanted">Wanted</option>
+              </select>
+            </div>
+
+            <div class="field">
               <label for="personPhotos">Photos</label>
               <label class="dropzone" id="dropzone" for="personPhotos">
                 <span class="dropzone-icon">📷</span>
@@ -221,6 +231,21 @@
           <div id="unmatchedEmpty" class="empty-state" hidden>
             <p>Nothing unmatched.</p>
             <span>Every detected person was matched to a known identity.</span>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-2">
+          <div class="panel-head split">
+            <div>
+              <h2>🚨 Alerts</h2>
+              <p>Criminal, missing, and wanted person sightings.</p>
+            </div>
+            <button id="clearAlertsBtn" class="btn small" type="button">Clear All</button>
+          </div>
+          <div id="alertsList" class="alerts-list"></div>
+          <div id="alertsEmpty" class="empty-state" hidden>
+            <p>No alerts yet.</p>
+            <span>Alerts appear when registered persons are detected.</span>
           </div>
         </section>
 

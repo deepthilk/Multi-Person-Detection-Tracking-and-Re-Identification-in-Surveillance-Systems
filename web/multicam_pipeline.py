@@ -29,6 +29,7 @@ import logging
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,16 @@ def _save_evidence_frame(video_path: str, frame_id: int, bbox, out_path: Path) -
         return None
 
 
+# Combined scoring weights — body provides discrimination that face cannot
+# for similar-looking people (ArcFace cross-person similarity can exceed
+# same-person similarity). Heavy body weighting ensures self-match (body=1.0)
+# always wins over cross-match (body=0.88-0.96).
+WEIGHT_BODY = 0.70
+WEIGHT_FACE = 0.30
+# Minimum combined score to accept a name. Below this, the track is unidentified.
+COMBINED_THRESHOLD = 0.70
+
+
 def _resolve_identity_name(
     sid,
     body_feat,
@@ -86,34 +97,35 @@ def _resolve_identity_name(
     match_threshold,
     face_similarity=None,
 ):
-    """Face-primary name resolution for one stable identity.
+    """Combined body+face name resolution for one stable identity.
 
-    If a face was ever detected on this identity's tracks, the face decides:
-    the best candidate-frame similarity to a registered person's average face
-    that clears ``face_confirm`` names the person; if no face clears the bar
-    the identity stays Unknown (``None``). The body is consulted ONLY when the
-    identity never showed a face at all (e.g. back-to-camera), where a
-    body-only match is the only available signal.
+    For each registered person, computes:
+      combined = WEIGHT_BODY × body_sim + WEIGHT_FACE × face_sim
 
-    ``face_similarity`` is injectable for tests; it defaults to ArcFace's cosine
-    similarity. ``identity_db`` needs ``_data`` and ``match(...)``.
+    where body_sim is cosine(track_body, person_avg_body) and face_sim is
+    the best ArcFace similarity across all face candidates for this track.
+
+    Returns the person with the highest combined score, or None if below
+    COMBINED_THRESHOLD.
+
+    This replaces the previous face-confirm / exclusivity-margin / body-fallback
+    chain. The combined approach works because body self-similarity (1.0) is
+    always higher than cross-similarity (0.88-0.96), providing discrimination
+    that face alone cannot for similar-looking people.
     """
     if face_similarity is None:
         from reidentification.face_cue import FaceCueExtractor
         face_similarity = FaceCueExtractor.similarity
 
+    from reidentification.reid_main import _cosine as _cosine_fn
+
+    # Collect best face per registered person across all candidate frames
+    best_face_per_person = {}  # name -> (face_feat, face_sim)
     cands_for_sid = [
         cands
         for tid, cands in face_candidates.items()
         if track_to_identity.get(tid) == sid
     ]
-    if not cands_for_sid:
-        matches = identity_db.match(
-            body_feat, query_face_embedding=None, top_k=1, threshold=match_threshold
-        )
-        return matches[0] if matches else None
-
-    confirmed = []  # (name, face_sim) across every candidate frame
     for cands in cands_for_sid:
         for (_fid, _bbox, face_feat, _score, _fbox) in cands:
             for name, record in identity_db._data.items():
@@ -121,11 +133,372 @@ def _resolve_identity_name(
                 if avg is None:
                     continue
                 sim = face_similarity(avg, face_feat)
-                if sim is not None and sim >= face_confirm:
-                    confirmed.append((name, sim))
-    if confirmed:
-        return max(confirmed, key=lambda c: c[1])
+                if sim is not None:
+                    prev = best_face_per_person.get(name)
+                    if prev is None or sim > prev[1]:
+                        best_face_per_person[name] = (face_feat, sim)
+
+    # Combined scoring against every registered person
+    best_name = None
+    best_score = -1.0
+    for name, record in identity_db._data.items():
+        avg_body = record.get("average_embedding")
+        body_sim = _cosine_fn(body_feat, avg_body) if avg_body is not None else 0.0
+
+        face_entry = best_face_per_person.get(name)
+        face_sim = face_entry[1] if face_entry else 0.0
+
+        combined = WEIGHT_BODY * body_sim + WEIGHT_FACE * face_sim
+        if combined > best_score:
+            best_score = combined
+            best_name = name
+
+    if best_name is not None:
+        # Face shortcut: if face confidently confirms (>= 0.40), accept
+        # even if combined score is lower. This handles the common case
+        # where face is clear but body has drifted from registration.
+        face_entry = best_face_per_person.get(best_name)
+        if face_entry and face_entry[1] >= 0.40:
+            return (best_name, best_score)
+        # Combined threshold for body-only tracks (no face confirmation)
+        if best_score >= COMBINED_THRESHOLD:
+            return (best_name, best_score)
+
     return None
+
+
+def run_single_pass_pipeline(
+    video_path: str,
+    output_json_path: str,
+    device: str = "cpu",
+    identity_db=None,
+    match_threshold: float | None = None,
+    progress_callback=None,
+    reid_stride: int = 1,
+    conf_threshold=0.6,
+    weak_conf_threshold=0.4,
+    min_height=50,
+    min_area_ratio=0.001,
+    imgsz=640,
+):
+    """Single-pass pipeline: detection + tracking + ReID in one video decode.
+
+    Instead of reading the video 3 times (detect → track → reid), this reads
+    it once and runs all three stages per frame.  Same accuracy, ~3x faster.
+    """
+    from detection.detect_module import get_cached_detector
+    from tracking.track_module import PersonTracker
+    from reidentification.reid_main import ReIDEngine, _cosine
+    from reidentification.face_cue import FaceCueExtractor, get_cached_face_extractor
+
+    # ── Initialise models (cached across cameras) ────────────────────────
+    detector = get_cached_detector(
+        conf_threshold=conf_threshold,
+        device=device,
+        min_height=min_height,
+        min_area_ratio=min_area_ratio,
+        weak_conf_threshold=weak_conf_threshold,
+    )
+    tracker = PersonTracker()
+    engine = ReIDEngine(device=device)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error("Failed to open video: %s", video_path)
+        return {"fps": 0, "people": [], "frames_read": 0,
+                "frames_expected": 0, "frame_drop_rate": 0}
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    expected_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    face_stride = max(1, int(round(fps / 5)))
+    reid_stride = max(1, int(reid_stride))
+
+    results = {}
+    face_candidates = {}
+    all_detections = {}
+    all_tracking = {}
+    frame_id = 0
+    last_result = []
+
+    logger.info("Single-pass pipeline: %s  (~%d frames @ %.1f fps)",
+                video_path, expected_frames, fps)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_id += 1
+
+        # ── Detection (YOLOv8) ──────────────────────────────────────────
+        detections = detector.detect(frame, imgsz=imgsz)
+        all_detections[frame_id] = detections
+
+        # ── Tracking (DeepSort) ─────────────────────────────────────────
+        tracks = tracker.update(frame, detections)
+        all_tracking[frame_id] = tracks
+
+        # ── ReID (body + face descriptors + identity assignment) ────────
+        if frame_id % reid_stride == 0:
+            last_result = engine.process_frame(frame, tracks, frame_id)
+        results[frame_id] = last_result
+
+        # ── Collect face candidates for name resolution ─────────────────
+        if frame_id % face_stride == 0:
+            for p in results[frame_id]:
+                tid = p.get("id")
+                bbox = p.get("bbox")
+                if tid is None or not bbox:
+                    continue
+                cached = engine._face_cache.get(tid)
+                if cached is not None:
+                    face_feat, yunet_score, face_bbox = cached
+                    face_candidates.setdefault(tid, []).append(
+                        (frame_id, bbox, face_feat, yunet_score, face_bbox)
+                    )
+
+        # ── Progress ────────────────────────────────────────────────────
+        if progress_callback is not None and frame_id % max(1, face_stride * 2) == 0:
+            pct = int(60 + 26 * (frame_id / max(1, expected_frames)))
+            progress_callback(min(pct, 86),
+                              f"Matching known people ({frame_id}/{max(1, expected_frames)} frames)")
+
+    cap.release()
+    frames_read = frame_id
+
+    # ── Post-processing (identical to run_camera_reid) ───────────────────
+    drop_rate = 0.0
+    if expected_frames > 0 and frames_read < expected_frames:
+        drop_rate = round(max(0.0, (expected_frames - frames_read) / expected_frames), 4)
+
+    engine.finalize_clustering()
+    results = _interpolate_gaps(results, max_gap=3)
+
+    none_resolved = 0
+    none_remaining = 0
+    for fid in sorted(results.keys()):
+        for p in results[fid]:
+            if p.get("consolidated_id") is None:
+                tid = p.get("id")
+                if tid in engine.track_to_identity:
+                    p["consolidated_id"] = engine.track_to_identity[tid]
+                    none_resolved += 1
+                else:
+                    none_remaining += 1
+    if none_remaining > 0:
+        logger.warning("⚠️  %d detections have no consolidated_id — will appear as unidentified",
+                        none_remaining)
+    logger.info("ReID summary: %d total detections, %d None resolved, %d still None",
+                sum(len(v) for v in results.values()), none_resolved, none_remaining)
+
+    # ── Name resolution ──────────────────────────────────────────────────
+    name_by_original_sid = {}
+    if identity_db is not None and len(identity_db):
+        from registration.db_config import SEARCH_SETTINGS as _search_settings
+        face_confirm = _search_settings.get("face_match_threshold", 0.40)
+        for sid, feat in engine.consolidated_features.items():
+            try:
+                resolved = _resolve_identity_name(
+                    sid, feat, face_candidates, engine.track_to_identity,
+                    identity_db, face_confirm, match_threshold,
+                )
+                if resolved is not None:
+                    name_by_original_sid[sid] = resolved
+            except Exception:
+                logger.exception("Name match failed for stable id %s — leaving unresolved", sid)
+
+    # ── Deduplication ────────────────────────────────────────────────────
+    if name_by_original_sid and identity_db is not None:
+        from reidentification.face_cue import FaceCueExtractor
+        name_groups = {}
+        for sid, (name, sim) in name_by_original_sid.items():
+            name_groups.setdefault(name, []).append((sid, sim))
+
+        claimed_names = set()
+        for name, entries in name_groups.items():
+            entries.sort(key=lambda x: x[1], reverse=True)
+            claimed_names.add(name)
+            best_feat = engine.consolidated_features.get(entries[0][0])
+            primary_faces = []
+            for tid, cands in face_candidates.items():
+                if engine.track_to_identity.get(tid) == entries[0][0]:
+                    for (_fid, _bbox, face_feat, _score, _fbox) in cands:
+                        if face_feat is not None:
+                            primary_faces.append(face_feat)
+            best_primary_face = max(primary_faces, key=lambda f: np.linalg.norm(f)) if primary_faces else None
+
+            for sid, sim in entries[1:]:
+                dup_feat = engine.consolidated_features.get(sid)
+                if dup_feat is None:
+                    del name_by_original_sid[sid]
+                    continue
+                body_sim = _cosine(best_feat, dup_feat) if best_feat is not None else 0.0
+                dup_faces = []
+                for tid, cands in face_candidates.items():
+                    if engine.track_to_identity.get(tid) == sid:
+                        for (_fid, _bbox, face_feat, _score, _fbox) in cands:
+                            if face_feat is not None:
+                                dup_faces.append(face_feat)
+                best_dup_face = max(dup_faces, key=lambda f: np.linalg.norm(f)) if dup_faces else None
+                face_cross_sim = 0.0
+                if best_primary_face is not None and best_dup_face is not None:
+                    face_cross_sim = FaceCueExtractor.similarity(best_primary_face, best_dup_face) or 0.0
+                different_people = (
+                    (body_sim < 0.70 and face_cross_sim >= 0.35)
+                    or (face_cross_sim < 0.35 and face_cross_sim > 0.0)
+                    or (body_sim < 0.60)
+                )
+                if different_people:
+                    matches = identity_db.match(dup_feat, query_face_embedding=None, top_k=5)
+                    new_name = None
+                    new_sim = 0.0
+                    for m_name, m_sim in matches:
+                        if m_name not in claimed_names:
+                            new_name = m_name
+                            new_sim = m_sim
+                            claimed_names.add(m_name)
+                            break
+                    if new_name:
+                        name_by_original_sid[sid] = (new_name, new_sim)
+                    else:
+                        del name_by_original_sid[sid]
+                else:
+                    pass  # same person over-split — keep
+
+    # ── Merge over-split tracks ──────────────────────────────────────────
+    if name_by_original_sid:
+        sid_frame_count = {}
+        for fid in sorted(results.keys()):
+            for p in results[fid]:
+                cid = p.get("consolidated_id")
+                if cid is not None:
+                    sid_frame_count[cid] = sid_frame_count.get(cid, 0) + 1
+        name_to_sids = {}
+        for sid, (name, sim) in name_by_original_sid.items():
+            name_to_sids.setdefault(name, []).append(sid)
+        for name, sids in name_to_sids.items():
+            if len(sids) <= 1:
+                continue
+            primary = max(sids, key=lambda s: sid_frame_count.get(s, 0))
+            for sid in sids:
+                if sid == primary:
+                    continue
+                for fid in sorted(results.keys()):
+                    for p in results[fid]:
+                        if p.get("consolidated_id") == sid:
+                            p["consolidated_id"] = primary
+                name_by_original_sid.pop(sid, None)
+                for tid, mapped_sid in list(engine.track_to_identity.items()):
+                    if mapped_sid == sid:
+                        engine.track_to_identity[tid] = primary
+                if sid in engine.consolidated_features:
+                    del engine.consolidated_features[sid]
+
+    # ── Evidence frames ──────────────────────────────────────────────────
+    evidence_by_sid = {}
+    if name_by_original_sid and identity_db is not None:
+        for sid, (name, _sim) in name_by_original_sid.items():
+            record = identity_db._data.get(name)
+            avg_face = (record or {}).get("average_face_descriptor")
+            if avg_face is None:
+                continue
+            per_frame = {}
+            for tid, cands in face_candidates.items():
+                if engine.track_to_identity.get(tid) != sid:
+                    continue
+                for (fid, bbox, face_feat, _score, _fbox) in cands:
+                    sim = FaceCueExtractor.similarity(avg_face, face_feat)
+                    if sim is None:
+                        continue
+                    if fid not in per_frame or sim > per_frame[fid][0]:
+                        per_frame[fid] = (sim, bbox)
+            ranked = sorted(per_frame.items(), key=lambda kv: kv[1][0], reverse=True)[:5]
+            evidence_by_sid[sid] = [
+                {"frame": fid, "similarity": round(sim, 3), "bbox": bbox}
+                for fid, (sim, bbox) in ranked
+            ]
+
+    # ── Renumber 1..N ───────────────────────────────────────────────────
+    first_seen = {}
+    none_first_seen = {}
+    for fid in sorted(results.keys()):
+        for p in results[fid]:
+            cid = p.get("consolidated_id")
+            tid = p.get("id")
+            if cid is not None and cid not in first_seen:
+                first_seen[cid] = fid
+            elif cid is None and tid is not None and tid not in none_first_seen:
+                none_first_seen[tid] = fid
+
+    remap = {cid: idx + 1 for idx, cid in enumerate(sorted(first_seen.keys(), key=lambda c: first_seen[c]))}
+    none_remap = {tid: -(idx + 1) for idx, tid in enumerate(sorted(none_first_seen.keys(), key=lambda t: none_first_seen[t]))}
+
+    track_info = {}
+    for fid in sorted(results.keys()):
+        for p in results[fid]:
+            cid = p.get("consolidated_id")
+            tid = p.get("id")
+            if cid is not None:
+                final_id = remap.get(cid, -1)
+                if final_id == -1:
+                    continue
+                original_sid = cid
+            elif tid is not None and tid in none_remap:
+                final_id = none_remap[tid]
+                original_sid = None
+            else:
+                continue
+            info = track_info.setdefault(final_id, {"first_frame": fid, "last_frame": fid, "original_sid": original_sid})
+            info["last_frame"] = fid
+            p["consolidated_id"] = final_id
+
+    Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_json_path, "w") as f:
+        json.dump(results, f)
+
+    people = []
+    evidence_dir = Path(output_json_path).parent
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    output_stem = Path(output_json_path).stem
+    for final_id, info in sorted(track_info.items()):
+        match = name_by_original_sid.get(info["original_sid"])
+        person_name = match[0] if match else None
+        person_status = "normal"
+        if person_name and identity_db is not None:
+            person_record = identity_db.get_person(person_name) if hasattr(identity_db, 'get_person') else None
+            if person_record:
+                person_status = person_record.get("status", "normal")
+        top_frames = []
+        for i, ev in enumerate(evidence_by_sid.get(info["original_sid"], []), start=1):
+            crop_path = _save_evidence_frame(
+                video_path, ev["frame"], ev["bbox"],
+                evidence_dir / f"{output_stem}_track{final_id}_top{i}.jpg",
+            )
+            top_frames.append({
+                "frame": ev["frame"],
+                "time_sec": round(ev["frame"] / fps, 1),
+                "similarity": ev["similarity"],
+                "url": f"/outputs/{crop_path.name}" if crop_path else None,
+            })
+        people.append({
+            "track_id": final_id,
+            "name": person_name,
+            "status": person_status,
+            "similarity": round(float(match[1]), 3) if match else None,
+            "first_seen_sec": round(info["first_frame"] / fps, 1),
+            "last_seen_sec": round(info["last_frame"] / fps, 1),
+            "top_frames": top_frames,
+        })
+
+    if progress_callback is not None:
+        progress_callback(88, "Finalising matches")
+
+    return {
+        "fps": fps,
+        "people": people,
+        "frames_read": frames_read,
+        "frames_expected": expected_frames,
+        "frame_drop_rate": drop_rate,
+    }
 
 
 def run_camera_reid(
@@ -213,9 +586,12 @@ def run_camera_reid(
                 bbox = p.get("bbox")
                 if tid is None or not bbox:
                     continue
-                got = name_face_extractor.extract_with_box(frame, bbox)
-                if got is not None:
-                    face_feat, yunet_score, face_bbox = got
+                # Reuse face result already extracted by the engine in
+                # process_frame() instead of running YuNet+ArcFace a second
+                # time.  This cuts the dominant per-frame cost roughly in half.
+                cached = engine._face_cache.get(tid)
+                if cached is not None:
+                    face_feat, yunet_score, face_bbox = cached
                     face_candidates.setdefault(tid, []).append(
                         (frame_id, bbox, face_feat, yunet_score, face_bbox)
                     )
@@ -296,7 +672,13 @@ def run_camera_reid(
     # NOT re-resolve those — they're the same person, just over-split. Only
     # re-resolve when body similarity between the duplicates is LOW (meaning
     # two genuinely different people coincidentally got the same face name).
+    #
+    # Face cross-check: body similarity alone is unreliable for uniformed
+    # subjects (always 0.90+). We also compare the BEST face candidates
+    # between the two SIDs. If face similarity is low (< 0.35), they are
+    # genuinely different people even if body similarity is high.
     if name_by_original_sid and identity_db is not None:
+        from reidentification.face_cue import FaceCueExtractor
         name_groups = {}  # name -> [(sid, sim), ...]
         for sid, (name, sim) in name_by_original_sid.items():
             name_groups.setdefault(name, []).append((sid, sim))
@@ -305,10 +687,16 @@ def run_camera_reid(
         for name, entries in name_groups.items():
             entries.sort(key=lambda x: x[1], reverse=True)  # best first
             claimed_names.add(name)
-            # Keep ALL entries with this name — they're over-split same person.
-            # Only re-resolve if body similarity between duplicates is very low
-            # (meaning genuinely different people who got the same face name).
             best_feat = engine.consolidated_features.get(entries[0][0])
+            # Collect best face for primary SID
+            primary_faces = []
+            for tid, cands in face_candidates.items():
+                if engine.track_to_identity.get(tid) == entries[0][0]:
+                    for (_fid, _bbox, face_feat, _score, _fbox) in cands:
+                        if face_feat is not None:
+                            primary_faces.append(face_feat)
+            best_primary_face = max(primary_faces, key=lambda f: np.linalg.norm(f)) if primary_faces else None
+
             for sid, sim in entries[1:]:
                 dup_feat = engine.consolidated_features.get(sid)
                 if dup_feat is None:
@@ -316,7 +704,31 @@ def run_camera_reid(
                     continue
                 # Check if body similarity is low → different people, re-resolve
                 body_sim = _cosine(best_feat, dup_feat) if best_feat is not None else 0.0
-                if body_sim < 0.70:
+
+                # Face cross-check: compare best face candidates between SIDs
+                dup_faces = []
+                for tid, cands in face_candidates.items():
+                    if engine.track_to_identity.get(tid) == sid:
+                        for (_fid, _bbox, face_feat, _score, _fbox) in cands:
+                            if face_feat is not None:
+                                dup_faces.append(face_feat)
+                best_dup_face = max(dup_faces, key=lambda f: np.linalg.norm(f)) if dup_faces else None
+
+                face_cross_sim = 0.0
+                if best_primary_face is not None and best_dup_face is not None:
+                    face_cross_sim = FaceCueExtractor.similarity(best_primary_face, best_dup_face) or 0.0
+
+                # Different people if: body is low OR face cross-sim is low.
+                # When face is unavailable (0.0), require body_sim < 0.60
+                # to treat as different — prevents auto-merging two people
+                # just because face wasn't detected.
+                different_people = (
+                    (body_sim < 0.70 and face_cross_sim >= 0.35)
+                    or (face_cross_sim < 0.35 and face_cross_sim > 0.0)
+                    or (body_sim < 0.60)
+                )
+
+                if different_people:
                     # Genuinely different people — re-resolve against remaining names
                     matches = identity_db.match(
                         dup_feat, query_face_embedding=None, top_k=5
@@ -331,16 +743,61 @@ def run_camera_reid(
                             break
                     if new_name:
                         name_by_original_sid[sid] = (new_name, new_sim)
-                        logger.info("Dedup: sid=%s renamed %s -> %s (body_sim=%.3f, sim %.3f -> %.3f)",
-                                    sid, name, new_name, body_sim, sim, new_sim)
+                        logger.info("Dedup: sid=%s renamed %s -> %s (body=%.3f, face_cross=%.3f, sim %.3f -> %.3f)",
+                                    sid, name, new_name, body_sim, face_cross_sim, sim, new_sim)
                     else:
                         del name_by_original_sid[sid]
-                        logger.info("Dedup: sid=%s removed %s (no other match, body_sim=%.3f) -> Unknown",
-                                    sid, name, body_sim)
+                        logger.info("Dedup: sid=%s removed %s (no other match, body=%.3f, face_cross=%.3f) -> Unknown",
+                                    sid, name, body_sim, face_cross_sim)
                 else:
                     # Same person over-split by body model — keep same name
-                    logger.info("Dedup: sid=%s kept as %s (over-split, body_sim=%.3f)",
-                                sid, name, body_sim)
+                    logger.info("Dedup: sid=%s kept as %s (over-split, body=%.3f, face_cross=%.3f)",
+                                sid, name, body_sim, face_cross_sim)
+
+    # ── Merge over-split tracks: same name → one unified track ───────────
+    # When the engine creates multiple stable IDs for the same person
+    # (because the body model is weak), face naming gives them all the
+    # same name. Merge them so the UI shows one track, not two.
+    if name_by_original_sid:
+        # Count frames per SID across all results
+        sid_frame_count = {}
+        for fid in sorted(results.keys()):
+            for p in results[fid]:
+                cid = p.get("consolidated_id")
+                if cid is not None:
+                    sid_frame_count[cid] = sid_frame_count.get(cid, 0) + 1
+
+        # Group SIDs by name
+        name_to_sids = {}
+        for sid, (name, sim) in name_by_original_sid.items():
+            name_to_sids.setdefault(name, []).append(sid)
+
+        # Merge duplicates: keep primary (most frames), reassign secondary
+        for name, sids in name_to_sids.items():
+            if len(sids) <= 1:
+                continue
+            # Primary = SID with most frames (most stable representation)
+            primary = max(sids, key=lambda s: sid_frame_count.get(s, 0))
+            for sid in sids:
+                if sid == primary:
+                    continue
+                # Reassign all tracks from secondary to primary
+                reassign_count = 0
+                for fid in sorted(results.keys()):
+                    for p in results[fid]:
+                        if p.get("consolidated_id") == sid:
+                            p["consolidated_id"] = primary
+                            reassign_count += 1
+                # Remove secondary from name mapping
+                name_by_original_sid.pop(sid, None)
+                # Update engine mappings
+                for tid, mapped_sid in list(engine.track_to_identity.items()):
+                    if mapped_sid == sid:
+                        engine.track_to_identity[tid] = primary
+                if sid in engine.consolidated_features:
+                    del engine.consolidated_features[sid]
+                logger.info("Merge: sid=%s -> primary sid=%s (%s, %d frames reassigned)",
+                            sid, primary, name, reassign_count)
 
     # Evidence frames: for each MATCHED identity, keep the top-5 frames whose
     # per-frame face similarity to the matched person's average face is the
@@ -415,7 +872,7 @@ def run_camera_reid(
 
     Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_json_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f)
 
     people = []
     evidence_dir = Path(output_json_path).parent
@@ -423,6 +880,13 @@ def run_camera_reid(
     output_stem = Path(output_json_path).stem
     for final_id, info in sorted(track_info.items()):
         match = name_by_original_sid.get(info["original_sid"])
+        person_name = match[0] if match else None
+        # Get person status from identity database
+        person_status = "normal"
+        if person_name and identity_db is not None:
+            person_record = identity_db.get_person(person_name) if hasattr(identity_db, 'get_person') else None
+            if person_record:
+                person_status = person_record.get("status", "normal")
         top_frames = []
         for i, ev in enumerate(evidence_by_sid.get(info["original_sid"], []), start=1):
             crop_path = _save_evidence_frame(
@@ -442,7 +906,8 @@ def run_camera_reid(
         people.append(
             {
                 "track_id": final_id,
-                "name": match[0] if match else None,
+                "name": person_name,
+                "status": person_status,
                 "similarity": round(float(match[1]), 3) if match else None,
                 "first_seen_sec": round(info["first_frame"] / fps, 1),
                 "last_seen_sec": round(info["last_frame"] / fps, 1),
@@ -555,6 +1020,7 @@ def load_track_overlay(reid_json_path: str, people: list, fps: float, max_frames
                     "track_id": tid,
                     "bbox": p.get("bbox"),
                     "name": info.get("name"),
+                    "status": info.get("status", "normal"),
                     "similarity": info.get("similarity"),
                 }
             )

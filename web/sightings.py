@@ -28,6 +28,14 @@ OUT_FILE = ROOT_DIR / "outputs" / "sightings.json"
 MAX_ALERTS = 200
 DEFAULT_COOLDOWN_SECONDS = 300  # 5 minutes between alerts for same person+camera
 
+# Status-based cooldown and alert levels
+STATUS_CONFIG = {
+    "criminal": {"cooldown": 0,    "alert_level": "critical"},
+    "missing":  {"cooldown": 120,  "alert_level": "high"},
+    "wanted":   {"cooldown": 180,  "alert_level": "medium"},
+    "normal":   {"cooldown": 300,  "alert_level": "low"},
+}
+
 _alerts = []
 _last_seen_at = {}  # (name, camera_label) -> time.monotonic() of last alert
 _loaded = False
@@ -62,11 +70,14 @@ def _person_payload(name: str) -> dict:
     db = IdentityDatabase()
     rec = db.get_person(name)
     if rec is None:
-        return {"name": name, "photos": []}
+        return {"name": name, "status": "normal", "photos": []}
     meta = rec.get("metadata", {})
     image_paths = meta.get("image_paths", [])
+    status = rec.get("status", "normal")
     return {
         "name": name,
+        "status": status,
+        "alert_level": STATUS_CONFIG.get(status, STATUS_CONFIG["normal"])["alert_level"],
         "num_images": meta.get("num_images", 0),
         "registered_at": meta.get("registered_at"),
         "last_updated": meta.get("last_updated"),
@@ -109,9 +120,17 @@ def record_session_sightings(session_id: str, cameras: dict,
             if not name:
                 continue
 
+            # Get person status for alert level and cooldown
+            db = IdentityDatabase()
+            rec = db.get_person(name)
+            status = rec.get("status", "normal") if rec else "normal"
+            status_cfg = STATUS_CONFIG.get(status, STATUS_CONFIG["normal"])
+            alert_level = status_cfg["alert_level"]
+            person_cooldown = status_cfg["cooldown"]
+
             key = (name, label)
             last = _last_seen_at.get(key)
-            if last is not None and (now - last) < cooldown_seconds:
+            if last is not None and (now - last) < person_cooldown:
                 continue
             _last_seen_at[key] = now
 
@@ -125,6 +144,8 @@ def record_session_sightings(session_id: str, cameras: dict,
                 "first_seen_sec": person.get("first_seen_sec"),
                 "last_seen_sec": person.get("last_seen_sec"),
                 "person": _person_payload(name),
+                "alert_level": alert_level,
+                "status": status,
             }
             _alerts.append(alert)
             new_alerts.append(alert)

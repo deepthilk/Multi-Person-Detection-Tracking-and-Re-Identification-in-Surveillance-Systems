@@ -15,6 +15,7 @@ Public API is unchanged: extract() -> 512-dim or None, similarity() -> 0..1.
 """
 
 import logging
+import os
 from pathlib import Path
 
 import cv2
@@ -62,7 +63,8 @@ class FaceCueExtractor:
                 # ArcFace recognizer via ONNX Runtime
                 import onnxruntime as ort
                 opts = ort.SessionOptions()
-                opts.intra_op_num_threads = 4
+                opts.intra_op_num_threads = max(4, os.cpu_count() or 4)
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 self._arcface_session = ort.InferenceSession(
                     str(_ARCFACE_PATH), opts, providers=["CPUExecutionProvider"]
                 )

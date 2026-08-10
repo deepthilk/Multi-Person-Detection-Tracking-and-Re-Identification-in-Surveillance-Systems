@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
-                     overwrite: bool = False, num_augmentations: int = 5) -> dict:
+                     overwrite: bool = False, num_augmentations: int = 5,
+                     status: str = "normal") -> dict:
     """
     Register a known person from one or more images.
 
@@ -39,6 +40,7 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
             the new photos are ADDED to the existing person (their average
             embedding is recomputed over all photos, old + new). If True,
             the old record is deleted first, so only the new photos count.
+        status: person status — "normal", "criminal", "missing", or "wanted".
 
     Returns:
         The stored record for this person (dict), or raises ValueError if
@@ -109,7 +111,8 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
             f"yielded a face descriptor — the rest are body-only samples."
         )
 
-    db.add_person(name, embeddings, image_paths=stored_paths, face_embeddings=face_embeddings)
+    db.add_person(name, embeddings, image_paths=stored_paths,
+                  face_embeddings=face_embeddings, status=status)
     _warn_discrimination(db, name)
 
     logger.info(
