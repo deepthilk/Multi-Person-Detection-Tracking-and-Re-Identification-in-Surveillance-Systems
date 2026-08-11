@@ -45,6 +45,7 @@ function goToTab(name) {
   });
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   if (name === "people") loadPersons();
+  if (name === "alerts") loadAlerts();
   if (name === "results" && currentSessionId) loadResults();
   if (name === "process" && activePreviewCamId) {
     // panel just became visible — canvas had 0 size while hidden, so resize before resuming
@@ -229,6 +230,9 @@ $("#registerForm").addEventListener("submit", async (e) => {
   const form = new FormData();
   form.append("name", name);
   pendingPhotos.forEach((f) => form.append("files", f));
+  form.append("person_id", $("#personId").value.trim() || "");
+  form.append("flag", $("#personFlag").value || "normal");
+  form.append("details", $("#personDetails").value.trim() || "");
 
   const btn = $("#registerBtn");
   btn.disabled = true;
@@ -293,7 +297,7 @@ function personCard(p) {
     <div class="person-card-head">
       <div class="person-avatar">${initials(p.name)}</div>
       <div>
-        <div class="person-name">${escapeHtml(p.name)}</div>
+        <div class="person-name">${escapeHtml(p.name)} ${flagBadge(p.flag)}</div>
         <div class="person-meta">${p.num_images} photo${p.num_images === 1 ? "" : "s"} · added ${when}</div>
       </div>
     </div>
@@ -321,6 +325,13 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+// ── watch-list flag badges ────────────────────────────────────────────────
+const FLAG_LABEL = { criminal: "CRIMINAL", missing: "MISSING", person_of_interest: "PERSON OF INTEREST", normal: "" };
+function flagBadge(flag) {
+  if (!flag || flag === "normal") return "";
+  return `<span class="flag flag-${escapeHtml(flag)}">${escapeHtml(FLAG_LABEL[flag] || flag)}</span>`;
+}
+
 async function loadPersons(query = "") {
   const list = $("#personList");
   const empty = $("#personEmpty");
@@ -330,6 +341,7 @@ async function loadPersons(query = "") {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error("Failed to load identity database");
     const persons = await resp.json();
+    window.lastPersons = persons;
 
     list.innerHTML = "";
     empty.hidden = persons.length > 0;
@@ -390,6 +402,10 @@ function openEditModal(name) {
   $("#editName").value = name;
   $("#editPhotoPreview").innerHTML = "";
   $("#editHint").textContent = "";
+  const rec = (window.lastPersons || []).find((r) => r.name === name);
+  $("#editId").value = rec?.person_id || "";
+  $("#editFlag").value = rec?.flag || "normal";
+  $("#editDetails").value = rec?.details || "";
   $("#editModal").hidden = false;
 }
 $("#editCancel").addEventListener("click", () => ($("#editModal").hidden = true));
@@ -430,6 +446,16 @@ $("#editSave").addEventListener("click", async () => {
       });
       if (!resp.ok) throw new Error("Could not rename — name may already exist");
     }
+
+    const profForm = new FormData();
+    profForm.append("person_id", $("#editId").value.trim() || "");
+    profForm.append("flag", $("#editFlag").value || "normal");
+    profForm.append("details", $("#editDetails").value.trim() || "");
+    const profResp = await fetch(`/api/persons/${encodeURIComponent(editTarget)}/profile`, {
+      method: "PUT",
+      body: profForm,
+    });
+    if (!profResp.ok) throw new Error("Could not save watch-list profile");
 
     toast("Changes saved");
     $("#editModal").hidden = true;
@@ -505,7 +531,18 @@ async function pollProgress() {
 
     const allDone = data.cameras.every((c) => c.status === "completed" || c.status === "error");
     if (allDone) {
+      if (!data.unified) {
+        // cross-camera unification + re-render is still running — keep polling
+        progressPollTimer = setTimeout(pollProgress, 1200);
+        return;
+      }
       stopProgressPolling();
+      // unification rewrote the reid.jsons with global_ids — refetch every
+      // camera's overlay so on-screen labels show the global IDs
+      Object.keys(realTrackCache).forEach((camId) => {
+        delete realTrackCache[camId];
+        maybeFetchRealTracks(camId);
+      });
       toast("Processing complete — view results");
       loadResults();
     } else {
@@ -936,6 +973,7 @@ function getActiveBoxes(video) {
       track_id: b.track_id,
       name: b.name,
       similarity: b.similarity,
+      global_id: b.global_id,
       x1: b.bbox[0],
       y1: b.bbox[1],
       x2: b.bbox[2],
@@ -1010,11 +1048,12 @@ function drawBoundingBox(ctx, px, isMatch) {
 
 function drawPlacard(ctx, px, box, isMatch, rect) {
   const textColor = isMatch ? TEXT_KNOWN_COLOR : TEXT_UNKNOWN_COLOR;
+  const idLabel = box.global_id != null ? `GID ${box.global_id}` : `ID ${box.track_id}`;
   const label = isMatch
-    ? `${box.name} · ID ${box.track_id}${
+    ? `${box.name} · ${idLabel}${
         box.similarity != null ? ` [Match: ${(box.similarity * 100).toFixed(1)}%]` : ""
       }`
-    : `ID ${box.track_id} — Unidentified`;
+    : `${box.global_id != null ? `Global ID ${box.global_id}` : `ID ${box.track_id}`} — Unidentified`;
 
   ctx.save();
   ctx.font = "700 13px 'JetBrains Mono', monospace";
@@ -1185,8 +1224,95 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* ══════════════════════════════════════════════════════════════════════
+   watch-list alerts feed
+   ══════════════════════════════════════════════════════════════════════ */
+
+async function loadAlerts() {
+  const list = $("#alertsList");
+  const empty = $("#alertsEmpty");
+  const count = $("#alertsCount");
+  try {
+    const resp = await fetch("/api/alerts");
+    if (!resp.ok) throw new Error("Failed to load alerts");
+    const { alerts } = await resp.json();
+    const active = (alerts || []).filter((a) => a.flag && a.flag !== "normal");
+    updateAlertsBadge(active.length);
+    if (count) count.textContent = active.length
+      ? `${active.length} active watch-list alert${active.length === 1 ? "" : "s"}`
+      : "";
+
+    list.innerHTML = "";
+    empty.hidden = active.length > 0;
+    active.forEach((a) => list.appendChild(alertCard(a)));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function updateAlertsBadge(n) {
+  const badge = $("#alertsBadge");
+  if (!badge) return;
+  badge.hidden = !n;
+  badge.textContent = n;
+}
+
+function alertCard(a) {
+  const el = document.createElement("div");
+  const cls = ["alert-card"];
+  if (a.flag === "criminal") cls.push("critical");
+  el.className = cls.join(" ");
+  const flagTxt = FLAG_LABEL[a.flag] || a.flag;
+  const when = a.time ? new Date(a.time.replace(" ", "T")).toLocaleString() : "—";
+  const sim = a.similarity != null ? ` · ${Math.round(a.similarity * 100)}% match` : "";
+  const where = [a.source, a.camera_id].filter(Boolean).join(" · ");
+  const track = a.track_id != null ? `track #${a.track_id}` : "";
+  const crop = a.crop_url
+    ? `<img class="alert-crop" src="${a.crop_url}" alt="" loading="lazy" />`
+    : `<div class="alert-crop empty">no&nbsp;photo</div>`;
+
+  el.innerHTML = `
+    <div class="alert-head">
+      ${crop}
+      <div class="alert-body">
+        <div class="alert-title"><b>${escapeHtml(a.person)}</b> ${flagBadge(a.flag)}</div>
+        <div class="alert-flagtext">${escapeHtml(flagTxt)}</div>
+        ${a.details ? `<div class="alert-details">${escapeHtml(a.details)}</div>` : ""}
+        <div class="alert-meta">${escapeHtml(where)}${track ? " · " + track : ""}</div>
+        <div class="alert-meta">${escapeHtml(when)}${sim}</div>
+      </div>
+      <button class="btn danger small alert-dismiss" data-dismiss="${escapeHtml(a.id)}">Dismiss</button>
+    </div>
+  `;
+  return el;
+}
+
+$("#alertsList").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-dismiss]");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/alerts/${encodeURIComponent(btn.dataset.dismiss)}`, { method: "DELETE" });
+    if (!resp.ok) throw new Error("Could not dismiss alert");
+    loadAlerts();
+  } catch (err) {
+    btn.disabled = false;
+    toast(err.message, true);
+  }
+});
+
+$("#alertsRefresh").addEventListener("click", loadAlerts);
+// keep the badge fresh even while the operator is on another tab
+setInterval(() => {
+  fetch("/api/alerts")
+    .then((r) => r.json())
+    .then(({ alerts }) => updateAlertsBadge((alerts || []).filter((a) => a.flag && a.flag !== "normal").length))
+    .catch(() => {});
+}, 15000);
+
+/* ══════════════════════════════════════════════════════════════════════
    init
    ══════════════════════════════════════════════════════════════════════ */
 
 loadPersons();
+loadAlerts();
 logEvent("info", "Console initialized — awaiting camera input");

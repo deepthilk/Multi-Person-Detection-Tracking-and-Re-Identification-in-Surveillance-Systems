@@ -16,7 +16,9 @@ from registration.identity_db import IdentityDatabase
 logger = logging.getLogger(__name__)
 
 
-def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -> dict:
+def register_person(name: str, image_paths: list, db: IdentityDatabase = None,
+                    person_id: str = None, flag: str = "normal",
+                    details: str = "") -> dict:
     """
     Register a known person from one or more images.
 
@@ -36,6 +38,9 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
         image_paths: list of file paths to photos of this person.
         db: optional existing IdentityDatabase instance (mainly for tests /
             batch registration so the JSON file isn't reloaded every call).
+        person_id: optional official / badge / case ID.
+        flag: watch-list status, one of registration.identity_db.FLAGS.
+        details: free-text notes (description, case notes, etc.).
 
     Returns:
         The stored record for this person (dict), or raises ValueError if
@@ -64,7 +69,8 @@ def register_person(name: str, image_paths: list, db: IdentityDatabase = None) -
 
     db = db or IdentityDatabase()
     db.add_person(name, embeddings, image_paths=stored_paths,
-                  face_embeddings=face_embeddings)
+                  face_embeddings=face_embeddings,
+                  person_id=person_id, flag=flag, details=details)
 
     logger.info(
         f"✅ '{name}' registered: {len(embeddings)}/{len(image_paths)} images used, "

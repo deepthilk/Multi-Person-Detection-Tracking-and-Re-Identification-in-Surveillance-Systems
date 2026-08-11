@@ -28,6 +28,11 @@ from registration.db_config import DB_SETTINGS, SEARCH_SETTINGS
 
 logger = logging.getLogger(__name__)
 
+# Alert / watch-list flags a registered person can carry. "normal" is the
+# default; everything else shows up on the dashboard's Alerts panel whenever
+# that person is recognised on a camera.
+FLAGS = ("normal", "criminal", "missing", "person_of_interest")
+
 
 def _cosine(a, b) -> float:
     a = np.asarray(a, dtype=np.float32)
@@ -65,7 +70,8 @@ class IdentityDatabase:
     # ── writes ───────────────────────────────────────────────────────────
 
     def add_person(self, name: str, embeddings: list, image_paths: list = None,
-                   face_embeddings: list = None):
+                   face_embeddings: list = None, person_id: str = None,
+                   flag: str = "normal", details: str = ""):
         """
         Add or update a person.
 
@@ -76,6 +82,9 @@ class IdentityDatabase:
             face_embeddings: optional list of 512-dim face embeddings, one per
                 image where a confident face was detected. Stored as the
                 person's face gallery so search can match by face.
+            person_id: optional official / badge / case ID shown on the dashboard.
+            flag: watch-list status, one of registration.identity_db.FLAGS.
+            details: free-text notes (description, case notes, etc.).
         """
         if not embeddings:
             raise ValueError(f"No usable embeddings for '{name}' — nothing to store")
@@ -96,10 +105,18 @@ class IdentityDatabase:
             num_images = existing["metadata"]["num_images"] + len(embeddings)
             all_paths = existing["metadata"].get("image_paths", []) + (image_paths or [])
             registered_at = existing["metadata"]["registered_at"]
+            # keep previously-set profile fields unless the caller supplied new ones
+            meta = existing["metadata"]
+            person_id = person_id if person_id is not None else meta.get("person_id")
+            flag = flag if flag is not None else meta.get("flag", "normal")
+            details = details if details is not None else meta.get("details", "")
         else:
             num_images = len(embeddings)
             all_paths = image_paths or []
             registered_at = datetime.now().isoformat()
+
+        if flag not in FLAGS:
+            raise ValueError(f"Invalid flag '{flag}' - expected one of {FLAGS}")
 
         self._data[name] = {
             "embeddings": vectors,
@@ -110,6 +127,9 @@ class IdentityDatabase:
                 "last_updated": datetime.now().isoformat(),
                 "num_images": num_images,
                 "image_paths": all_paths,
+                "person_id": person_id,
+                "flag": flag,
+                "details": details or "",
             },
         }
         self.save()
@@ -181,6 +201,35 @@ class IdentityDatabase:
             )
             return None
         return self.add_person(name, keep_appearance, face_embeddings=keep_faces)
+
+    def update_metadata(self, name: str, **fields) -> dict:
+        """
+        Update profile fields (person_id / flag / details / notes) for an
+        existing person without touching embeddings. Accepts any subset of:
+        person_id, flag, details. Returns the updated record.
+
+        Raises KeyError if the person is not registered.
+        """
+        record = self._data.get(name)
+        if record is None:
+            raise KeyError(f"'{name}' is not in the identity database")
+
+        meta = record.setdefault("metadata", {})
+        for key, value in fields.items():
+            if key not in ("person_id", "flag", "details"):
+                raise ValueError(f"Unsupported metadata field '{key}'")
+            if key == "flag" and value is not None and value not in FLAGS:
+                raise ValueError(f"Invalid flag '{value}' - expected one of {FLAGS}")
+            if value is not None:
+                meta[key] = value
+        meta["last_updated"] = datetime.now().isoformat()
+        self.save()
+        logger.info(
+            "Updated metadata for '%s': %s",
+            name,
+            {k: fields[k] for k in fields if fields[k] is not None},
+        )
+        return record
 
     def delete_person(self, name: str) -> bool:
         if name in self._data:
@@ -297,8 +346,16 @@ class IdentityDatabase:
             if face_sim is None:
                 return app_sim, ["appearance"], threshold
             if face_sim >= s["face_confirmed_threshold"]:
+                # A confirmed face is the decisive cue: fuse with appearance
+                # to rank, but never let a weak/absent appearance signal drag
+                # the score below the face threshold. Real case: registration
+                # photos were head-shots, so the appearance descriptor was
+                # ~orthogonal (0.0) to a full-body video track; face said 0.465
+                # (>= 0.45) but the 70/30 blend dropped to 0.326 and the match
+                # was rejected.
                 score = (s["fused_weight_face_confirmed"] * face_sim +
                          s["fused_weight_appearance_confirmed"] * app_sim)
+                score = max(score, face_sim)
                 return score, ["appearance", "face"], s["face_confirmed_threshold"]
             if face_sim < s["face_veto_threshold"]:
                 return min(app_sim, face_sim), ["appearance", "face(veto)"], threshold

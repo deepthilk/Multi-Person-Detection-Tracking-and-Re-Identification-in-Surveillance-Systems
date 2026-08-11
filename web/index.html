@@ -41,8 +41,12 @@
             <button class="tab-btn" data-tab="results" role="tab" aria-selected="false">
               <span class="tab-num">04</span> Results
             </button>
+            <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false">
+              <span class="tab-num">05</span> Alerts
+              <span class="tab-badge" id="alertsBadge" hidden></span>
+            </button>
             <button class="tab-btn" data-tab="telemetry" role="tab" aria-selected="false">
-              <span class="tab-num">05</span> Logs
+              <span class="tab-num">06</span> Logs
             </button>
           </nav>
           <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch between dark and light mode" title="Switch theme">
@@ -99,6 +103,26 @@
             <div class="field">
               <label for="personName">Full name</label>
               <input id="personName" type="text" placeholder="e.g. Alice Fernandes" autocomplete="off" required />
+            </div>
+
+            <div class="field">
+              <label for="personId">Case / ID <span class="hint">(optional)</span></label>
+              <input id="personId" type="text" placeholder="e.g. REG-004" autocomplete="off" />
+            </div>
+
+            <div class="field">
+              <label for="personFlag">Watch-list flag</label>
+              <select id="personFlag">
+                <option value="normal">Normal</option>
+                <option value="criminal">Criminal</option>
+                <option value="missing">Missing</option>
+                <option value="person_of_interest">Person of interest</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="personDetails">Details / notes <span class="hint">(optional)</span></label>
+              <textarea id="personDetails" rows="2" placeholder="Description, case notes, last seen…"></textarea>
             </div>
 
             <div class="field">
@@ -244,6 +268,24 @@
           </div>
         </section>
       </main>
+      <!-- ══════════════════ VIEW: ALERTS ══════════════════ -->
+      <main class="view" id="view-alerts">
+        <section class="panel reveal">
+          <div class="panel-head split">
+            <div>
+              <h2>Watch-list Alerts</h2>
+              <p>Flagged persons (criminal / missing / person of interest) recognised on any camera. Set a flag from the Known People tab → Edit.</p>
+            </div>
+            <button id="alertsRefresh" class="btn ghost small" type="button">Refresh</button>
+          </div>
+          <div id="alertsCount" class="hint" style="margin-bottom: .8rem;"></div>
+          <div id="alertsList" class="alerts-list"></div>
+          <div id="alertsEmpty" class="empty-state" hidden>
+            <p>No alerts.</p>
+            <span>Flag a person as criminal / missing / person of interest — they'll show up here whenever they are recognised on a camera.</span>
+          </div>
+        </section>
+      </main>
       <!-- ══════════════════ VIEW: SYSTEM LOG ══════════════════ -->
       <main class="view" id="view-telemetry">
         <section class="panel reveal">
@@ -287,6 +329,23 @@
             <input id="editPhotos" type="file" accept="image/*" multiple hidden />
           </label>
           <div id="editPhotoPreview" class="photo-preview"></div>
+        </div>
+        <div class="field">
+          <label for="editId">Case / ID</label>
+          <input id="editId" type="text" />
+        </div>
+        <div class="field">
+          <label for="editFlag">Watch-list flag</label>
+          <select id="editFlag">
+            <option value="normal">Normal</option>
+            <option value="criminal">Criminal</option>
+            <option value="missing">Missing</option>
+            <option value="person_of_interest">Person of interest</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="editDetails">Details / notes</label>
+          <textarea id="editDetails" rows="3"></textarea>
         </div>
         <span id="editHint" class="hint"></span>
         <div class="modal-actions">

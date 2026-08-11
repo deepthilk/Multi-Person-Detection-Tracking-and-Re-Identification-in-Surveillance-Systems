@@ -335,6 +335,7 @@ def load_track_overlay(reid_json_path: str, people: list, fps: float, max_frames
                     "bbox": p.get("bbox"),
                     "name": info.get("name"),
                     "similarity": info.get("similarity"),
+                    "global_id": info.get("global_id"),
                 }
             )
         if boxes:

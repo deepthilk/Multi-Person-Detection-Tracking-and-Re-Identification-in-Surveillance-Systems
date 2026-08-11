@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import json
 import logging
 import shutil
@@ -80,6 +81,108 @@ def _record_latency(stage: str, seconds: float, camera_id: str = None):
         del LATENCY_SAMPLES[: len(LATENCY_SAMPLES) - _MAX_LATENCY_SAMPLES]
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Watch-list alerts (flagged-person sightings)
+# ══════════════════════════════════════════════════════════════════════════
+
+# where watch-list alert events are persisted; also owned here:
+# - dismissed_alerts.json (ids of alerts the operator marked "handled")
+ALERTS_PATH = ROOT_DIR / "outputs" / "alerts.json"
+DISMISSED_PATH = ROOT_DIR / "outputs" / "dismissed_alerts.json"
+
+
+def _read_alerts() -> List[dict]:
+    if not ALERTS_PATH.exists():
+        return []
+    try:
+        with open(ALERTS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"Could not read alerts file: {e}")
+        return []
+
+
+def _append_alert(alert: dict):
+    """Persist an alert event to the top of alerts.json (capped at 200).
+    De-duplicates by (person, camera_id, track_id) so re-runs / cross-camera
+    corrections don't stack identical rows."""
+    alerts = _read_alerts()
+    key = (alert.get("person"), alert.get("camera_id"), alert.get("track_id"))
+    alerts = [a for a in alerts
+              if (a.get("person"), a.get("camera_id"), a.get("track_id")) != key]
+    alert.setdefault("time", time.strftime("%Y-%m-%d %H:%M:%S"))
+    alerts.insert(0, alert)
+    ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(ALERTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(alerts[:200], f, indent=2, ensure_ascii=False)
+
+
+def _alert_event_id(ev: dict) -> str:
+    """Stable id for a persisted alert event (alerts.json)."""
+    key = {
+        "person": ev.get("person"),
+        "source": ev.get("source"),
+        "time": ev.get("time"),
+        "camera_id": ev.get("camera_id"),
+        "track_id": ev.get("track_id"),
+    }
+    raw = json.dumps(key, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_dismissed() -> set:
+    try:
+        if DISMISSED_PATH.exists():
+            data = json.loads(DISMISSED_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return set(data)
+    except Exception as e:
+        logger.warning(f"Could not read dismissed alerts: {e}")
+    return set()
+
+
+def _write_dismissed(dismissed: set):
+    DISMISSED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        DISMISSED_PATH.write_text(
+            json.dumps(sorted(dismissed), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"Could not write dismissed alerts: {e}")
+
+
+def _flag_label(flag):
+    from registration.identity_db import FLAGS
+    return flag if flag in FLAGS else "normal"
+
+
+def _raise_flag_alerts(cam: dict):
+    """For one finished camera, persist an alert for every recognised track
+    whose registered person carries a non-normal watch-list flag."""
+    for p in cam.get("people", []):
+        name = p.get("name")
+        if not name:
+            continue
+        record = _get_db().get_person(name) or {}
+        meta = record.get("metadata", {})
+        flag = _flag_label(meta.get("flag", "normal"))
+        if flag == "normal":
+            continue
+        _append_alert({
+            "person": name,
+            "flag": flag,
+            "details": meta.get("details", ""),
+            "source": cam.get("label", cam.get("camera_id", "cam")),
+            "camera_id": cam.get("camera_id"),
+            "track_id": p.get("track_id"),
+            "similarity": round(float(p["similarity"] or 0.0), 3),
+            "crop_url": p.get("thumb_url"),
+            "first_seen_sec": p.get("first_seen_sec"),
+            "last_seen_sec": p.get("last_seen_sec"),
+        })
+
+
 def _ensure_artifact(path: Path, label: str):
     if not path.exists():
         raise RuntimeError(f"{label} not created")
@@ -133,6 +236,9 @@ def _person_summary(name: str, record: dict) -> dict:
         "last_updated": meta.get("last_updated"),
         "image_paths": image_paths,
         "photos": [_photo_url(p) for p in image_paths],
+        "person_id": meta.get("person_id"),
+        "flag": meta.get("flag", "normal"),
+        "details": meta.get("details", ""),
     }
 
 
@@ -151,7 +257,9 @@ def search_persons(q: str = ""):
 
 
 @app.post("/api/persons")
-def add_person(name: str = Form(...), files: List[UploadFile] = File(...)):
+def add_person(name: str = Form(...), files: List[UploadFile] = File(...),
+               person_id: str = Form(""), flag: str = Form("normal"),
+               details: str = Form("")):
     name = name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
@@ -164,7 +272,9 @@ def add_person(name: str = Form(...), files: List[UploadFile] = File(...)):
 
     saved_paths = _save_uploads(name, files)
     try:
-        record = register_person(name, saved_paths, db=db)
+        record = register_person(name, saved_paths, db=db,
+                                 person_id=person_id.strip() or None,
+                                 flag=flag, details=details.strip())
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return JSONResponse(_person_summary(name, record), status_code=201)
@@ -214,6 +324,28 @@ def delete_person(name: str):
     if not db.delete_person(name):
         raise HTTPException(status_code=404, detail=f"'{name}' is not registered")
     return JSONResponse({"deleted": name})
+
+
+@app.put("/api/persons/{name}/profile")
+def update_person_profile(name: str, person_id: str = Form(""), flag: str = Form("normal"),
+                          details: str = Form("")):
+    """Update a registered person's watch-list profile (case ID / flag / notes)
+    without touching their embeddings or photos."""
+    db = _get_db()
+    if db.get_person(name) is None:
+        raise HTTPException(status_code=404, detail=f"'{name}' is not registered")
+    flag = _flag_label(flag)
+    try:
+        db.update_metadata(
+            name,
+            person_id=person_id.strip() or None,
+            flag=flag,
+            details=details.strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    _log("info", f"Profile updated for '{name}' (flag={flag})")
+    return JSONResponse(_person_summary(name, db.get_person(name)))
 
 
 def _save_uploads(name: str, files: List[UploadFile]) -> List[str]:
@@ -298,7 +430,7 @@ def session_progress(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     cams = list(session["cameras"].values())
     overall = int(sum(c["percent"] for c in cams) / max(1, len(cams)))
-    return JSONResponse({"cameras": cams, "overall_percent": overall})
+    return JSONResponse({"cameras": cams, "overall_percent": overall, "unified": session.get("unified", False)})
 
 
 @app.get("/api/session/{session_id}/results")
@@ -319,6 +451,7 @@ def session_results(session_id: str):
                 "camera_id": cam["camera_id"],
                 "camera_label": cam["label"],
                 "track_id": person["track_id"],
+                "global_id": person.get("global_id"),
                 "first_seen_sec": person["first_seen_sec"],
                 "last_seen_sec": person["last_seen_sec"],
                 "thumb_url": person.get("thumb_url"),
@@ -356,6 +489,7 @@ def session_results(session_id: str):
                     "name": p.get("name"),
                     "similarity": p.get("similarity"),
                     "face_sim": p.get("face_sim"),
+                    "global_id": p.get("global_id"),
                 }
                 for p in c.get("people", [])
             ],
@@ -380,6 +514,8 @@ def _rewrite_tracks(reid_path: Path, corrected: dict):
             tracks[tid]["face_sim"] = c.get("face_sim")
             tracks[tid]["cues"] = c.get("cues", [])
             tracks[tid]["manual"] = bool(c.get("manual")) or tracks[tid].get("manual", False)
+            if c.get("global_id") is not None:
+                tracks[tid]["global_id"] = c["global_id"]
     with open(reid_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
@@ -409,12 +545,14 @@ def _unify_session(session_id: str):
         if cam.get("status") == "completed" and cam.get("reid_json_path")
     }
     if not completed:
+        session["unified"] = True
         return
     reid_paths = {cid: Path(cam["reid_json_path"]) for cid, cam in completed.items()}
     try:
         corrected = unify_session_files(reid_paths)
     except Exception:
         logger.exception("Cross-camera unify failed for session %s", session_id)
+        session["unified"] = True
         return
 
     changes = 0
@@ -434,11 +572,16 @@ def _unify_session(session_id: str):
             p["global_id"] = c["global_id"]
         _rewrite_tracks(Path(cam["reid_json_path"]), corr)
         _re_render(cam)
+        # A cross-camera resolution may have just named a flagged person that
+        # the single-camera pass left unknown — raise (deduped) alerts again.
+        _raise_flag_alerts(cam)
 
     if changes:
         _log("info", f"Cross-camera unification: {changes} name change(s) across {len(completed)} camera(s)")
     else:
         _log("info", "Cross-camera unification: all cameras already agree")
+
+    session["unified"] = True
 
 
 @app.post("/api/session/{session_id}/correct")
@@ -508,6 +651,8 @@ def correct_track(session_id: str, camera_id: str = Form(...), track_id: int = F
     _re_render(cam)
     _log("info", f"{cam['label']}: manual correction → track {track_id} = "
                  f"{name!r} ({'face=' + str(round(face_sim, 3)) if face_sim else 'manual'})")
+    # A manual correction can be what first reveals a flagged person's identity.
+    _raise_flag_alerts(cam)
 
     # Propagate the corrected name to the same person on other cameras.
     if len(session["cameras"]) > 1:
@@ -575,6 +720,9 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             if extract_track_thumbnail(str(input_path), str(reid_path), p["track_id"], thumb_path):
                 p["thumb_url"] = f"/outputs/{thumb_path.name}"
 
+        # Watch-list alert for every flagged registered person recognised here.
+        _raise_flag_alerts(cam)
+
         if summary["frame_drop_rate"] > 0.02:
             _log(
                 "warn",
@@ -586,10 +734,11 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             if p["name"]:
                 level = "critical" if p["similarity"] and p["similarity"] >= 0.75 else "info"
                 tag = "CRITICAL RE-ID MATCH" if level == "critical" else "MATCH"
+                conf = f"{p['similarity'] * 100:.1f}%" if p["similarity"] is not None else "n/a"
                 _log(
                     level,
                     f"{label}: [{tag}] track {p['track_id']} resolved to '{p['name']}' "
-                    f"(confidence {p['similarity'] * 100:.1f}%)",
+                    f"(confidence {conf})",
                     camera_id,
                 )
             else:
@@ -670,6 +819,56 @@ def get_telemetry():
             "latency_samples": LATENCY_SAMPLES[-40:],
         }
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Watch-list alerts API
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/alerts")
+def api_alerts():
+    """Return all watch-list alert events (alerts.json), newest first, minus
+    the ones the operator marked as handled. Every alert carries the same
+    shape the UI expects: person, flag, details, source, camera_id, track_id,
+    similarity, crop_url, first_seen_sec, last_seen_sec, time, id."""
+    dismissed = _read_dismissed()
+    alerts = []
+    for ev in _read_alerts():
+        alert_id = _alert_event_id(ev)
+        if alert_id in dismissed:
+            continue
+        ev = dict(ev)
+        ev["id"] = alert_id
+        alerts.append(ev)
+    alerts.sort(key=lambda a: a.get("time") or "", reverse=True)
+    return JSONResponse({"alerts": alerts})
+
+
+@app.delete("/api/alerts/{alert_id}")
+def api_delete_alert(alert_id: str):
+    """Dismiss an alert after it has been handled: it is removed from
+    alerts.json entirely (or recorded in dismissed_alerts.json if the event
+    is already gone) so it never comes back."""
+    alerts = _read_alerts()
+    kept = []
+    removed = False
+    for ev in alerts:
+        if _alert_event_id(ev) == alert_id:
+            removed = True
+            continue
+        kept.append(ev)
+    if removed:
+        ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(ALERTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(kept[:200], f, indent=2, ensure_ascii=False)
+        _log("info", f"Alert dismissed: {alert_id}")
+        return JSONResponse({"deleted": True, "alert_id": alert_id})
+
+    # event not (or no longer) in the file — remember it as handled anyway
+    dismissed = _read_dismissed()
+    dismissed.add(alert_id)
+    _write_dismissed(dismissed)
+    return JSONResponse({"deleted": True, "alert_id": alert_id})
 
 
 # ══════════════════════════════════════════════════════════════════════════

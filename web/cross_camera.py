@@ -37,8 +37,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Same-person face similarity measured >= 0.53 on this footage (deeps 0.536,
-# lekha 0.576); different people <= 0.28. 0.45 is comfortably between.
-FACE_SAME = 0.45
+# lekha 0.576); different people <= 0.28. 0.42 is comfortably between and
+# matches registration/db_config.py's face_confirmed_threshold (Prajna's
+# low-res registration photos score 0.44-0.48 on real same-person footage).
+FACE_SAME = 0.42
 # Different-person faces sit <= 0.28; a face pair below this vetoes a
 # cross-camera link even when the bodies look identical.
 FACE_VETO = 0.28
@@ -211,7 +213,7 @@ def unify_cameras(cameras: dict) -> dict:
                 "similarity": t.get("similarity"),
                 "face_sim": t.get("face_sim"),
                 "cues": t.get("cues", []),
-                "global_id": None if len(cam_ids) > 1 else gid,
+                "global_id": gid,
             }
             continue
         # Choose the component name: manual correction wins, else the

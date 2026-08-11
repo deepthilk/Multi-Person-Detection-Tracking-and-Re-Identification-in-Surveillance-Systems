@@ -47,8 +47,11 @@ SEARCH_SETTINGS = {
     # Face + appearance score-level fusion (IdentityDatabase.match_multimodal).
     # Face similarity uses InsightFaceExtractor.similarity (0..1 cosine on
     # ArcFace w600k_mbf embeddings; measured on this project's footage:
-    # same-person >= ~0.54, different-person <= ~0.28).
-    "face_confirmed_threshold": 0.45,   # >= this: faces clearly say "same person"
+    # same-person >= ~0.54, different-person <= ~0.28). 0.42 keeps a wide
+    # margin above the different-person ceiling (0.28/0.30) while still
+    # catching true same-person matches whose face quality is mediocre
+    # (Prajna measured 0.44-0.47 on this footage — below the old 0.45 bar).
+    "face_confirmed_threshold": 0.42,   # >= this: faces clearly say "same person"
     "face_veto_threshold": 0.30,        # <  this: faces clearly say "different person"
     "fused_weight_face_confirmed": 0.70,    # face dominates a confirmed match
     "fused_weight_appearance_confirmed": 0.30,
