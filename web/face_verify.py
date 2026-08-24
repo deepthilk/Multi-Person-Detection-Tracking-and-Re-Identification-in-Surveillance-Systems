@@ -871,7 +871,7 @@ def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
 
     results["__tracks__"] = tracks_payload
     with open(reid_json_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, separators=(",", ":"))
 
     first_seen = {}
     last_seen = {}

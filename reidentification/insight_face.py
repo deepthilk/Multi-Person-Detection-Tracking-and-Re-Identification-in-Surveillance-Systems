@@ -23,6 +23,8 @@ module never changes validated live-tracking behaviour.
 
 import logging
 
+import threading
+
 import cv2
 import numpy as np
 
@@ -58,6 +60,9 @@ class InsightFaceExtractor:
         self._app = None
         self._det_size = det_size
         self._max_batch = max_batch
+        # FaceAnalysis and the detector's input_size are shared mutable state:
+        # guard calls so concurrent camera jobs can share one extractor safely.
+        self._lock = threading.Lock()
 
     def _get_app(self):
         if self._app is None:
@@ -103,6 +108,10 @@ class InsightFaceExtractor:
         return self._best_face_embedding(frame)
 
     def _best_face_embedding(self, image):
+        with self._lock:
+            return self._best_face_embedding_unlocked(image)
+
+    def _best_face_embedding_unlocked(self, image):
         app = self._get_app()
         if app is None:
             return None
@@ -144,6 +153,7 @@ class InsightFaceExtractor:
 
 
 _shared_extractor = None
+_shared_extractor_lock = threading.Lock()
 
 
 def get_shared_extractor():
@@ -152,9 +162,12 @@ def get_shared_extractor():
     Loading the buffalo_s ONNX models costs several seconds per instance, and
     a single video job otherwise creates TWO extractors (the Re-ID loop plus
     the face-verification pass). Sharing one instance across the process loads
-    the models once and removes that fixed cost from every job.
+    the models once and removes that fixed cost from every job. The creation
+    lock keeps concurrent camera jobs from double-loading the models.
     """
     global _shared_extractor
     if _shared_extractor is None:
-        _shared_extractor = InsightFaceExtractor()
+        with _shared_extractor_lock:
+            if _shared_extractor is None:
+                _shared_extractor = InsightFaceExtractor()
     return _shared_extractor

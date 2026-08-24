@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import sys
+import threading
 import time
 import uuid
 from typing import Dict, List
@@ -406,21 +407,35 @@ def start_session(
             "stride": stride,
         }
 
-        background_tasks.add_task(
-            _run_camera_job,
-            session_id,
-            camera_id,
-            input_path,
-            device,
-            stride,
-            det_stride,
-        )
-
     SESSIONS[session_id] = {"cameras": cameras}
-    # Runs AFTER every camera job (FastAPI BackgroundTasks are sequential),
-    # unifying identities that appear on more than one camera.
-    background_tasks.add_task(_unify_session, session_id)
+
+    # Camera jobs are independent and CPU-bound, so they run on their own
+    # threads instead of the (strictly sequential) FastAPI BackgroundTasks.
+    # `stride` is the per-job frame-sampling knob, so this change is
+    # accuracy-neutral. The join helper below preserves the "unify AFTER every
+    # camera finishes" ordering.
+    threads = []
+    for i, (f, label) in enumerate(zip(files, labels)):
+        camera_id = f"cam{i + 1}"
+        thread = threading.Thread(
+            target=_run_camera_job,
+            args=(session_id, camera_id, cameras[camera_id]["input_path"],
+                  device, stride, det_stride),
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+
+    background_tasks.add_task(_join_threads_then_unify, session_id, threads)
     return JSONResponse({"session_id": session_id, "cameras": list(cameras.keys())})
+
+
+def _join_threads_then_unify(session_id: str, threads: list):
+    """Wait for every camera job thread, then run the cross-camera unify step
+    exactly once — mirrors the old sequential BackgroundTasks ordering."""
+    for t in threads:
+        t.join()
+    _unify_session(session_id)
 
 
 @app.get("/api/session/{session_id}/progress")
@@ -499,25 +514,47 @@ def session_results(session_id: str):
     return JSONResponse({"summary": summary, "matched": matched, "unmatched": unmatched, "cameras": cameras})
 
 
-def _rewrite_tracks(reid_path: Path, corrected: dict):
+def _rewrite_tracks(reid_path: Path, corrected: dict) -> bool:
     """Write corrected names/evidence back into a camera's reid.json
-    __tracks__ section so re-rendered videos and future reads use them."""
+    __tracks__ section so re-rendered videos and future reads use them.
+
+    Returns True if any track's rendered content (name / similarity /
+    face_sim / global_id) actually changed, so the caller can skip a no-op
+    re-render when the video's labels would be identical."""
     if not reid_path.exists():
-        return
+        return False
     with open(reid_path, encoding="utf-8") as f:
         data = json.load(f)
     tracks = data.get("__tracks__", {})
+    changed = False
     for tid, c in corrected.items():
-        if tid in tracks:
-            tracks[tid]["name"] = c.get("name")
-            tracks[tid]["similarity"] = c.get("similarity")
-            tracks[tid]["face_sim"] = c.get("face_sim")
-            tracks[tid]["cues"] = c.get("cues", [])
-            tracks[tid]["manual"] = bool(c.get("manual")) or tracks[tid].get("manual", False)
-            if c.get("global_id") is not None:
-                tracks[tid]["global_id"] = c["global_id"]
+        if tid not in tracks:
+            continue
+        t = tracks[tid]
+        new = (
+            c.get("name"),
+            c.get("similarity"),
+            c.get("face_sim"),
+            c.get("global_id"),
+        )
+        old = (
+            t.get("name"),
+            t.get("similarity"),
+            t.get("face_sim"),
+            t.get("global_id"),
+        )
+        if new != old:
+            changed = True
+        t["name"] = c.get("name")
+        t["similarity"] = c.get("similarity")
+        t["face_sim"] = c.get("face_sim")
+        t["cues"] = c.get("cues", [])
+        t["manual"] = bool(c.get("manual")) or t.get("manual", False)
+        if c.get("global_id") is not None:
+            t["global_id"] = c["global_id"]
     with open(reid_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, separators=(",", ":"))
+    return changed
 
 
 def _re_render(cam: dict):
@@ -526,7 +563,8 @@ def _re_render(cam: dict):
     reid_path = Path(cam["reid_json_path"])
     out = reid_path.with_name(reid_path.name.replace("_reid.json", "_reid.mp4"))
     try:
-        render_reid_video(cam["input_path"], str(reid_path), str(out))
+        if render_reid_video(cam["input_path"], str(reid_path), str(out)):
+            cam["output_url"] = f"/outputs/{out.name}"
     except Exception:
         logger.exception("Re-render failed for %s", cam["camera_id"])
 
@@ -552,6 +590,12 @@ def _unify_session(session_id: str):
         corrected = unify_session_files(reid_paths)
     except Exception:
         logger.exception("Cross-camera unify failed for session %s", session_id)
+        # The per-camera jobs no longer render up-front (rendering now happens
+        # once, here, with the final names) — so on unify failure still produce
+        # a video per completed camera instead of leaving them without one.
+        for cam in completed.values():
+            if not cam.get("output_url"):
+                _re_render(cam)
         session["unified"] = True
         return
 
@@ -570,8 +614,11 @@ def _unify_session(session_id: str):
             p["face_sim"] = c["face_sim"]
             p["cues"] = c.get("cues", [])
             p["global_id"] = c["global_id"]
-        _rewrite_tracks(Path(cam["reid_json_path"]), corr)
-        _re_render(cam)
+        # Re-render only when a track's labels actually changed, or when no
+        # video exists yet (first run) — a no-op unify must not re-encode every
+        # camera again.
+        if _rewrite_tracks(Path(cam["reid_json_path"]), corr) or not cam.get("output_url"):
+            _re_render(cam)
         # A cross-camera resolution may have just named a flagged person that
         # the single-camera pass left unknown — raise (deduped) alerts again.
         _raise_flag_alerts(cam)
@@ -646,7 +693,7 @@ def correct_track(session_id: str, camera_id: str = Form(...), track_id: int = F
     track["cues"] = cues
     track["manual"] = bool(name)
     with open(reid_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, separators=(",", ":"))
 
     _re_render(cam)
     _log("info", f"{cam['label']}: manual correction → track {track_id} = "
@@ -666,7 +713,6 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
     detections_path = OUTPUT_DIR / f"{session_id}_{camera_id}_detections.json"
     tracking_path = OUTPUT_DIR / f"{session_id}_{camera_id}_tracking.json"
     reid_path = OUTPUT_DIR / f"{session_id}_{camera_id}_reid.json"
-    output_video_path = OUTPUT_DIR / f"{session_id}_{camera_id}_reid.mp4"
     label = cam.get("label", camera_id)
 
     _log("info", f"{label}: job queued on {device.upper()}", camera_id)
@@ -744,12 +790,7 @@ def _run_camera_job(session_id: str, camera_id: str, input_path: Path, device: s
             else:
                 _log("info", f"{label}: track {p['track_id']} has no identity match — unknown", camera_id)
 
-        cam.update({"percent": 90, "message": "Rendering annotated video"})
-        t3 = time.time()
-        if render_reid_video(str(input_path), str(reid_path), str(output_video_path)):
-            cam["output_url"] = f"/outputs/{output_video_path.name}"
-        _record_latency("render", time.time() - t3, camera_id)
-
+        cam.update({"percent": 90, "message": "Finalizing"})
         cam.update({"status": "completed", "percent": 100, "message": "Done"})
         _log("info", f"{label}: pipeline complete ({time.time() - t0:.1f}s total)", camera_id)
     except Exception as exc:

@@ -252,7 +252,7 @@ def run_camera_reid(
 
     Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_json_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, separators=(",", ":"))
 
     people = []
     for final_id, info in sorted(track_info.items()):
