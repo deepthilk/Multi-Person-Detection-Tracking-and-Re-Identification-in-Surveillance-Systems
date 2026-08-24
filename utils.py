@@ -134,11 +134,13 @@ def fill_track_gaps(reid_res, max_gap=15):
     return filled
 
 
-def draw_reid_matches(frame, reid_data, name_map=None, gid_map=None):
+def draw_reid_matches(frame, reid_data, name_map=None, gid_map=None, tentative_map=None):
     """Draw Re-ID matching information on frame.
 
     Style: solid BLACK box, BLACK label placard. Text is RED for a resolved
-    (known) person and GREEN for an unknown person.
+    (known) person and GREEN for an unknown person. An unknown track with a
+    near-threshold database candidate shows a green "may be <name> (x%)"
+    hint instead of a bare ID.
     """
     frame_copy = frame.copy()
 
@@ -188,10 +190,14 @@ def draw_reid_matches(frame, reid_data, name_map=None, gid_map=None):
 
         name = name_map.get(str(person_id)) if name_map is not None else None
         gid = gid_map.get(str(person_id)) if gid_map is not None else None
+        tent = tentative_map.get(str(person_id)) if tentative_map is not None else None
         if name and gid is not None:
             label = f"{name} · GID {gid}"
         elif name:
             label = name
+        elif tent and tent.get("name"):
+            pct = round(float(tent.get("similarity") or 0) * 100)
+            label = f"may be {tent['name']} ({pct}%)"
         elif gid is not None:
             label = f"Global ID {gid}"
         else:
@@ -312,6 +318,7 @@ def render_reid_video(video_path, reid_json, output_video_path):
     # before re-render. Falls back to no names (old ID-style labels).
     name_map = {}
     gid_map = {}
+    tentative_map = {}
     tracks = reid_res.get("__tracks__") if isinstance(reid_res, dict) else None
     if isinstance(tracks, dict):
         name_map = {
@@ -323,6 +330,11 @@ def render_reid_video(video_path, reid_json, output_video_path):
             tid: t["global_id"]
             for tid, t in tracks.items()
             if t.get("global_id") is not None
+        }
+        tentative_map = {
+            tid: {"name": t.get("tentative_name"), "similarity": t.get("tentative_similarity")}
+            for tid, t in tracks.items()
+            if t.get("tentative_name") and not t.get("name")
         }
 
     cap = cv2.VideoCapture(video_path)
@@ -358,7 +370,7 @@ def render_reid_video(video_path, reid_json, output_video_path):
 
         frame_id += 1
         frame_reid = reid_res.get(str(frame_id), [])
-        frame = draw_reid_matches(frame, frame_reid, name_map, gid_map)
+        frame = draw_reid_matches(frame, frame_reid, name_map, gid_map, tentative_map)
         out.write(frame)
 
     cap.release()

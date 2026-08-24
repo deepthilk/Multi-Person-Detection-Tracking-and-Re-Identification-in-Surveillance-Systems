@@ -193,6 +193,7 @@
               <p>Uploaded footage with bounding boxes and identity placards tracked live on top.</p>
             </div>
             <div class="preview-controls">
+              <button id="previewPauseBtn" class="btn ghost small" type="button" aria-label="Pause or resume the preview">⏸ Pause</button>
               <select id="previewCameraSelect" aria-label="Camera to preview"></select>
             </div>
           </div>
@@ -201,6 +202,7 @@
             <canvas id="overlayCanvas"></canvas>
             <span id="overlayModeBadge" class="overlay-mode-badge">DEMO OVERLAY</span>
           </div>
+          <p class="hint" style="margin-top:.5rem;">Boxes appear here only after processing finishes — while the pipeline runs you see the raw footage. Results-tab videos use the same final annotations.</p>
         </section>
       </main>
 

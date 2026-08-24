@@ -1034,3 +1034,32 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, var(--warm), #f
   0%, 100% { box-shadow: 0 0 0 0 rgba(255, 109, 109, 0.5); }
   50% { box-shadow: 0 0 0 5px rgba(255, 109, 109, 0); }
 }
+
+/* ══════════════════ UX CORRECTIONS ══════════════════ */
+
+/* alert crops open the lightbox on click */
+img.alert-crop { cursor: zoom-in; transition: transform 0.15s ease, border-color 0.15s ease; }
+img.alert-crop:hover { transform: scale(1.08); border-color: var(--warm); }
+
+/* results-tab videos styled like the live-detection preview stage */
+.output-stage { position: relative; background: #000; }
+.output-stage video {
+  display: block; width: 100%; max-height: 420px;
+  background: #000;
+}
+.video-fallback {
+  display: none;
+  padding: 2rem 1.25rem;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 0.88rem;
+}
+.video-fallback code {
+  font-family: "JetBrains Mono", monospace; font-size: 0.8rem;
+  background: rgba(255, 255, 255, 0.06); padding: 0.1rem 0.35rem; border-radius: 5px;
+}
+.camera-output.video-error .video-fallback { display: block; }
+.camera-output.video-error video { display: none; }
+
+/* tentative ("may be …") hint under unknown rows */
+.tentative-hint { color: var(--warm-2); font-weight: 600; }

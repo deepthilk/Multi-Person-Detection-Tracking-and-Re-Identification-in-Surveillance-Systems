@@ -484,6 +484,8 @@ def session_results(session_id: str):
                     {
                         "track_id": f"{cam['camera_id']}-{person['track_id']}",
                         **sighting,
+                        "tentative_name": person.get("tentative_name"),
+                        "tentative_similarity": person.get("tentative_similarity"),
                     }
                 )
 

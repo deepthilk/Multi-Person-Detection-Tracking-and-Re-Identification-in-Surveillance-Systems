@@ -173,6 +173,9 @@ $("#startProcessingBtn").addEventListener("click", async () => {
     data.cameras.forEach((camId, i) => {
       sessionVideoUrls[camId] = URL.createObjectURL(files[i]);
     });
+    Object.keys(realTrackCache).forEach((k) => delete realTrackCache[k]);
+    cameraStatusSeenClear();
+    sessionComplete = false;
     populatePreviewCameras(data.cameras);
 
     toast("Processing started");
@@ -487,6 +490,9 @@ function dotClass(status) {
 }
 
 const cameraStatusSeen = {};
+function cameraStatusSeenClear() {
+  Object.keys(cameraStatusSeen).forEach((k) => delete cameraStatusSeen[k]);
+}
 function renderCameraStatus(cameras) {
   $("#processEmpty").hidden = true;
   const list = $("#cameraStatusList");
@@ -497,7 +503,8 @@ function renderCameraStatus(cameras) {
       cameraStatusSeen[cam.camera_id] = cam.status;
       if (cam.status === "completed") {
         logEvent("info", `${cam.label}: pipeline completed`);
-        maybeFetchRealTracks(cam.camera_id);
+        // NOTE: overlay tracks are intentionally NOT fetched here — boxes
+        // stay off until the whole session (incl. cross-camera unify) is done
       }
       if (cam.status === "error") logEvent("error", `${cam.label}: ${cam.message}`);
       if (cam.status === "running" && prev === "queued") logEvent("info", `${cam.label}: detection started`);
@@ -537,12 +544,14 @@ async function pollProgress() {
         return;
       }
       stopProgressPolling();
+      sessionComplete = true;
       // unification rewrote the reid.jsons with global_ids — refetch every
       // camera's overlay so on-screen labels show the global IDs
       Object.keys(realTrackCache).forEach((camId) => {
         delete realTrackCache[camId];
         maybeFetchRealTracks(camId);
       });
+      playCompletionChime();
       toast("Processing complete — view results");
       loadResults();
     } else {
@@ -560,6 +569,31 @@ function startProgressPolling() {
 function stopProgressPolling() {
   clearTimeout(progressPollTimer);
   progressPollTimer = null;
+}
+
+// ── completion chime: short two-note beep when the whole session finishes ─
+let audioCtx = null;
+function playCompletionChime() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    [880, 1174.66].forEach((freq, i) => {
+      const t0 = audioCtx.currentTime + i * 0.18;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.22, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.4);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.45);
+    });
+    logEvent("info", "Completion chime played");
+  } catch (e) {
+    /* audio unavailable — silent fallback */
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -633,8 +667,16 @@ function renderCameraOutputs(cameras) {
           .map((p) => escapeHtml(p.name || `unknown #${p.track_id}`))
           .join(" · ")}</span>
       </div>
-      <video controls preload="metadata" src="${c.output_url}"></video>
+      <div class="output-stage">
+        <video controls preload="metadata" src="${c.output_url}"></video>
+        <div class="video-fallback">
+          <p>This camera's annotated video can't be played by the browser.</p>
+          <span>The render needs ffmpeg for browser-compatible encoding — run <code>!apt install -y ffmpeg</code> once in Colab, then re-run the session.</span>
+        </div>
+      </div>
     `;
+    const video = item.querySelector("video");
+    video.addEventListener("error", () => item.classList.add("video-error"));
     box.appendChild(item);
   });
 }
@@ -699,12 +741,17 @@ function renderUnmatched(unmatched) {
   unmatched.forEach((u) => {
     const row = document.createElement("div");
     row.className = "result-row unmatched";
+    const tentPct = u.tentative_similarity != null ? Math.round(u.tentative_similarity * 100) : null;
+    const tentHint = u.tentative_name
+      ? `<div class="result-sub tentative-hint">may be ${escapeHtml(u.tentative_name)}${tentPct != null ? ` · ${tentPct}%` : ""} (below match threshold)</div>`
+      : "";
     row.innerHTML = `
       <div class="result-left">
         ${avatarHtml(u, "?")}
         <div style="flex:1;">
           <div class="result-name">Unknown person · ${escapeHtml(u.track_id)}</div>
           <div class="result-sub">${sightingChips([u])}</div>
+          ${tentHint}
           <div style="margin-top:.6rem;display:flex;gap:.5rem;">
             <input class="correction-input" placeholder="Assign name… (new names auto-register)" autocomplete="off" />
             <button class="btn primary small" type="button">Save</button>
@@ -841,6 +888,7 @@ $("#logClearBtn").addEventListener("click", () => {
    ══════════════════════════════════════════════════════════════════════ */
 
 const sessionVideoUrls = {}; // camera_id -> object URL, set when a session starts
+let sessionComplete = false; // boxes are drawn only AFTER the whole session (incl. cross-camera unify) finishes
 const realTrackCache = {}; // camera_id -> { fps, frames: [{t, boxes}], fetching }
 let overlayRaf = null;
 let overlayAlertTimer = null;
@@ -963,6 +1011,9 @@ function findNearestFrame(frames, t, tolerance = 0.35) {
 }
 
 function getActiveBoxes(video) {
+  // while the pipeline is still running the preview shows ONLY the raw
+  // footage — boxes appear once the full session (incl. unify) is complete
+  if (!sessionComplete) return [];
   const cache = realTrackCache[activePreviewCamId];
   if (!cache || cache.fetching || cache.frames.length === 0) return [];
   const frame = findNearestFrame(cache.frames, video.currentTime);
@@ -1049,10 +1100,13 @@ function drawBoundingBox(ctx, px, isMatch) {
 function drawPlacard(ctx, px, box, isMatch, rect) {
   const textColor = isMatch ? TEXT_KNOWN_COLOR : TEXT_UNKNOWN_COLOR;
   const idLabel = box.global_id != null ? `GID ${box.global_id}` : `ID ${box.track_id}`;
+  const tentPct = box.tentative_similarity != null ? Math.round(box.tentative_similarity * 100) : null;
   const label = isMatch
     ? `${box.name} · ${idLabel}${
         box.similarity != null ? ` [Match: ${(box.similarity * 100).toFixed(1)}%]` : ""
       }`
+    : box.tentative_name
+    ? `may be ${box.tentative_name}${tentPct != null ? ` (${tentPct}%)` : ""} · ${idLabel}`
     : `${box.global_id != null ? `Global ID ${box.global_id}` : `ID ${box.track_id}`} — Unidentified`;
 
   ctx.save();
@@ -1170,8 +1224,24 @@ if (window.ResizeObserver) {
 }
 window.addEventListener("resize", resizeOverlayCanvas);
 
-$("#previewVideo").addEventListener("play", () => startOverlay());
-$("#previewVideo").addEventListener("pause", () => stopOverlay());
+// ── pause / resume control for the live preview ──────────────────────────
+function syncPreviewPauseLabel() {
+  const v = $("#previewVideo");
+  const btn = $("#previewPauseBtn");
+  if (!v || !btn) return;
+  btn.textContent = v.paused ? "▶ Play" : "⏸ Pause";
+}
+$("#previewPauseBtn").addEventListener("click", () => {
+  const v = $("#previewVideo");
+  if (!v || !v.src) return;
+  if (v.paused) v.play().catch(() => {});
+  else v.pause();
+  logEvent("info", v.paused ? "Preview paused" : "Preview resumed");
+});
+
+$("#previewVideo").addEventListener("play", () => { startOverlay(); syncPreviewPauseLabel(); });
+$("#previewVideo").addEventListener("pause", () => { stopOverlay(); syncPreviewPauseLabel(); });
+$("#previewVideo").addEventListener("loadedmetadata", syncPreviewPauseLabel);
 
 /* ══════════════════════════════════════════════════════════════════════
    05d — DATABASE IMAGE GALLERY + LIGHTBOX
@@ -1283,6 +1353,14 @@ function alertCard(a) {
       <button class="btn danger small alert-dismiss" data-dismiss="${escapeHtml(a.id)}">Dismiss</button>
     </div>
   `;
+  // click the alert's crop to open a full-size preview in the lightbox
+  const cropImg = el.querySelector("img.alert-crop");
+  if (cropImg) {
+    cropImg.style.cursor = "zoom-in";
+    cropImg.addEventListener("click", () =>
+      openLightbox(`${a.person} — alert crop`, [a.crop_url], 0)
+    );
+  }
   return el;
 }
 

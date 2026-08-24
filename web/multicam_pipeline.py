@@ -32,6 +32,14 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
+# Display-only band for tentative ("may be ...") hints on UNKNOWN tracks.
+# A track with no confirmed name gets its best below-threshold database
+# candidate surfaced as a hint when the score is close enough to the real
+# match threshold to be plausibly the same person. Purely additive metadata:
+# never influences which tracks get a confirmed name, nor any threshold.
+TENTATIVE_WINDOW = 0.12   # hint only when score >= threshold - this much
+TENTATIVE_FLOOR = 0.40    # ...and never below this absolute similarity
+
 
 def _frame_keys(results):
     """Numeric frame keys only — skips reserved "_"-prefixed metadata keys
@@ -288,6 +296,49 @@ def run_camera_reid(
     if corrected is not None:
         people = corrected
 
+    # Tentative identities (display-only): for tracks that every pass left
+    # UNKNOWN, look up the best below-threshold database candidate and persist
+    # it as a hint so the UI can show "may be <name> (~x%)" on the video and
+    # in the results list. Runs AFTER all correction passes so it reflects the
+    # final state; re-reads the persisted JSON because face_verify may have
+    # rewritten __tracks__ after this module wrote it.
+    if identity_db is not None and len(identity_db):
+        try:
+            with open(output_json_path) as f:
+                persisted = json.load(f)
+            stored_tracks = persisted.get("__tracks__") or {}
+            changed = False
+            for p in people:
+                if p.get("name"):
+                    continue
+                tid = p.get("track_id")
+                t = stored_tracks.get(str(tid)) or {}
+                mean = t.get("mean_feature")
+                if not mean:
+                    continue
+                try:
+                    cand = identity_db.match_multimodal(
+                        mean, [list(x) for x in (t.get("faces") or [])],
+                        top_k=1, threshold=0.0,
+                    )
+                except Exception:
+                    logger.exception("Tentative match failed for track %s", tid)
+                    cand = []
+                if not cand:
+                    continue
+                score = float(cand[0]["score"])
+                if TENTATIVE_FLOOR <= score and score >= match_threshold - TENTATIVE_WINDOW:
+                    guess = {"tentative_name": cand[0]["name"],
+                             "tentative_similarity": round(score, 3)}
+                    p.update(guess)
+                    stored_tracks[str(tid)].update(guess)
+                    changed = True
+            if changed:
+                with open(output_json_path, "w") as f:
+                    json.dump(persisted, f, separators=(",", ":"))
+        except Exception:
+            logger.exception("Tentative-identity annotation failed — continuing without hints")
+
     return {
         "fps": fps,
         "people": people,
@@ -336,6 +387,8 @@ def load_track_overlay(reid_json_path: str, people: list, fps: float, max_frames
                     "name": info.get("name"),
                     "similarity": info.get("similarity"),
                     "global_id": info.get("global_id"),
+                    "tentative_name": info.get("tentative_name"),
+                    "tentative_similarity": info.get("tentative_similarity"),
                 }
             )
         if boxes:
