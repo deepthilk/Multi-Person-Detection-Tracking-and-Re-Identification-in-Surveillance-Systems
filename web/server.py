@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import hashlib
 import json
 import logging
@@ -223,7 +223,9 @@ def _photo_url(path_str: str) -> str:
     # image_paths are stored like "outputs/registration/images/<name>/<file>";
     # taking the last two path parts is robust whether the stored string is
     # relative or absolute, and avoids depending on the exact separator.
-    parts = Path(path_str).parts[-2:]
+    # Stored paths may use Windows "\" separators, which POSIX (Linux/Colab)
+    # does not treat as directory separators — normalise before splitting.
+    parts = PurePosixPath(path_str.replace("\\", "/")).parts[-2:]
     return "/reg-photos/" + "/".join(parts)
 
 

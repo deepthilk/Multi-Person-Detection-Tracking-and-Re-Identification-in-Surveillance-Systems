@@ -341,7 +341,7 @@ class IdentityDatabase:
 
         from reidentification.insight_face import InsightFaceExtractor
 
-        def _fuse(app_sim: float, face_sim) -> tuple:
+        def _fuse(app_sim: float, face_sim, face_median=None) -> tuple:
             s = SEARCH_SETTINGS
             if face_sim is None:
                 return app_sim, ["appearance"], threshold
@@ -353,6 +353,18 @@ class IdentityDatabase:
                 # ~orthogonal (0.0) to a full-body video track; face said 0.465
                 # (>= 0.45) but the 70/30 blend dropped to 0.326 and the match
                 # was rejected.
+                # Robustness gate: face_sim is the MAX over all (query x
+                # gallery) pairs, so one lucky pair can cross the confirmed bar
+                # while the track's typical face is far below it (unregistered
+                # Lekha: max=0.579 vs deeps but median per-face best=0.109,
+                # 2/30 faces >= 0.42). The MEDIAN must also corroborate at the
+                # same-person level; otherwise the face is only "ambiguous"
+                # (balanced blend, appearance threshold) — not a decisive name.
+                if face_median is not None and \
+                        face_median < s["face_robust_median_threshold"]:
+                    return (s["fused_weight_face_ambiguous"] * face_sim +
+                            s["fused_weight_appearance_ambiguous"] * app_sim), \
+                           ["appearance", "face"], threshold
                 score = (s["fused_weight_face_confirmed"] * face_sim +
                          s["fused_weight_appearance_confirmed"] * app_sim)
                 score = max(score, face_sim)
@@ -369,18 +381,26 @@ class IdentityDatabase:
             app_sim = _cosine(query_appearance, record["average_embedding"])
             gallery_faces = record.get("face_embeddings") or []
             face_sim = None
+            # Robust corroboration: each query face's BEST gallery similarity.
+            # face_sim is the max over all pairs, which a single lucky pair can
+            # inflate (one 0.579 pair while 28/30 faces are ~0.1); the median
+            # of these per-face bests says what the track typically agrees with.
+            face_median = None
             if query_faces and gallery_faces:
-                face_sim = max(
-                    InsightFaceExtractor.similarity(q, g)
-                    for q in query_faces for g in gallery_faces
-                )
-            score, cues, eff_thresh = _fuse(app_sim, face_sim)
+                per_face_best = [
+                    max(InsightFaceExtractor.similarity(q, g) for g in gallery_faces)
+                    for q in query_faces
+                ]
+                face_sim = max(per_face_best)
+                face_median = float(np.median(per_face_best))
+            score, cues, eff_thresh = _fuse(app_sim, face_sim, face_median)
             if score >= eff_thresh:
                 results.append({
                     "name": name,
                     "score": round(float(score), 4),
                     "appearance_sim": round(float(app_sim), 4),
                     "face_sim": round(float(face_sim), 4) if face_sim is not None else None,
+                    "face_median": round(face_median, 4) if face_median is not None else None,
                     "cues": cues,
                 })
 

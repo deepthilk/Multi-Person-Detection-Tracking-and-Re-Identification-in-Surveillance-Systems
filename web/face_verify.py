@@ -70,12 +70,51 @@ SWAP_WINDOW = 30
 # DIFFERENT person for the one-sided false-merge split (same-person >= ~0.54,
 # different-person <= ~0.28 on this footage, so 0.40 is a safe midpoint).
 _SPLIT_DIFFERENT_FACE = 0.40
+# Reappearance-fragment floor: when two groups in one cid are TIME-DISJOINT
+# (a person left and returned — DeepSORT hands them new tracker ids) and the
+# split-off group's face votes are RELATIVE-ONLY (weak, no confident winner),
+# only a CLEAR face mismatch is reason to split. Relative votes on low-res
+# unregistered faces are noise (real case: Lekha's cam2 segments voted
+# 'pranjali' / 'Prajna' on galleries she doesn't belong to, cross-face 0.39)
+# and splitting re-mints the SAME person a second id. Same-person fragments
+# here cross at >= 0.39 (deeps 0.82, Prajna 0.54, Lekha 0.39); genuinely
+# different disjoint people sit well below 0.35.
+_REAPPEAR_DIFFERENT_FACE = 0.35
+# Face-to-face reappearance merge (_merge_fragments): when the same person
+# leaves and comes back, DeepSORT hands them a NEW tracker id AND the face-vote
+# NAME can fail to confirm the reappearance (the new segment's faces can be
+# weak and even vote for the WRONG low-res gallery — Prajna's reappearance on
+# cam2 scores 0.25-0.38 and votes 'deeps'). Two time-disjoint fragments are
+# still the SAME person when enough of their CROSS-FACE pairs are close, no
+# gallery involved. Measured on this footage: same-person tops 0.57-0.76 with
+# many pairs >= 0.5 (cam1 reappearance 26/165, cam2 reappearance 1570/3721);
+# different people top <= 0.48 with ZERO pairs >= 0.5 — 0.55 / 3 pairs sits
+# safely between.
+FACE_MERGE_TOP = 0.55     # best pairwise sim required to even consider a merge
+FACE_MERGE_SIM = 0.50     # a pair at/above this counts as a same-person pair
+FACE_MERGE_PAIRS = 3      # fewest same-person pairs before trusting the merge
 
 
 def _face_sim(a, b) -> float:
     from reidentification.insight_face import InsightFaceExtractor
     return float(InsightFaceExtractor.similarity(
         np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)))
+
+
+def _box_iou(a, b) -> float:
+    """Intersection-over-union of two [x0, y0, x1, y1] boxes (>= 0 on miss)."""
+    if not a or not b:
+        return 0.0
+    ax0, ay0, ax1, ay1 = (float(v) for v in a[:4])
+    bx0, by0, bx1, by1 = (float(v) for v in b[:4])
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    aa = max(0.0, (ax1 - ax0) * (ay1 - ay0))
+    bb = max(0.0, (bx1 - bx0) * (by1 - by0))
+    uni = aa + bb - inter
+    return inter / uni if uni > 0 else 0.0
 
 
 class _FaceClassifier:
@@ -388,6 +427,39 @@ def _split_false_merges(classified, results, raw_faces=None):
                         p["consolidated_id"] = new_cid
         return new_cid
 
+    def _spans_disjoint(cid, ga, gb):
+        """Two tracker groups never share a frame (same person can't be in two
+        places). Reappearance fragments of ONE person are always disjoint; two
+        different people can co-occur, so disjoint spans are a strong signal
+        the engine merged a genuine reappearance, not two distinct people."""
+        def _range(gtids):
+            spans = [tid_info[(cid, t)] for t in gtids if (cid, t) in tid_info]
+            if not spans:
+                return None
+            return (min(s[0] for s in spans), max(s[1] for s in spans))
+        ra, rb = _range(ga), _range(gb)
+        if ra is None or rb is None:
+            return False
+        return ra[1] < rb[0] or rb[1] < ra[0]
+
+    def _preserve_reappearance(cid, gtids, kept_tids):
+        """True when the split-off group is a weak reappearance fragment of the
+        kept group: time-disjoint spans (the person left and returned), a
+        RELATIVE-only face winner (no confident votes — unregistered/low-res
+        faces), and no clear cross-face disagreement. Splitting such a group
+        re-mints the SAME person a second id (real case: Lekha cam2)."""
+        if not all(t in rel_override for t in gtids):
+            return False
+        if not _spans_disjoint(cid, gtids, kept_tids):
+            return False
+        cross = _max_cross_sim((cid, gtids[0]), (cid, kept_tids[0]))
+        if cross is None or cross < _REAPPEAR_DIFFERENT_FACE:
+            return False
+        logger.info("face_verify: PRESERVE reappearance merge cid=%s "
+                    "trackers=%s (weak relative vote, cross %.2f)",
+                    cid, gtids, cross)
+        return True
+
     cid_tids = {}
     for (c, t), (a, b) in tid_info.items():
         cid_tids.setdefault(c, []).append(t)
@@ -398,9 +470,25 @@ def _split_false_merges(classified, results, raw_faces=None):
         tids = sorted(tids, key=int)
         if len(tids) < 2:
             continue
-        groups, no_winner = {}, []
+        groups, no_winner, rel_override = {}, [], set()
         for t in tids:
             w = _winner(tid_votes.get((cid, t), {}))
+            rw = _winner(rel_votes.get((cid, t), {}))
+            if rw is not None and (w is None or rw != w):
+                # The confident tally can be a few high-scoring strays while
+                # the overwhelming RELATIVE majority says someone else (real
+                # case: the 3rd/unregistered person on cam1 — 4 faces >= 0.45
+                # hit deeps at 0.576, but 77 faces prefer pranjali). Prefer the
+                # relative winner when it has a strong majority — also when the
+                # confident tally has no winner at all (a single stray face is
+                # not enough to name a tracker, but 25/33 faces agreeing on one
+                # gallery is a real identity signal).
+                rv = rel_votes.get((cid, t), {})
+                top = rv.get(rw, 0)
+                runner = sorted(rv.values(), reverse=True)[1] if len(rv) > 1 else 0
+                if top >= MIN_VOTES and (top - runner) >= MARGIN_VOTES:
+                    w = rw
+                    rel_override.add(t)
             (groups.setdefault(w, []).append(t) if w is not None
              else no_winner.append(t))
         if len(groups) >= 2:
@@ -409,8 +497,16 @@ def _split_false_merges(classified, results, raw_faces=None):
             ordered = sorted(groups.items(),
                              key=lambda kv: min(tid_info[(cid, t)][0] for t in kv[1]))
             for winner, gtids in ordered[1:]:
+                if _preserve_reappearance(cid, gtids, ordered[0][1]):
+                    continue
                 new_cid = _mint_split(cid, gtids)
-                seeds[new_cid] = winner
+                if all(t in rel_override for t in gtids):
+                    # Name came only from the relative tally — the person is
+                    # NOT confidently any registered face (unregistered 3rd
+                    # person), so keep the split identity UNIDENTIFIED.
+                    seeds[new_cid] = None
+                else:
+                    seeds[new_cid] = winner
                 splits += 1
                 logger.info("face_verify: SPLIT false merge cid=%s trackers=%s "
                             "(%s) -> new cid=%s", cid, gtids, winner, new_cid)
@@ -434,6 +530,8 @@ def _split_false_merges(classified, results, raw_faces=None):
                 ordered = sorted(rel_groups.items(),
                                  key=lambda kv: min(tid_info[(cid, t)][0] for t in kv[1]))
                 for winner, gtids in ordered[1:]:
+                    if _preserve_reappearance(cid, gtids, ordered[0][1]):
+                        continue
                     new_cid = _mint_split(cid, gtids)
                     seeds[new_cid] = winner
                     splits += 1
@@ -481,7 +579,7 @@ def _split_false_merges(classified, results, raw_faces=None):
     return splits, seeds
 
 
-def _merge_fragments(classified, results, seeds=None):
+def _merge_fragments(classified, results, seeds=None, raw_faces=None):
     """
     Re-merge identities the engine FRAGMENTED. When the same person leaves and
     returns, DeepSORT often hands them a NEW tracker id, and the engine's
@@ -494,17 +592,21 @@ def _merge_fragments(classified, results, seeds=None):
     below CONFIDENT_FACE, so her fragments never became "decisive" and stayed
     forever apart).
 
-    The gate is the FACE-VOTE NAME, preferring the DECISIVE name computed
-    exactly as the final naming does (see _face_decided), then the SPLITTER'S
-    SEED name (a split-created identity's name is the splitter's face winner),
-    then the RELATIVE best-match winner — the same weak-face evidence the
-    false-merge splitter uses (each face votes for the gallery it looks most
-    like, no absolute score gate). Two identities are merged when they agree on
-    a name AND at least one side is STRONG (decisive name or splitter seed):
+    Two gates, either of which merges two time-disjoint fragments:
+
+    (1) FACE-VOTE NAME — the decisive name computed exactly as the final naming
+    does (see _face_decided), then the SPLITTER'S SEED name (a split-created
+    identity's name is the splitter's face winner), then the RELATIVE best-match
+    winner. The relative winner now needs an ABSOLUTE score floor: a fragment
+    whose best face scores below the DB-confirmed bar can vote for the WRONG
+    gallery (Prajna's low-res reappearance faces score 0.25-0.38 and vote
+    'deeps'), so only faces the DB itself confirms may carry a relative name.
+    Two identities merge when they agree on a name AND at least one side is
+    STRONG (decisive name or splitter seed):
 
       • genuine fragments merge — e.g. two "usha" fragments where Usha's faces
-        only ever reach the relative bar, or a relative "deeps" fragment folded
-        into a decisive "deeps" fragment;
+        only ever reach the relative bar (0.44-0.49 >= the floor), or a
+        relative "deeps" fragment folded into a decisive "deeps" fragment;
       • different people NEVER merge on weak evidence alone — a relative-only
         vote (both sides weak) is not enough, so two people who merely look
         like the same low-res gallery blob stay separate;
@@ -512,6 +614,13 @@ def _merge_fragments(classified, results, seeds=None):
         appearance ~equal, so the engine routinely merges DIFFERENT people into
         one identity (the splitter then un-merges them), and a split-created
         identity has no engine name at all.
+
+    (2) FACE-TO-FACE — the gallery-independent fallback for reappearances whose
+    names never agree (a weak reappearance can vote for a DIFFERENT low-res
+    gallery than its first segment). Two fragments are the SAME person when
+    enough of their raw CROSS-FACE pairs are close (see FACE_MERGE_*): time
+    was already proven disjoint, and cross-face similarity does not depend on
+    registration photo quality at all.
 
     The later fragment is folded into the earliest. Returns the number of
     merges performed.
@@ -550,8 +659,16 @@ def _merge_fragments(classified, results, seeds=None):
         return None
 
     def _rel_winner(cid):
-        """Best-match-name majority with no absolute score gate (same weak-face
-        evidence as the false-merge splitter's relative tally)."""
+        """Best-match-name majority, gated on an ABSOLUTE score floor (the DB's
+        own face-confirmed threshold). A relative tally is the same weak-face
+        evidence as the false-merge splitter uses, but an UNGATED one is
+        unsafe for NAMING: a fragment whose best face sits far below the
+        confirmed bar can vote for the WRONG gallery (Prajna's reappearance on
+        cam2 scores 0.25-0.38 and votes 'deeps' because the deeps gallery is
+        higher-res). Only faces the DB itself would confirm (>= the floor) may
+        carry a relative name — Usha's 0.44-0.49 still passes."""
+        if max_score.get(cid, 0.0) < _DB_FACE_CONFIRMED:
+            return None
         v = rel_votes.get(cid, {})
         if not v:
             return None
@@ -564,6 +681,14 @@ def _merge_fragments(classified, results, seeds=None):
     def _name(cid):
         """(name, strong) — decisive name or splitter seed is strong; a bare
         relative winner is weak and can only merge INTO a strong fragment."""
+        s = (seeds or {}).get(cid)
+        if cid in (seeds or {}) and s is None:
+            # Split-created UNIDENTIFIED identity (an unregistered person the
+            # splitter explicitly set apart). A few stray face hits >= 0.50
+            # must NOT rename it and fold it back into the person it was
+            # separated from — the relative tally says the faces belong to a
+            # DIFFERENT person. A None-seeded identity never merges.
+            return None, True
         d = _decided(cid)
         if d is not None:
             return d, True
@@ -585,6 +710,35 @@ def _merge_fragments(classified, results, seeds=None):
         strong_rel = top >= MIN_VOTES and (top - runner) >= MARGIN_VOTES
         return w, strong_rel
 
+    # Fragments of the SAME person can never be on screen at the same time.
+    # Two identities whose tracker spans overlap are DIFFERENT people (real
+    # case: a crowded clip where several people each weakly vote for the same
+    # gallery blob — merging them mints one fake identity). Disjoint spans are
+    # a hard prerequisite for merging.
+    cid_frames = {}
+    for fid_str, people in results.items():
+        if fid_str.startswith("_"):
+            continue
+        for p in people:
+            c = p.get("consolidated_id")
+            if c is None or c == -1:
+                continue
+            cid_frames.setdefault(c, set()).add(int(fid_str))
+
+    # Raw cross-face pools per consolidated id (post-correction) for the
+    # gallery-independent face-to-face merge gate, plus the frames each cid
+    # actually has face evidence on (the correct time gate for that gate).
+    cid_pool = {}
+    cid_face_frames = {}
+    if raw_faces:
+        for fid, boxes in sorted(raw_faces.items()):
+            for tid, emb in boxes.items():
+                cid = _cid_at(results, fid, tid)
+                if cid is None:
+                    continue
+                cid_pool.setdefault(cid, []).append(np.asarray(emb, dtype=np.float32))
+                cid_face_frames.setdefault(cid, set()).add(fid)
+
     cids = sorted(set(votes) | set(rel_votes))
     if len(cids) < 2:
         return 0, {}
@@ -602,21 +756,82 @@ def _merge_fragments(classified, results, seeds=None):
         if ra != rb:
             parent[rb] = ra
 
+    def _root_pool(c):
+        """All raw faces pooled across the whole component of `c` (so a merge
+        chain accumulates evidence instead of only the seed pair's faces)."""
+        r = find(c)
+        out = []
+        for cc, arr in cid_pool.items():
+            if find(cc) == r:
+                out.extend(arr)
+        return out
+
+    def _root_face_frames(c):
+        """All face-bearing frames across the whole component of `c`."""
+        r = find(c)
+        out = set()
+        for cc, frames in cid_face_frames.items():
+            if find(cc) == r:
+                out |= frames
+        return out
+
+    def _same_person_faces(a, b):
+        """Same-person verdict from raw face pairs alone — no gallery, no name.
+        Same-person reappearances on this footage top at 0.57-0.76 with many
+        pairs >= 0.50; different people top <= 0.48 with zero pairs >= 0.50."""
+        fa, fb = _root_pool(a), _root_pool(b)
+        if len(fa) < FACE_MERGE_PAIRS or len(fb) < FACE_MERGE_PAIRS:
+            return False
+        top, n_ge = 0.0, 0
+        for x in fa:
+            for y in fb:
+                s = _face_sim(x, y)
+                if s > top:
+                    top = s
+                if s >= FACE_MERGE_SIM:
+                    n_ge += 1
+                    if top >= FACE_MERGE_TOP and n_ge >= FACE_MERGE_PAIRS:
+                        return True
+        return top >= FACE_MERGE_TOP and n_ge >= FACE_MERGE_PAIRS
+
+    def _face_spans_disjoint(a, b):
+        """The FACE-BEARING spans of two components are disjoint. The full-box
+        span of a fragment can overlap another's because the engine folds
+        unrelated face-less boxes into it (real case: cam1's first Prajna
+        segment carries the reappearing chair and a face-less passer-by in its
+        id, extending its span past the reappearance's start) — but the face
+        evidence, which is what proves a reappearance, never overlaps. The
+        same person can never show two faces at once, so disjoint FACE spans
+        are the correct time gate for the face-to-face merge."""
+        fa, fb = _root_face_frames(a), _root_face_frames(b)
+        if not fa or not fb:
+            return False
+        return fa.isdisjoint(fb)
+
     merged_pairs = 0
     for i, a in enumerate(cids):
         for b in cids[i + 1:]:
-            if find(a) == find(b):
+            ra, rb = find(a), find(b)
+            if ra == rb:
                 continue
+            fa, fb = cid_frames.get(ra, set()), cid_frames.get(rb, set())
+            name_time_ok = not (fa and fb and not fa.isdisjoint(fb))
             na, sa = _name(a)
             nb, sb = _name(b)
-            if not (na and nb and na == nb):
-                continue            # only the same face-vote name confirms identity
-            if not (sa or sb):
-                continue            # never merge two weak-only fragments
+            why = None
+            if name_time_ok and na and nb and na == nb and (sa or sb):
+                why = f"both '{na}'"
+            elif _face_spans_disjoint(a, b) and _same_person_faces(a, b):
+                why = "face"
+            if why is None:
+                continue            # need a shared face-vote name (time-disjoint
+                                    # spans) OR a face-to-face same-person verdict
+                                    # (time-disjoint face spans)
             union(a, b)
+            cid_frames.setdefault(find(a), set()).update(fa | fb)
             merged_pairs += 1
-            logger.info("face_verify: MERGE fragmented ids %s + %s "
-                        "(both '%s')", a, b, na)
+            logger.info("face_verify: MERGE fragmented ids %s + %s (%s)",
+                        a, b, why)
 
     if not merged_pairs:
         return 0, {}
@@ -694,6 +909,137 @@ def _renumber(results):
     return remap
 
 
+def _non_person_cids(results, cid_faces, frame_h):
+    """Consolidated ids that hold NO face at all and whose bbox never looks
+    like a person: FULLY STATIC (an inanimate object — DeepSORT tracks the
+    chair at the side, h ~365 of a 720-tall frame, as a person) or SHORT/TINY
+    (a partial edge sliver, max height < 60% of the frame). A real person can
+    be face-less only if far away, but then they move and are full-height; a
+    still real person still yields at least one readable face. Zero-face
+    static/tiny boxes are non-people: drop them so they never show up as a
+    fake person id (real case: the user's session showed a fake id for a chair
+    at the side). Returns the list of cids to suppress."""
+    stats = {}
+    for fid_str, people in results.items():
+        if fid_str.startswith("_"):
+            continue
+        for p in people:
+            c = p.get("consolidated_id")
+            bb = p.get("bbox")
+            if c is None or c == -1 or not bb:
+                continue
+            x0, y0, x1, y1 = (float(v) for v in bb[:4])
+            s = stats.setdefault(c, {"cx": [], "cy": [], "w": [], "h": []})
+            s["cx"].append((x0 + x1) / 2.0)
+            s["cy"].append((y0 + y1) / 2.0)
+            s["w"].append(x1 - x0)
+            s["h"].append(y1 - y0)
+    out = []
+    for c, s in stats.items():
+        if cid_faces.get(c):
+            continue
+        if len(s["cx"]) < 2:
+            continue
+        static = (max(s["cx"]) - min(s["cx"]) < 15.0
+                  and max(s["cy"]) - min(s["cy"]) < 15.0
+                  and max(s["w"]) - min(s["w"]) < 15.0
+                  and max(s["h"]) - min(s["h"]) < 15.0)
+        short = max(s["h"]) < 0.6 * frame_h
+        if static or short:
+            out.append(c)
+    return out
+
+
+def _non_person_tids(tracking_data, results, raw_faces, frame_h,
+                     static_px=15.0, short_ratio=0.6):
+    """Tracking ids that are NOT people: no face at all AND (rock-static bbox
+    OR short/tiny). This works at TRACKER granularity, so a non-person object
+    folded into a person's consolidated id by the engine is still caught: its
+    boxes match a non-person tracking id and get dropped box-by-box (real
+    case: the side chair shares Prajna's tracker/engine id at cam2 frames
+    100-125/219-295 because DeepSORT handed the chair's detection to the
+    person's id). Returns a set of tracking ids (strings)."""
+    # Which tracking ids ever produced a face (raw_faces is keyed by the
+    # engine's per-frame id, so match tracking boxes -> reid boxes by IoU).
+    face_tids = set()
+    tid_stats = {}
+    for fid_str, boxes in tracking_data.items():
+        fid = int(fid_str)
+        faces = raw_faces.get(fid)
+        people = results.get(fid_str, [])
+        for t in boxes:
+            tid = t.get("id")
+            bb = t.get("bbox")
+            if tid is None or not bb:
+                continue
+            s = tid_stats.setdefault(tid, {"cx": [], "cy": [], "w": [], "h": []})
+            x0, y0, x1, y1 = (float(v) for v in bb[:4])
+            s["cx"].append((x0 + x1) / 2.0)
+            s["cy"].append((y0 + y1) / 2.0)
+            s["w"].append(x1 - x0)
+            s["h"].append(y1 - y0)
+            if faces and tid not in face_tids:
+                # raw_faces is keyed by the engine's per-frame id when it came
+                # from the pipeline cache, but by the tracking id on the
+                # standalone re-extract fallback — cover both.
+                eng = max(people, default=None,
+                          key=lambda p: _box_iou(bb, p.get("bbox")))
+                if eng is not None and (eng.get("id") in faces or tid in faces):
+                    face_tids.add(tid)
+
+    out = set()
+    for tid, s in tid_stats.items():
+        if tid in face_tids or len(s["cx"]) < 2:
+            continue
+        static = (max(s["cx"]) - min(s["cx"]) < static_px
+                  and max(s["cy"]) - min(s["cy"]) < static_px
+                  and max(s["w"]) - min(s["w"]) < static_px
+                  and max(s["h"]) - min(s["h"]) < static_px)
+        short = max(s["h"]) < short_ratio * frame_h
+        # A no-face box that spans nearly the FULL viewport height (>= 95%)
+        # is a detector false positive, not a person crop — people crops keep
+        # a margin at the frame edges even up close. Real case: a right-edge
+        # artefact box [1112,5,1280,708] in a 720-tall frame rendered as an
+        # extra fake identity.
+        oversized = max(s["h"]) >= 0.95 * frame_h
+        if static or short or oversized:
+            out.add(tid)
+    return out
+
+
+def _drop_non_person_boxes(results, tracking_data, non_person_tids, min_iou=0.5):
+    """Remove reid boxes that overlap a non-person tracking id's box at the
+    same frame, whatever consolidated id they were folded into. Returns the
+    number of boxes dropped."""
+    dropped = 0
+    for fid_str in [k for k in results if not k.startswith("_")]:
+        tracks = tracking_data.get(fid_str, [])
+        if not tracks:
+            continue
+        people = results.get(fid_str)
+        if not people:
+            continue
+        kept = []
+        for p in people:
+            bb = p.get("bbox")
+            c = p.get("consolidated_id")
+            if c is None or c == -1 or not bb:
+                kept.append(p)
+                continue
+            best_tid, best_iou = None, 0.0
+            for t in tracks:
+                iou = _box_iou(bb, t.get("bbox"))
+                if iou > best_iou:
+                    best_tid, best_iou = t.get("id"), iou
+            if best_tid is not None and best_iou >= min_iou \
+                    and best_tid in non_person_tids:
+                dropped += 1
+                continue
+            kept.append(p)
+        results[fid_str] = kept
+    return dropped
+
+
 def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
                    stride=4, fps=25.0, max_faces=60):
     """
@@ -710,6 +1056,12 @@ def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
     cached_faces = results.pop("__verify_faces__", {}) or {}
 
     frame_ids = sorted(int(k) for k in results if not k.startswith("_"))
+
+    with open(tracking_json_path, encoding="utf-8") as f:
+        tracking_data = json.load(f)
+    cap = cv2.VideoCapture(video_path)
+    cap_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720.0
+    cap.release()
 
     from reidentification.insight_face import get_shared_extractor
     extractor = get_shared_extractor()
@@ -737,14 +1089,23 @@ def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
     else:
         # Fallback (standalone verification of an older reid.json): decode the
         # video and re-extract faces at `stride`.
-        with open(tracking_json_path, encoding="utf-8") as f:
-            tracking_data = json.load(f)
         raw_faces = _collect_faces(video_path, tracking_data, frame_ids, stride, extractor)
 
     if not raw_faces:
         logger.warning("face_verify: no faces found — leaving output unchanged")
         results["__tracks__"] = old_tracks
         return None
+
+    # Box-level non-person suppression: drop no-face static/tiny tracker boxes
+    # even when the engine folded them into a person's consolidated id (the
+    # side chair rendering under Prajna's id). Runs before any face voting so
+    # the dropped boxes never distort cid stats.
+    non_person_tids = _non_person_tids(tracking_data, results, raw_faces, cap_h)
+    if non_person_tids:
+        n_dropped = _drop_non_person_boxes(results, tracking_data, non_person_tids)
+        logger.info("face_verify: dropped %d non-person box(es) "
+                    "(no faces, static/tiny tracking id): %s",
+                    n_dropped, sorted(non_person_tids))
 
     classifier = _FaceClassifier(identity_db)
     classified = {
@@ -761,7 +1122,7 @@ def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
     n_split, seeds = _split_person_switches(classified, results, engine_names)
     n_false, seeds2 = _split_false_merges(classified, results, raw_faces)
     seeds.update(seeds2)
-    n_merge, merged_names = _merge_fragments(classified, results, seeds)
+    n_merge, merged_names = _merge_fragments(classified, results, seeds, raw_faces)
 
     # Face votes per consolidated id (pre-renumber, after corrections).
     votes, max_score, face_best = {}, {}, {}
@@ -814,6 +1175,14 @@ def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
     decision = {}
     for cid in sorted(cid_set):
         old = old_tracks.get(str(cid), {})
+        if cid in seeds and seeds[cid] is None:
+            # Split-created UNIDENTIFIED identity: the splitter set it apart
+            # because the relative face tally says it is a DIFFERENT person
+            # (unregistered 3rd person). Do not let a couple of stray faces
+            # that happen to score >= 0.50 against a registered gallery rename
+            # it and re-fold it into the person it was split from.
+            decision[cid] = (None, None, None, [])
+            continue
         d = _face_decided(cid)
         if d is not None:
             decision[cid] = d
@@ -854,8 +1223,22 @@ def verify_and_fix(video_path, tracking_json_path, reid_json_path, identity_db,
                 continue
             cid_faces.setdefault(cid, []).append(face)
 
+    # Drop non-people (the static side chair, tiny edge slivers) that have no
+    # faces, so they never appear as a fake id in the summary or overlay.
+    suppressed = set(_non_person_cids(results, cid_faces, cap_h))
+    if suppressed:
+        for fid_str in [k for k in results if not k.startswith("_")]:
+            kept = [p for p in results[fid_str]
+                    if p.get("consolidated_id") not in suppressed]
+            results[fid_str] = kept
+        logger.info("face_verify: dropped %s non-person track(s) "
+                    "(no faces, static/tiny bbox): %s",
+                    len(suppressed), sorted(suppressed))
+
     tracks_payload = {}
     for cid in remap.values():
+        if cid in suppressed:
+            continue
         name, sim, fsim, cues = decision_new.get(cid, (None, None, None, []))
         old = old_tracks.get(str(cid))
         faces = [f.tolist() for f in cid_faces.get(cid, [])[:max_faces]]

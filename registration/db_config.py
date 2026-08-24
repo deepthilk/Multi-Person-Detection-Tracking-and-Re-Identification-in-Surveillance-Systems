@@ -52,6 +52,15 @@ SEARCH_SETTINGS = {
     # catching true same-person matches whose face quality is mediocre
     # (Prajna measured 0.44-0.47 on this footage — below the old 0.45 bar).
     "face_confirmed_threshold": 0.42,   # >= this: faces clearly say "same person"
+    # A single lucky face-pair must not confirm a name. face_sim is the MAX
+    # over all (query x gallery) pairs, so one stray pair can cross the
+    # confirmed bar while the track's typical face is far below it (real case:
+    # an unregistered Lekha scored max=0.579 vs deeps but median per-face best
+    # was only 0.109, 2/30 faces >= 0.42). Require the MEDIAN of each query
+    # face's best gallery similarity to also agree at the same-person level.
+    # Measured on this footage: true matches median 0.55-0.70, this false
+    # positive 0.109 — 0.30 sits safely between.
+    "face_robust_median_threshold": 0.30,
     "face_veto_threshold": 0.30,        # <  this: faces clearly say "different person"
     "fused_weight_face_confirmed": 0.70,    # face dominates a confirmed match
     "fused_weight_appearance_confirmed": 0.30,
