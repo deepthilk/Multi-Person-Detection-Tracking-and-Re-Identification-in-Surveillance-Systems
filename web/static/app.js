@@ -995,41 +995,90 @@ function updateOverlayModeBadge() {
   badge.classList.toggle("live", !!isLive);
 }
 
-// binary search for the sampled frame nearest video.currentTime
-function findNearestFrame(frames, t, tolerance = 0.35) {
+// Binary search for the two sampled frames bracketing video time `t`.
+// Returns { f0, f1, alpha, gapSec } where f0.t <= t <= f1.t, alpha in [0,1]
+// is how far t is between them, and gapSec is the wall-clock distance
+// between the brackets. Never returns null while frames exist, so boxes
+// never vanish due to sampling.
+function findFrameWindow(frames, t) {
   if (!frames.length) return null;
+  if (t <= frames[0].t) return { f0: frames[0], f1: null, alpha: 0, gapSec: 0 };
+  const last = frames[frames.length - 1];
+  if (t >= last.t) return { f0: last, f1: null, alpha: 0, gapSec: 0 };
   let lo = 0,
     hi = frames.length - 1;
-  while (lo < hi) {
+  while (lo + 1 < hi) {
     const mid = (lo + hi) >> 1;
-    if (frames[mid].t < t) lo = mid + 1;
+    if (frames[mid].t < t) lo = mid;
     else hi = mid;
   }
-  let best = frames[lo];
-  if (lo > 0 && Math.abs(frames[lo - 1].t - t) < Math.abs(best.t - t)) best = frames[lo - 1];
-  return Math.abs(best.t - t) <= tolerance ? best : null;
+  const f0 = frames[lo],
+    f1 = frames[hi];
+  const span = Math.max(f1.t - f0.t, 1e-6);
+  return { f0, f1, alpha: Math.min(1, Math.max(0, (t - f0.t) / span)), gapSec: f1.t - f0.t };
 }
 
+// Gaps shorter than this glide the box smoothly (brief occlusion); longer
+// gaps hold the box at its last known position instead of sweeping across
+// empty space (a person leaving and reappearing far away).
+const MAX_GLIDE_GAP_SEC = 1.0;
+
+// Build a per-box interpolation map from one frame's boxes.
+function boxForIndex(frames, idx) {
+  const boxes = frames[idx] && frames[idx].boxes;
+  const out = {};
+  if (!boxes) return out;
+  for (const b of boxes) {
+    if (Array.isArray(b.bbox) && b.bbox.length === 4) out[b.track_id] = b;
+  }
+  return out;
+}
+
+// Linearly interpolate every box between the bracketing sampled frames so
+// the box tracks the person continuously (no lag, no snap) and stays
+// visible even when the underlying sampling is coarse.
 function getActiveBoxes(video) {
   // while the pipeline is still running the preview shows ONLY the raw
   // footage — boxes appear once the full session (incl. unify) is complete
   if (!sessionComplete) return [];
   const cache = realTrackCache[activePreviewCamId];
   if (!cache || cache.fetching || cache.frames.length === 0) return [];
-  const frame = findNearestFrame(cache.frames, video.currentTime);
-  if (!frame) return [];
-  return frame.boxes
-    .filter((b) => Array.isArray(b.bbox) && b.bbox.length === 4)
-    .map((b) => ({
-      track_id: b.track_id,
-      name: b.name,
-      similarity: b.similarity,
-      global_id: b.global_id,
-      x1: b.bbox[0],
-      y1: b.bbox[1],
-      x2: b.bbox[2],
-      y2: b.bbox[3],
-    }));
+  const win = findFrameWindow(cache.frames, video.currentTime);
+  if (!win) return [];
+
+  const glide = win.gapSec <= MAX_GLIDE_GAP_SEC && win.f1;
+  const a = boxForIndex(cache.frames, cache.frames.indexOf(win.f0));
+  let b = {};
+  if (glide) b = boxForIndex(cache.frames, cache.frames.indexOf(win.f1));
+  const alpha = glide ? win.alpha : 0;
+  const allIds = new Set([...Object.keys(a), ...Object.keys(b)]);
+  const result = [];
+  for (const id of allIds) {
+    const ba = a[id],
+      bb = b[id];
+    const src = ba || bb;
+    // glide smoothly on short gaps; hold the last known position on long ones
+    result.push(interpBox(src, bb && glide ? bb : src, alpha, ba, bb, glide));
+  }
+  return result;
+}
+
+function interpBox(a, b, alpha, hasA, hasB, glide) {
+  const lerp = (p, q) => p + (q - p) * alpha;
+  // For a long gap (no glide), keep the box at the most recent known place
+  // instead of interpolating toward a far-away reappearance.
+  const effective = glide ? b : (a || b);
+  return {
+    track_id: a.track_id,
+    name: a.name,
+    similarity: a.similarity,
+    global_id: a.global_id,
+    tentative_name: a.tentative_name ?? b.tentative_name,
+    x1: lerp(a.bbox[0], effective.bbox[0]),
+    y1: lerp(a.bbox[1], effective.bbox[1]),
+    x2: lerp(a.bbox[2], effective.bbox[2]),
+    y2: lerp(a.bbox[3], effective.bbox[3]),
+  };
 }
 
 // ── coordinate transform: video-intrinsic pixels -> canvas display pixels,
@@ -1184,8 +1233,13 @@ function startOverlay() {
       const cache = realTrackCache[activePreviewCamId];
       if (!cache || cache.fetching || !cache.frames.length) return;
       const video = $("#previewVideo");
-      const frame = findNearestFrame(cache.frames, video.currentTime);
-      const hit = frame && frame.boxes.find((b) => b.name && b.similarity >= 0.75);
+      const win = findFrameWindow(cache.frames, video.currentTime);
+      let hit = null;
+      if (win) {
+        const check = (f) =>
+          f && f.boxes.find((b) => b.name && b.similarity >= 0.75);
+        hit = check(win.f0) || (win.f1 && check(win.f1));
+      }
       if (hit) {
         logEvent(
           "critical",

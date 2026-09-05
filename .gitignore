@@ -17,3 +17,5 @@ venv/
 reidentification/dataset/
 *.pth
 reidentification/model/model.py
+report/
+kaggle_run.ipynb

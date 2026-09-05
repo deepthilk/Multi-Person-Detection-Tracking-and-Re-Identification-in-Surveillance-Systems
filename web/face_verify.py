@@ -576,6 +576,58 @@ def _split_false_merges(classified, results, raw_faces=None):
                 logger.info("face_verify: SPLIT one-sided merge cid=%s "
                             "tracker=%s (face disagrees with %s, cross %.2f) "
                             "-> new cid=%s", cid, t, winner, cross, new_cid)
+
+    # ── Co-occurrence safety net ─────────────────────────────────────────────
+    # After the face-based passes, NO identity may ever hold two different
+    # trackers in the SAME frame — one person can't be in two places at once.
+    # The engine occasionally merges two co-occurring people into one cid
+    # (identical uniforms make their appearances ~equal), and if their faces
+    # are inconclusive every vote-based split above correctly declines. That
+    # leaves BOTH boxes labelled with the same global id on one frame (user
+    # visible: "one frame has two people with the same GID"). Two distinct
+    # DeepSORT track ids in the same frame are by definition different people,
+    # so this is a guaranteed false merge — split the later-appearing ones off
+    # (earliest tracker keeps the cid; split identities stay unidentified).
+    frame_tids = {}
+    for fid_str, people in results.items():
+        if fid_str.startswith("_"):
+            continue
+        for p in people:
+            c = p.get("consolidated_id")
+            t = p.get("id")
+            if c is None or c == -1 or t is None:
+                continue
+            frame_tids.setdefault((int(fid_str), c), set()).add(t)
+
+    first_by_cid = {}
+    for fid_str, people in results.items():
+        if fid_str.startswith("_"):
+            continue
+        for p in people:
+            c = p.get("consolidated_id")
+            if c is None or c == -1:
+                continue
+            first_by_cid.setdefault(c, int(fid_str))
+
+    cooc_cids = sorted({c for (_, c), tids in frame_tids.items() if len(tids) >= 2})
+    for cid in cooc_cids:
+        # trackers that ever share a frame with another tracker of the same cid
+        conflicting = set()
+        for (fid, c), tids in sorted(frame_tids.items()):
+            if c != cid or len(tids) < 2:
+                continue
+            conflicting.update(tids)
+        if len(conflicting) < 2:
+            continue
+        keep = min(conflicting, key=lambda t: (tid_info.get((cid, t), (10**9, 0))[0], t))
+        rest = sorted(conflicting - {keep}, key=lambda t: (tid_info.get((cid, t), (10**9, 0))[0], t))
+        for t in rest:
+            new_cid = _mint_split(cid, [t])
+            seeds[new_cid] = None  # distinct person, but no confident name
+            splits += 1
+            logger.info("face_verify: SPLIT same-frame merge cid=%s tracker=%s "
+                        "(co-occurs with %s in the same frame) -> new cid=%s",
+                        cid, t, keep, new_cid)
     return splits, seeds
 
 

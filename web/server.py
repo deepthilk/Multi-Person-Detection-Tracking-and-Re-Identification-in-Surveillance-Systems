@@ -2,6 +2,7 @@ from pathlib import Path, PurePosixPath
 import hashlib
 import json
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -17,6 +18,16 @@ import torch
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+# The registration layer (registration/db_config.py) stores paths as relative
+# to the process working directory (e.g. "outputs/registration/..."). On Colab
+# the server is spawned from /content/project, but if that directory is
+# re-created underneath a running server (Cell 1 does shutil.rmtree + re-extract)
+# the process's CWD becomes a deleted directory and every relative mkdir/read
+# fails with "No such file or directory: 'outputs'". Pin the CWD to the project
+# root so relative paths always resolve against this code's own tree regardless
+# of how/where the server was launched.
+os.chdir(ROOT_DIR)
 
 from detection.detect_module import run_detection
 from tracking.track_module import run_tracking
@@ -35,6 +46,19 @@ STATIC_DIR = WEB_DIR / "static"
 UPLOAD_DIR = WEB_DIR / "uploads"
 OUTPUT_DIR = WEB_DIR / "outputs"
 REG_UPLOAD_DIR = WEB_DIR / "uploads" / "registration"
+
+# Larger read buffer for uploading files: shutil.copyfileobj's default is
+# 16 KB, which makes large video uploads issue many small reads/writes. A
+# bigger buffer cuts that overhead (plus round-trips through the remote
+# tunnel in Colab) without changing the bytes that are written.
+_COPY_BUFSIZE = 8 * 1024 * 1024
+
+
+def _copyfile(src, dst):
+    # dst is an already-open binary file object (callers own the `with` block,
+    # which also ensures the parent directory exists).
+    shutil.copyfileobj(src, dst, length=_COPY_BUFSIZE)
+
 # where registration/register_person.py persists a copy of every registered
 # photo (see registration/db_config.py -> DB_SETTINGS["images_dir"]) — this
 # module only reads from it, never writes, matching the "reuse, never edit"
@@ -359,7 +383,7 @@ def _save_uploads(name: str, files: List[UploadFile]) -> List[str]:
         safe_name = Path(f.filename or f"photo_{i}.jpg").name
         dest = dest_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
         with dest.open("wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+            _copyfile(f.file, buffer)
         saved.append(str(dest))
     return saved
 
@@ -392,7 +416,7 @@ def start_session(
         safe_name = Path(f.filename or f"{camera_id}.mp4").name
         input_path = UPLOAD_DIR / f"{session_id}_{camera_id}_{safe_name}"
         with input_path.open("wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+            _copyfile(f.file, buffer)
 
         cameras[camera_id] = {
             "camera_id": camera_id,
@@ -459,11 +483,9 @@ def session_results(session_id: str):
     cams = session["cameras"]
     matched_by_name: Dict[str, dict] = {}
     unmatched: List[dict] = []
-    total_people = 0
 
     for cam in cams.values():
         for person in cam.get("people", []):
-            total_people += 1
             sighting = {
                 "camera_id": cam["camera_id"],
                 "camera_label": cam["label"],
@@ -492,7 +514,10 @@ def session_results(session_id: str):
     matched = sorted(matched_by_name.values(), key=lambda m: m["name"].lower())
     summary = {
         "camera_count": len(cams),
-        "people_detected": total_people,
+        # people_detected = unique people (matched identities + unknown tracks).
+        # The same person seen on N cameras shares one identity, so they count
+        # once here — consistent with `matched` (unique names, not sightings).
+        "people_detected": len(matched) + len(unmatched),
         "matched": len(matched),
         "unknown": len(unmatched),
         "all_cameras_done": all(c["status"] in ("completed", "error") for c in cams.values()),
@@ -930,7 +955,7 @@ def process_video(background_tasks: BackgroundTasks, file: UploadFile = File(...
     input_path = UPLOAD_DIR / f"{job_id}_{safe_name}"
 
     with input_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        _copyfile(file.file, buffer)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 

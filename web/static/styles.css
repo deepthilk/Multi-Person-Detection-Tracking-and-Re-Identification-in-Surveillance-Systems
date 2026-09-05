@@ -1063,3 +1063,88 @@ img.alert-crop:hover { transform: scale(1.08); border-color: var(--warm); }
 
 /* tentative ("may be …") hint under unknown rows */
 .tentative-hint { color: var(--warm-2); font-weight: 600; }
+
+/* ══════════════════ LIGHT THEME CONTRAST FIXES ══════════════════
+   The UI was designed dark-first: several components hardcode a near-black
+   input/terminal background even though their text uses var(--ink) (which
+   becomes dark navy in light mode). The result is dark-on-dark text that is
+   invisible in the light theme. These overrides only take effect under
+   [data-theme="light"] and give those components a light background (and, for
+   the dark video/terminal panels that should stay dark, ensure their inner
+   text remains legible). */
+
+:root[data-theme="light"] input[type="text"],
+:root[data-theme="light"] input[type="search"],
+:root[data-theme="light"] input[type="number"],
+:root[data-theme="light"] select,
+:root[data-theme="light"] textarea {
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--ink);
+  border-color: var(--line);
+}
+:root[data-theme="light"] input::placeholder,
+:root[data-theme="light"] textarea::placeholder { color: #8a94a6; }
+
+:root[data-theme="light"] .stepper,
+:root[data-theme="light"] .tabs {
+  background: rgba(255, 255, 255, 0.7);
+}
+:root[data-theme="light"] .stepper input { color: var(--ink); }
+:root[data-theme="light"] .stepper-btn {
+  background: rgba(226, 131, 54, 0.16); color: var(--warm);
+}
+
+:root[data-theme="light"] .camera-slot-drop {
+  color: var(--ink-soft);
+}
+:root[data-theme="light"] .camera-slot-drop:hover { color: var(--ink); border-color: var(--warm); }
+:root[data-theme="light"] .camera-slot video { background: #111; }
+
+:root[data-theme="light"] .person-card:hover { box-shadow: var(--glow-warm); }
+
+/* progress bar track on light backgrounds */
+:root[data-theme="light"] progress::-webkit-progress-bar { background: rgba(20, 30, 50, 0.14); }
+:root[data-theme="light"] progress::-moz-progress-bar { background: rgba(20, 30, 50, 0.14); }
+
+:root[data-theme="light"] .camera-status-row {
+  background: rgba(255, 255, 255, 0.6);
+}
+:root[data-theme="light"] .result-row {
+  background: rgba(255, 255, 255, 0.6);
+}
+:root[data-theme="light"] .sighting-chip { color: var(--ink-soft); }
+:root[data-theme="light"] .gallery-thumb { background: rgba(255, 255, 255, 0.6); }
+
+/* alert card backdrop in light mode */
+:root[data-theme="light"] .modal-backdrop { background: rgba(30, 40, 55, 0.45); }
+:root[data-theme="light"] .modal { background: #ffffff; box-shadow: 0 30px 60px rgba(30, 45, 65, 0.28); }
+:root[data-theme="light"] .toast { background: #ffffff; }
+:root[data-theme="light"] .toast.error { border-color: rgba(216, 57, 74, 0.55); color: var(--danger); }
+
+/* light pink preset text is invisible on white surfaces */
+:root[data-theme="light"] .hint.error { color: var(--danger); }
+:root[data-theme="light"] .badge.err { color: var(--danger); border-color: rgba(216, 57, 74, 0.5); }
+
+/* light-mode text on the still-dark panels (video stage, log terminal) */
+:root[data-theme="light"] .overlay-mode-badge { background: rgba(10, 16, 24, 0.78); color: #ffd9a8; }
+:root[data-theme="light"] .log-terminal { background: #0d1420; }
+:root[data-theme="light"] .log-terminal { color: #dbe6f2; }
+:root[data-theme="light"] .log-time { color: #6b7a90; }
+:root[data-theme="light"] .log-tag.info { color: #5eead4; }
+:root[data-theme="light"] .log-tag.warn { color: #ffc857; }
+:root[data-theme="light"] .log-tag.error { color: #ff8484; }
+:root[data-theme="light"] .log-tag.critical {
+  color: #fff;
+  background: var(--log-critical);
+}
+
+/* lightbox stays dark (photo viewer) */
+:root[data-theme="light"] .lightbox-body { background: #05090e; }
+:root[data-theme="light"] .lightbox-nav { background: rgba(6, 12, 19, 0.75); color: #fff; }
+
+/* video fallback text on dark output stage */
+:root[data-theme="light"] .video-fallback { color: #c6d2e0; }
+:root[data-theme="light"] .video-fallback code { background: rgba(255, 255, 255, 0.08); }
+
+/* badge / tentative text needs strong enough contrast on light surfaces */
+:root[data-theme="light"] .tentative-hint { color: var(--warm); }
