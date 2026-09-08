@@ -89,6 +89,29 @@
             <button id="startProcessingBtn" class="btn primary" type="button" disabled>▶ Start Processing</button>
           </div>
         </section>
+
+        <!-- LIVE WEBCAM RECOGNITION (single video, real-time) -->
+        <section class="panel reveal" id="livePanel">
+          <div class="panel-head">
+            <h2>Live Webcam Recognition</h2>
+            <p>Run the pipeline in real time on this laptop's webcam and recognise people against the registered database (single video).</p>
+          </div>
+
+          <div class="live-stage" id="liveStage">
+            <video id="livePreview" autoplay playsinline muted></video>
+            <canvas id="liveOverlay" aria-hidden="true"></canvas>
+          </div>
+
+          <div class="live-controls">
+            <button type="button" id="liveStartBtn" class="btn primary">● Start Live Capture</button>
+            <button type="button" id="liveStopBtn" class="btn danger" disabled>■ Stop</button>
+            <div id="liveStatus" class="hint">Camera is off.</div>
+          </div>
+          <p class="hint" id="liveFootNote">
+            First start warms up the models (a few seconds). Registered people are tagged by name;
+            everyone else shows as “Unidentified”. Stop the capture to release the webcam.
+          </p>
+        </section>
       </main>
 
       <!-- ══════════════════ VIEW: PEOPLE / REGISTRATION ══════════════════ -->

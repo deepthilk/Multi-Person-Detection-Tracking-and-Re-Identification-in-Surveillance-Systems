@@ -1448,3 +1448,212 @@ setInterval(() => {
 loadPersons();
 loadAlerts();
 logEvent("info", "Console initialized — awaiting camera input");
+
+/* ─── LIVE WEBCAM RECOGNITION (additive; single video) ─────────────────────
+   Captures from the laptop webcam, POSTs JPEG snapshots to the new
+   /api/live/{id}/frame endpoint, and draws the returned boxes + names over
+   the preview using the same coordinate helpers and placard style as the
+   offline video preview. No existing upload/processing code is touched.   */
+
+const liveEls = {
+  video: $("#livePreview"),
+  overlay: $("#liveOverlay"),
+  stage: $("#liveStage"),
+  startBtn: $("#liveStartBtn"),
+  stopBtn: $("#liveStopBtn"),
+  status: $("#liveStatus"),
+};
+
+const liveState = {
+  stream: null,
+  sessionId: null,
+  capW: 960,
+  capH: 540,
+  active: false,
+  busy: false,
+  timer: null,
+};
+
+const liveSnapCanvas = document.createElement("canvas");
+const liveSnapCtx = liveSnapCanvas.getContext("2d");
+
+function liveSetStatus(msg, isError = false) {
+  liveEls.status.textContent = msg;
+  liveEls.status.classList.toggle("error", isError);
+  liveEls.status.classList.remove("ok");
+}
+
+async function liveStart() {
+  if (liveState.active || liveEls.startBtn.disabled) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast("Webcam capture is not supported in this browser", true);
+    return;
+  }
+
+  liveEls.startBtn.disabled = true;
+  liveSetStatus("Requesting webcam access…");
+
+  try {
+    liveState.stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 960 }, height: { ideal: 540 }, facingMode: "user" },
+      audio: false,
+    });
+    liveEls.video.srcObject = liveState.stream;
+    await new Promise((resolve) => {
+      liveEls.video.onloadedmetadata = () => resolve();
+      if (liveEls.video.readyState >= 1) resolve();
+      setTimeout(resolve, 3000); // safety: some drivers never fire metadata
+    });
+    await liveEls.video.play();
+    liveState.capW = liveEls.video.videoWidth || liveState.capW;
+    liveState.capH = liveEls.video.videoHeight || liveState.capH;
+    liveEls.stage.classList.add("has-video");
+
+    liveSetStatus("Warming up models — first boxes may take a few seconds…");
+    const resp = await fetch("/api/live/start", {
+      method: "POST",
+      body: new URLSearchParams({ stride: "1" }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || "Could not start the live backend");
+    }
+    const data = await resp.json();
+    liveState.sessionId = data.live_id;
+
+    liveState.active = true;
+    liveEls.stopBtn.disabled = false;
+    liveSetStatus("Live recognition is running — boxes appear in a moment.");
+    liveState.timer = setInterval(liveCapture, 700);
+  } catch (err) {
+    await liveStop(true);
+    liveEls.startBtn.disabled = false;
+    liveSetStatus("Live capture failed: " + err.message, true);
+    toast(err.message, true);
+  }
+}
+
+async function liveCapture() {
+  if (!liveState.active || !liveState.sessionId || liveState.busy) return;
+  liveState.busy = true;
+  try {
+    const video = liveEls.video;
+    if (video.readyState < 2) return;
+
+    liveSnapCanvas.width = liveState.capW;
+    liveSnapCanvas.height = liveState.capH;
+    liveSnapCtx.drawImage(video, 0, 0, liveState.capW, liveState.capH);
+    const blob = await new Promise((resolve) => liveSnapCanvas.toBlob(resolve, "image/jpeg", 0.72));
+    if (!blob) return;
+
+    const fd = new FormData();
+    fd.append("image", blob, "live.jpg");
+    const resp = await fetch(`/api/live/${encodeURIComponent(liveState.sessionId)}/frame`, {
+      method: "POST",
+      body: fd,
+    });
+    if (resp.status === 404) {
+      await liveStop(true);
+      liveSetStatus("Live session ended by the server.", true);
+      return;
+    }
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || "Live frame failed");
+    }
+    const data = await resp.json();
+    const detections = data.detections || [];
+    drawLiveBoxes(detections);
+    const known = detections.filter((d) => d.name).length;
+    liveSetStatus(
+      `Live: ${detections.length} person(s) on screen, ${known} recognised` + " — stop to release the camera.");
+  } catch (err) {
+    liveSetStatus("Live processing error: " + err.message, true);
+  } finally {
+    liveState.busy = false;
+  }
+}
+
+function drawLiveBoxes(boxes) {
+  const video = liveEls.video;
+  const canvas = liveEls.overlay;
+  if (!canvas || !video) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cw = video.clientWidth;
+  const ch = video.clientHeight;
+  if (!cw || !ch) return;
+
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+
+  const rect = getContainRect(liveState.capW, liveState.capH, cw, ch);
+  if (!rect) return;
+
+  boxes.forEach((b) => {
+    const bbox = b.bbox || [];
+    if (!bbox.length) return;
+    const px = videoBoxToCanvas(
+      { x1: bbox[0], y1: bbox[1], x2: bbox[2], y2: bbox[3] },
+      rect
+    );
+    if (px.w <= 0 || px.h <= 0) return; // clamped outside the visible frame
+    const isMatch = !!b.name;
+    drawBoundingBox(ctx, px, isMatch);
+    drawPlacard(
+      ctx,
+      px,
+      {
+        track_id: b.track_id,
+        name: b.name,
+        similarity: b.similarity,
+        global_id: null,
+        tentative_name: null,
+        tentative_similarity: null,
+      },
+      isMatch,
+      rect
+    );
+  });
+}
+
+async function liveStop(silent = false) {
+  liveState.active = false;
+  if (liveState.timer) {
+    clearInterval(liveState.timer);
+    liveState.timer = null;
+  }
+  if (!silent && liveState.sessionId) {
+    try {
+      await fetch(`/api/live/${encodeURIComponent(liveState.sessionId)}/stop`, { method: "POST" });
+    } catch (_) {}
+  }
+  if (liveState.stream) {
+    liveState.stream.getTracks().forEach((t) => t.stop());
+    liveState.stream = null;
+  }
+  liveEls.video.srcObject = null;
+  liveEls.stage.classList.remove("has-video");
+  const canvas = liveEls.overlay;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  liveState.sessionId = null;
+  liveState.busy = false;
+  liveEls.stopBtn.disabled = true;
+  liveEls.startBtn.disabled = false;
+  liveSetStatus("Camera is off.");
+}
+
+liveEls.startBtn.addEventListener("click", liveStart);
+liveEls.stopBtn.addEventListener("click", () => liveStop(false));
+
+// Ensure live session is stopped when page is closed or refreshed
+window.addEventListener("beforeunload", () => {
+  if (liveState.sessionId) {
+    liveStop(true).then(() => {}); // non-blocking, ignore errors
+  }
+});

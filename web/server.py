@@ -1,4 +1,7 @@
 from pathlib import Path, PurePosixPath
+import cv2
+import numpy as np
+from PIL import Image
 import hashlib
 import json
 import logging
@@ -76,6 +79,9 @@ app = FastAPI(title="Multi-Person Detection & Re-ID — Web Console")
 JOBS: Dict[str, dict] = {}
 # multi-camera sessions: session_id -> {"cameras": {camera_id: job_dict}}
 SESSIONS: Dict[str, dict] = {}
+# live webcam recognition sessions: live_id -> LiveRecognitionSession
+# (additive single-camera feature; owns its own detector/tracker/reid state)
+LIVE_SESSIONS: Dict[str, object] = {}
 
 # ── operations telemetry: rolling in-memory buffers, capped so a long
 #    session can't grow these unbounded ──────────────────────────────────
@@ -107,8 +113,15 @@ def _record_latency(stage: str, seconds: float, camera_id: str = None):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Watch-list alerts (flagged-person sightings)
+#  Alert images directory
 # ══════════════════════════════════════════════════════════════════════════
+ALERT_IMAGES_DIR = ROOT_DIR / "outputs" / "alerts_images"
+REG_IMAGES_DIR = ROOT_DIR / "outputs" / "registration" / "images"
+app.mount("/alerts-images", StaticFiles(directory=ALERT_IMAGES_DIR), name="alerts-images")
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Watch-list alerts (flagged-person sightings)
+# ═══════════════════════════════════════════════════════════════════════════
 
 # where watch-list alert events are persisted; also owned here:
 # - dismissed_alerts.json (ids of alerts the operator marked "handled")
@@ -128,15 +141,36 @@ def _read_alerts() -> List[dict]:
         return []
 
 
-def _append_alert(alert: dict):
+def _append_alert(alert: dict, frame=None, bbox=None):
     """Persist an alert event to the top of alerts.json (capped at 200).
     De-duplicates by (person, camera_id, track_id) so re-runs / cross-camera
-    corrections don't stack identical rows."""
+    corrections don't stack identical rows.
+    If frame+bbox are provided, saves a cropped person image and sets crop_url."""
     alerts = _read_alerts()
     key = (alert.get("person"), alert.get("camera_id"), alert.get("track_id"))
     alerts = [a for a in alerts
               if (a.get("person"), a.get("camera_id"), a.get("track_id")) != key]
     alert.setdefault("time", time.strftime("%Y-%m-%d %H:%M:%S"))
+    # Save cropped person image if frame and bbox are provided
+    if frame is not None and bbox is not None:
+        person_dir = ALERTS_PATH.parent / "images" / alert.get("person", "unknown")
+        person_dir.mkdir(parents=True, exist_ok=True)
+        x1, y1, x2, y2 = map(int, bbox)
+        # Clip bbox to frame boundaries
+        h, w = frame.shape[:2]
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w - 1))
+        y2 = max(0, min(y2, h - 1))
+        crop = frame[y1:y2, x1:x2]
+        if crop.size > 0:
+            crop_img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(crop_img)
+            safe_name = "".join(c for c in alert.get("person", "unknown") if c.isalnum() or c in " _-")[:50]
+            img_name = f"{uuid.uuid4().hex[:8]}_{safe_name}.jpg"
+            img_path = person_dir / img_name
+            pil_img.save(img_path, "JPEG", quality=85)
+            alert["crop_url"] = f"/alerts-images/{alert.get('person', 'unknown')}/{img_name}"
     alerts.insert(0, alert)
     ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(ALERTS_PATH, "w", encoding="utf-8") as f:
@@ -1034,6 +1068,92 @@ def _run_pipeline_job(job_id, input_path, detections_path, tracking_path, reid_p
         )
     except Exception as exc:
         JOBS[job_id].update({"status": "error", "message": str(exc)})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LIVE WEBCAM RECOGNITION (additive; single camera, no multi-cam)
+#  The browser records frames from the laptop webcam and POSTs them here;
+#  each frame runs detection -> DeepSORT -> Re-ID against the registered
+#  IdentityDatabase (web/live_pipeline.py) and returns boxes + names to
+#  overlay live. Existing pipeline functions are untouched.
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/live/start")
+def live_start(stride: int = Form(1)):
+    from web.live_pipeline import LiveRecognitionSession
+
+    live_id = uuid.uuid4().hex[:12]
+    try:
+        session = LiveRecognitionSession(stride=stride)
+        session.warm()  # load YOLO + DeepSORT + Re-ID models now, not on first frame
+    except Exception as exc:
+        logger.exception("Live session init failed")
+        raise HTTPException(status_code=500, detail=f"Failed to load live models: {exc}")
+    LIVE_SESSIONS[live_id] = session
+    _log("info", f"Live webcam session started ({live_id})", camera_id="live")
+    return {"live_id": live_id, "backend": "ready", "stride": stride}
+
+
+@app.post("/api/live/{live_id}/frame")
+def live_frame(live_id: str, image: UploadFile = File(...)):
+    import cv2
+    import numpy as np
+
+    session = LIVE_SESSIONS.get(live_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Live session not found or stopped")
+    data = image.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty frame")
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Could not decode frame image")
+    try:
+        detections = session.process_frame(frame)
+    except Exception as exc:
+        logger.exception("Live frame failed (session %s)", live_id)
+        raise HTTPException(status_code=500, detail=f"Live processing failed: {exc}")
+
+    # ── raise alerts for flagged persons ─────────────────────────────────────
+    db: IdentityDatabase = session._models["db"]
+    alert_triggered = False
+    for det in detections:
+        name = det.get("name")
+        if not name:
+            logger.info(f"[LIVE] Detection has no name: {det.get('track_id')} bbox={det.get('bbox')}")
+            continue
+        record = db._data.get(name)
+        if not record:
+            logger.info(f"[LIVE] Name '{name}' not in DB")
+            continue
+        flag = record.get("metadata", {}).get("flag", "normal")
+        logger.info(f"[LIVE] Person '{name}' has flag='{flag}'")
+        if flag and flag != "normal":
+            _append_alert({
+                "person": name,
+                "flag": flag,
+                "details": "Live webcam recognition",
+                "source": "live",
+                "camera_id": "live",
+                "track_id": det.get("track_id"),
+                "similarity": det.get("similarity"),
+            }, frame=frame, bbox=det.get("bbox"))
+            alert_triggered = True
+    if alert_triggered:
+        logger.info("[LIVE] Alert appended to alerts.json")
+    # ------------------------------------------------------------------------
+
+    return {"detections": detections, "ts": time.time()}
+
+
+@app.post("/api/live/{live_id}/stop")
+def live_stop(live_id: str):
+    session = LIVE_SESSIONS.pop(live_id, None)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Live session not found")
+    session.close()
+    _log("info", f"Live webcam session stopped ({live_id})")
+    return {"ok": True}
 
 
 if __name__ == "__main__":

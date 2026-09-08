@@ -1148,3 +1148,55 @@ img.alert-crop:hover { transform: scale(1.08); border-color: var(--warm); }
 
 /* badge / tentative text needs strong enough contrast on light surfaces */
 :root[data-theme="light"] .tentative-hint { color: var(--warm); }
+
+/* ══════════════════ LIVE WEBCAM RECOGNITION ══════════════════ */
+
+.live-stage {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  overflow: hidden;
+  background: #05090e;
+  aspect-ratio: 16 / 9;
+}
+.live-stage video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #05090e;
+  display: block;
+}
+.live-stage:not(.has-video) video { visibility: hidden; }
+.live-stage:not(.has-video)::before {
+  content: "Live camera is off — press Start Live Capture above.";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+  background:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.02) 0 2px, transparent 2px 14px),
+    radial-gradient(circle at 30% 20%, rgba(78, 227, 209, 0.08), transparent 55%),
+    #05090e;
+}
+#liveOverlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+.live-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+.live-controls .hint { flex: 1 1 220px; text-align: right; }
+.live-stage + .live-controls #liveStatus.error { color: var(--danger); }
