@@ -153,7 +153,7 @@ def _append_alert(alert: dict, frame=None, bbox=None):
     alert.setdefault("time", time.strftime("%Y-%m-%d %H:%M:%S"))
     # Save cropped person image if frame and bbox are provided
     if frame is not None and bbox is not None:
-        person_dir = ALERTS_PATH.parent / "images" / alert.get("person", "unknown")
+        person_dir = ALERT_IMAGES_DIR / alert.get("person", "unknown")
         person_dir.mkdir(parents=True, exist_ok=True)
         x1, y1, x2, y2 = map(int, bbox)
         # Clip bbox to frame boundaries

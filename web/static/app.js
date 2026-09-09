@@ -1441,12 +1441,52 @@ setInterval(() => {
     .catch(() => {});
 }, 15000);
 
+/* ── System Log tab ────────────────────────────────────────────────── */
+
+async function loadLogs() {
+  const terminal = $("#logTerminal");
+  if (!terminal) return;
+  try {
+    const resp = await fetch("/api/logs");
+    if (!resp.ok) throw new Error("Failed to load logs");
+    const { logs } = await resp.json();
+    const html = logs.map((entry) => {
+      const tagText = { info: "INFO", warn: "WARN", error: "ERROR", critical: "CRITICAL" }[entry.level] || entry.level;
+      const time = new Date(entry.ts * 1000).toLocaleTimeString();
+      return `<div class="log-line"><span class="log-time">${time}</span> <span class="log-tag ${entry.level}">[${tagText}]</span> <span class="log-msg">${escapeHtml(entry.message)}</span></div>`;
+    }).join("");
+    terminal.innerHTML = html;
+    terminal.scrollTop = terminal.scrollHeight;
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+// keep the Logs tab fresh
+setInterval(() => {
+  fetch("/api/logs")
+    .then((r) => r.json())
+    .then(({ logs }) => {
+      const terminal = $("#logTerminal");
+      if (!terminal) return;
+      const html = logs.map((entry) => {
+        const tagText = { info: "INFO", warn: "WARN", error: "ERROR", critical: "CRITICAL" }[entry.level] || entry.level;
+        const time = new Date(entry.ts * 1000).toLocaleTimeString();
+        return `<div class="log-line"><span class="log-time">${time}</span> <span class="log-tag ${entry.level}">[${tagText}]</span> <span class="log-msg">${escapeHtml(entry.message)}</span></div>`;
+      }).join("");
+      terminal.innerHTML = html;
+      terminal.scrollTop = terminal.scrollHeight;
+    })
+    .catch(() => {});
+}, 3000);
+
 /* ══════════════════════════════════════════════════════════════════════
    init
    ══════════════════════════════════════════════════════════════════════ */
 
 loadPersons();
 loadAlerts();
+loadLogs();
 logEvent("info", "Console initialized — awaiting camera input");
 
 /* ─── LIVE WEBCAM RECOGNITION (additive; single video) ─────────────────────
