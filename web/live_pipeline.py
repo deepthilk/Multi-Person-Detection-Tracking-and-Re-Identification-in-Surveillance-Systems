@@ -91,7 +91,7 @@ class LiveRecognitionSession:
                 min_height=self.min_height,
                 min_area_ratio=self.min_area_ratio,
             )
-            tracker = PersonTracker()
+            tracker = PersonTracker(max_age=5, max_cosine_distance=0.5)
             engine = ReIDEngine(device=self.device)
             face_extractor = get_shared_extractor()
             identity_db = IdentityDatabase()
@@ -134,7 +134,8 @@ class LiveRecognitionSession:
 
         Returns:
             List of dicts:
-                {"track_id": int, "bbox": [x1,y1,x2,y2],
+                {"track_id": int, "global_id": str|None,
+                 "bbox": [x1,y1,x2,y2],
                  "name": str|None, "similarity": float|None,
                  "face_sim": float|None, "cues": [str]}
             bbox is in raw frame-pixel coordinates; the browser scales it to
@@ -159,11 +160,43 @@ class LiveRecognitionSession:
 
             tracks = tracker.update(frame, detections)
 
+            # Carry over names to new tracks whose centroid is near
+            # a previously recognized track's centroid.
+            # Uses centroid distance instead of bbox overlap because
+            # when a person moves closer/further the bbox size changes
+            # dramatically but the centroid stays roughly stable.
+            active_tids = {t["id"] for t in tracks}
+            for tid in active_tids:
+                if self._track_state.get(tid, {}).get("name"):
+                    continue  # already named
+                bbox = next((t["bbox"] for t in tracks if t["id"] == tid), None)
+                if bbox is None:
+                    continue
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                for other_tid, other_state in self._track_state.items():
+                    if other_tid == tid or other_state.get("name") is None:
+                        continue
+                    ob = other_state.get("_last_bbox")
+                    if not isinstance(ob, (list, tuple)) or len(ob) < 4:
+                        continue
+                    ox = (ob[0] + ob[2]) / 2
+                    oy = (ob[1] + ob[3]) / 2
+                    dist = ((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5
+                    # threshold: 50% of the current track's diagonal
+                    diag = ((bbox[2] - bbox[0]) ** 2 + (bbox[3] - bbox[1]) ** 2) ** 0.5
+                    if diag > 0 and dist < 0.5 * diag:
+                        self._track_state[tid].update(
+                            {k: other_state[k] for k in ("name", "similarity", "face_sim", "cues") if k in other_state}
+                        )
+                        break
+
             out = []
             for t in tracks:
                 tid = t["id"]
                 bbox = t["bbox"]
                 state = self._track_state.setdefault(tid, {})
+                state["_last_bbox"] = bbox
 
                 if detect_frame:
                     feat = engine.extract_feature(frame, bbox)
@@ -193,6 +226,7 @@ class LiveRecognitionSession:
                 out.append(
                     {
                         "track_id": tid,
+                        "global_id": state.get("name"),
                         "bbox": bbox,
                         "name": state.get("name"),
                         "similarity": state.get("similarity"),
