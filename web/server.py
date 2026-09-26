@@ -121,6 +121,8 @@ def _record_latency(stage: str, seconds: float, camera_id: str = None):
 # ══════════════════════════════════════════════════════════════════════════
 ALERT_IMAGES_DIR = ROOT_DIR / "outputs" / "alerts_images"
 REG_IMAGES_DIR = ROOT_DIR / "outputs" / "registration" / "images"
+ALERT_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+REG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/alerts-images", StaticFiles(directory=ALERT_IMAGES_DIR), name="alerts-images")
 
 # ═══════════════════════════════════════════════════════════════════════════
