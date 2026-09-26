@@ -410,5 +410,8 @@ class IdentityDatabase:
     def __len__(self):
         return len(self._data)
 
+    def __iter__(self):
+        return iter(self._data)
+
     def __repr__(self):
         return f"IdentityDatabase({len(self._data)} person(s) @ {self.db_path})"
