@@ -39,6 +39,10 @@ from registration.identity_db import IdentityDatabase
 from registration.register_person import register_person
 from utils import render_reid_video, extract_track_thumbnail
 
+import sys as _sys
+if str(ROOT_DIR / "web") not in _sys.path:
+    _sys.path.insert(0, str(ROOT_DIR / "web"))
+
 from multicam_pipeline import run_camera_reid
 from cross_camera import unify_session_files
 

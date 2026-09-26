@@ -18,4 +18,4 @@ reidentification/dataset/
 *.pth
 reidentification/model/model.py
 report/
-kaggle_run.ipynb
+multi-person-detection-reidentification_colab.zip
